@@ -1,0 +1,5 @@
+head_polished = "M400;\n M106 P1 S255; \n G4 P4000;\n G1 X-3.5 F18000;\n G1 X-13.5 F3000;\nG1 X-3.5 F18000;\n G1 X-13.5 F3000;\n G1 X-3.5 F18000;\n G1 X-13.5 F3000;\n G1 X-3.5 F18000;\n G1 X-13.5 F3000;\n M400;\n M106 P1 S0;"
+cut_filament = "G1 X180 F18000;\n G1 X200 F1000;\n G1 X180 F1000;\n G1 X-13.5 F18000;\n G1 E-4 F200;"
+nozzle_temperature ="M400;\n  M109 S245;"
+fan_close = "M106 P1 S0;"
+Standby_port = "G91;\nG1 Z10 F600;\nG90; "
