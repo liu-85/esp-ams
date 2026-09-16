@@ -1,77 +1,301 @@
+"""
+network_model.py —— WiFi 联网与配网
+===================================
+
+本文件只负责 WiFi，不管 MQTT（MQTT 在 bambu/bambu_mqtt.py 里）。
+
+--------------------------------------------------------------------------
+一、上电自动联网：**直连，不扫描**
+--------------------------------------------------------------------------
+   旧逻辑：每次开机先 scan() 一遍，从扫描结果里挑信号最强的、且在记录里的 AP 去连。
+   问题：  scan() 是阻塞操作，ESP32-C3 上要 1.5~3 秒。开机慢、网页也跟着卡；
+           而且扫描期间射频要切信道，会影响已经连上的连接。
+
+   新逻辑：首次配网成功后 SSID/密码已经存在 wifi.dat 里，"直接连"又快又稳。
+           auto_connection() 只做一件事：拿记录里的 SSID/密码挨个尝试连接，
+           全程不扫描。
+
+   想扫描只有一个入口：用户在网页上点「重新扫描 WiFi」→ 见 scan_networks(force=True)。
+
+--------------------------------------------------------------------------
+二、连不上就开热点（最多尝试 WIFI_BOOT_ATTEMPTS 次）
+--------------------------------------------------------------------------
+   auto_connection() 里总共最多尝试 WIFI_BOOT_ATTEMPTS 次（默认 3 次，
+   有多个已保存 SSID 时轮流试）。全部失败返回 None，由 AMS_WEB.main_task
+   打开配置热点 AMS_WIFI，让用户用手机连上来重新配网。
+
+--------------------------------------------------------------------------
+三、连接成功判定：必须拿到 IP
+--------------------------------------------------------------------------
+   `isconnected()` 只表示"和 AP 关联上了"，此时 DHCP 可能还没完成，
+   ifconfig()[0] 还是 0.0.0.0。这时候去连 MQTT 必然失败。
+   所以 do_connect() 会一直等到拿到非 0.0.0.0 的 IP 才算成功。
+
+--------------------------------------------------------------------------
+四、可调参数
+--------------------------------------------------------------------------
+   全部集中在下面这几个常量里，不用翻代码。
+"""
+
 import network
-from logout import logout
 import time
+
+from logout import logout
 from info_load import read_profiles
+
+
+# ==========================================================================
+# 配置热点（AP）—— 自动联网失败时打开，用手机连它来配网
+# ==========================================================================
+AP_SSID = "AMS_WIFI"
+AP_PASSWORD = "A12345678"   # 至少 8 位，否则某些手机不认；想空密码改成 "" 并把 AP_AUTHMODE 设 0
+AP_AUTHMODE = 3             # 3 = WPA2-PSK
+
+# ==========================================================================
+# 联网策略
+# ==========================================================================
+WIFI_BOOT_ATTEMPTS = 3      # 上电自动连接的总尝试次数，用完就开热点
+CONNECT_TIMEOUT_MS = 8000   # 单次连接最长等待时间（含 DHCP 拿 IP）
+CONNECT_POLL_MS = 200       # 等待连接时的轮询间隔
+RECONNECT_GAP_MS = 500      # 一轮试完还没成功，歇一下再试下一轮
+
+# ==========================================================================
+# 扫描缓存
+# ==========================================================================
+# scan() 会阻塞 1.5~3 秒，网页每次刷新都扫一遍会明显卡顿。
+# 这里给扫描结果加个缓存，过期才会真的重扫；用户点「重新扫描」可强制刷新。
+SCAN_CACHE_MS = 60000       # 60 秒
+
 
 class network_model:
     def __init__(self):
-        self.ap_ssid = "AMS_WIFI"       # wifi初始账户
-        self.ap_password = "A12345678"  # wifi初始密码
-        self.ap_authmode = 3  # WPA2
-        self.wlan_ap = network.WLAN(network.AP_IF)  # 热点模式
-        self.wlan_sta = network.WLAN(network.STA_IF) # 连接wifi模式
+        self.ap_ssid = AP_SSID
+        self.ap_password = AP_PASSWORD
+        self.ap_authmode = AP_AUTHMODE
+
+        self.wlan_ap = network.WLAN(network.AP_IF)   # 热点模式
+        self.wlan_sta = network.WLAN(network.STA_IF)  # 连接路由器的模式
         self.wlan_ap.active(False)
         self.wlan_sta.active(False)
-        
-    def swcith_ap(self,status=1):
-        #打开关闭热点,1是开，0是关
+
+        # 扫描结果缓存
+        self._scan_cache = []
+        self._scan_ts = None
+
+    # ======================================================================
+    # 热点（AP）
+    # ======================================================================
+    def swcith_ap(self, status=1):
+        """打开 / 关闭配置热点。status=1 打开，0 关闭。
+
+        （方法名保留老拼写，避免调用方改动；新代码也可以用 switch_ap）
+        """
         if status:
             self.wlan_ap.active(True)
-            self.wlan_ap.config(essid=self.ap_ssid, password=self.ap_password, authmode=self.ap_authmode)
-            logout("当前热点已打开")
-            logout('热点名称 ' + self.ap_ssid + ', 密码: ' + self.ap_password)
+            self.wlan_ap.config(essid=self.ap_ssid,
+                                password=self.ap_password,
+                                authmode=self.ap_authmode)
+            logout("配置热点已打开: " + self.ap_ssid + "  密码: " + self.ap_password)
+            logout("手机连上热点后，浏览器打开 http://192.168.4.1 配网")
         else:
             self.wlan_ap.active(False)
-            logout("当前热点已关闭")
+            logout("配置热点已关闭")
         return self.wlan_ap.active()
-        
-    def auto_connection(self):
-        # 从历史文件连接wifi
-        connected = False
+
+    # 别名：语义更清楚的新名字
+    switch_ap = swcith_ap
+
+    def ap_is_on(self):
+        return bool(self.wlan_ap.active())
+
+    # ======================================================================
+    # 状态查询（网页用）
+    # ======================================================================
+    def sta_ip(self):
+        """STA 的 IP；没连上时返回空字符串"""
         try:
-            if self.wlan_sta.isconnected():
-                return self.wlan_sta
-            # Read known network profiles from file
-            profiles = read_profiles()
-            # Search WiFis in range
+            if not self.wlan_sta.isconnected():
+                return ""
+            ip = self.wlan_sta.ifconfig()[0]
+            return "" if ip == "0.0.0.0" else ip
+        except Exception:
+            return ""
+
+    def ap_ip(self):
+        try:
+            if not self.wlan_ap.active():
+                return ""
+            return self.wlan_ap.ifconfig()[0]
+        except Exception:
+            return ""
+
+    def current_ssid(self):
+        """当前连着的 SSID；没连上返回空字符串"""
+        try:
+            if not self.wlan_sta.isconnected():
+                return ""
+            ssid = self.wlan_sta.config("ssid")
+            if isinstance(ssid, bytes):
+                ssid = ssid.decode("utf-8")
+            return ssid or ""
+        except Exception:
+            return ""
+
+    def status_text(self):
+        """把 MicroPython 的 status() 码翻成人话，方便网页直接显示"""
+        try:
+            code = self.wlan_sta.status()
+        except Exception:
+            return "未知"
+        return {
+            network.STAT_IDLE: "空闲",
+            network.STAT_CONNECTING: "连接中",
+            network.STAT_WRONG_PASSWORD: "密码错误",
+            network.STAT_NO_AP_FOUND: "找不到该 WiFi",
+            network.STAT_CONNECT_FAIL: "连接失败",
+            network.STAT_GOT_IP: "已获取 IP",
+        }.get(code, "状态码 %s" % code)
+
+    # ======================================================================
+    # 扫描（只在用户主动要求时才真的扫）
+    # ======================================================================
+    def scan_networks(self, force=False):
+        """返回附近的 SSID 列表（去重、排序）。
+
+        force=False 时优先用缓存，避免每次刷新网页都阻塞 2 秒。
+        force=True  用于网页上的「重新扫描 WiFi」按钮。
+        """
+        now = time.ticks_ms()
+        if (not force) and self._scan_ts is not None \
+                and time.ticks_diff(now, self._scan_ts) < SCAN_CACHE_MS:
+            return self._scan_cache
+
+        try:
             self.wlan_sta.active(True)
-            networks = self.wlan_sta.scan()
-            AUTHMODE = {0: "open", 1: "WEP", 2: "WPA-PSK", 3: "WPA2-PSK", 4: "WPA/WPA2-PSK"}
-            for ssid, bssid, channel, rssi, authmode, hidden in sorted(networks, key=lambda x: x[3], reverse=True):
-                ssid = ssid.decode('utf-8')
-                encrypted = authmode > 0
-                #print("ssid: %s chan: %d rssi: %d authmode: %s" % (ssid, channel, rssi, AUTHMODE.get(authmode, '?')))
-                if encrypted:
-                    if ssid in profiles:
-                        password = profiles[ssid]
-                        connected = self.do_connect(ssid, password)
-                    #else:
-                        #print("skipping unknown encrypted network")
-                else:  # open
-                    connected = self.do_connect(ssid, None)
-                if connected:
-                    break
+            raw = self.wlan_sta.scan()
         except OSError as e:
-            logout("exception"+str(e))
-        return self.wlan_sta if connected else None
-    
-    def do_connect(self,ssid,password):
-        # 连接wifi
+            logout("扫描 WiFi 失败: " + str(e), is_error=True)
+            return self._scan_cache
+
+        # 扫描结果按信号强度排序，弱的在后；先出现的就是更强的那个
+        found = []
+        try:
+            ordered = sorted(raw, key=lambda item: item[3], reverse=True)
+        except Exception:
+            ordered = raw
+
+        for item in ordered:
+            try:
+                name = item[0].decode("utf-8")
+            except Exception:
+                name = ""
+            if name and name not in found:
+                found.append(name)
+
+        self._scan_cache = found
+        self._scan_ts = now
+        logout("扫描到 %d 个 WiFi" % len(found))
+        return found
+
+    # ======================================================================
+    # 上电自动联网
+    # ======================================================================
+    def auto_connection(self):
+        """上电自动联网：**不扫描**，直接用 wifi.dat 里存的账号密码连。
+
+        返回值：
+            连上 → WLAN 对象（调用方据此判断"已联网"）
+            连不上（没有记录 / 试满 WIFI_BOOT_ATTEMPTS 次都失败）→ None
+                  → AMS_WEB.main_task 会打开配置热点
+        """
+        if self.wlan_sta.isconnected() and self.sta_ip():
+            return self.wlan_sta
+
+        try:
+            profiles = read_profiles()
+        except OSError:
+            profiles = {}
+        except Exception as e:
+            logout("读取 wifi.dat 失败: " + str(e), is_error=True)
+            profiles = {}
+
+        if not profiles:
+            logout("没有已保存的 WiFi 记录，直接进入配网模式")
+            return None
+
+        ssids = list(profiles.keys())
+        logout("已保存 %d 个 WiFi: %s" % (len(ssids), ssids))
+
         self.wlan_sta.active(True)
-        self.wlan_sta.disconnect()
-        logout('正在连接wifi %s...' % ssid)
-        self.wlan_sta.connect(ssid, password)
-        for retry in range(100):
-            # 等待连接
-            connected = self.wlan_sta.isconnected()
-            if connected:
+
+        attempts = 0
+        while attempts < WIFI_BOOT_ATTEMPTS:
+            for ssid in ssids:
+                if attempts >= WIFI_BOOT_ATTEMPTS:
+                    break
+                attempts += 1
+                logout("自动连接 WiFi (%d/%d): %s"
+                       % (attempts, WIFI_BOOT_ATTEMPTS, ssid))
+                if self.do_connect(ssid, profiles[ssid]):
+                    return self.wlan_sta
+            if attempts < WIFI_BOOT_ATTEMPTS:
+                time.sleep_ms(RECONNECT_GAP_MS)
+
+        logout("自动连接 WiFi 失败 %d 次，转由上层打开配置热点" % attempts,
+               is_error=True)
+        return None
+
+    # ======================================================================
+    # 连接单个 WiFi
+    # ======================================================================
+    def do_connect(self, ssid, password, timeout_ms=None):
+        """连接指定 WiFi，成功返回 True。
+
+        成功 = 关联上 + **拿到非 0.0.0.0 的 IP**。
+        密码错误、找不到 AP 这类硬失败会立刻返回，不会白等满超时。
+        """
+        timeout_ms = timeout_ms or CONNECT_TIMEOUT_MS
+
+        self.wlan_sta.active(True)
+        try:
+            self.wlan_sta.disconnect()
+        except Exception:
+            pass
+        time.sleep_ms(100)
+
+        logout("正在连接 WiFi: %s ..." % ssid)
+        try:
+            self.wlan_sta.connect(ssid, password)
+        except Exception as e:
+            logout("调用 connect 失败: " + str(e), is_error=True)
+            return False
+
+        deadline = time.ticks_add(time.ticks_ms(), timeout_ms)
+        while time.ticks_diff(deadline, time.ticks_ms()) > 0:
+            if self.wlan_sta.isconnected():
+                ip = self.wlan_sta.ifconfig()[0]
+                if ip and ip != "0.0.0.0":
+                    logout("WiFi 连接成功: %s  IP=%s" % (ssid, ip))
+                    return True
+                # 关联上了但还没拿到 IP（DHCP 中），继续等
+
+            # 硬失败就别等了，早点回去开热点
+            try:
+                code = self.wlan_sta.status()
+            except Exception:
+                code = None
+            if code == network.STAT_WRONG_PASSWORD:
+                logout("WiFi 密码错误: " + ssid, is_error=True)
                 break
-            time.sleep(0.1)
-            logout('.', end='')
-        if connected:
-            logout('\n连接成功. 网络信息：: '+self.wlan_sta.ifconfig()[0])
-            
-        else:
-            logout('\n连接失败. 不能去连接: ' + ssid)
-        return connected
-        
+            if code == network.STAT_NO_AP_FOUND:
+                logout("找不到 WiFi: " + ssid, is_error=True)
+                break
+
+            time.sleep_ms(CONNECT_POLL_MS)
+
+        logout("WiFi 连接失败: %s（%s）" % (ssid, self.status_text()), is_error=True)
+        try:
+            self.wlan_sta.disconnect()
+        except Exception:
+            pass
+        return False

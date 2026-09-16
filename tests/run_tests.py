@@ -420,6 +420,335 @@ def test_ams_clutch_invariant_helper():
 
 
 # ===========================================================================
+# 联网 / 配网逻辑（network_model.py）
+# ===========================================================================
+
+def test_network_config_values_are_sane():
+    """联网参数必须合法：AP 密码至少要 8 位，否则手机连不上 WPA2 热点"""
+    import network_model as nm
+    check_eq(nm.WIFI_BOOT_ATTEMPTS, 3, "上电自动连接应为 3 次后转热点")
+    check(nm.CONNECT_TIMEOUT_MS > 0, "连接超时必须大于 0")
+    check(len(nm.AP_SSID) > 0, "热点名称不能为空")
+    check(len(nm.AP_PASSWORD) >= 8,
+          "WPA2 热点密码不能少于 8 位（当前 %d 位）" % len(nm.AP_PASSWORD))
+
+
+def test_network_boot_connect_does_not_scan():
+    """★ 上电自动联网必须直连已保存的 WiFi，不再扫描"""
+    import network_model as nm
+    m = nm.network_model()
+    m.wlan_sta.scan_result = [(b"Home", b"", 1, -50, 3, False)]
+
+    original = nm.read_profiles
+    nm.read_profiles = lambda: {"Home": "pwd123456"}
+    try:
+        result = m.auto_connection()
+    finally:
+        nm.read_profiles = original
+
+    check(result is not None, "有已保存的 WiFi 时应该连上")
+    check_eq(m.wlan_sta.scan_calls, 0,
+             "上电自动连接不应该扫描 WiFi（scan 会阻塞 1.5~3 秒，拖慢开机和网页）")
+    check_eq(m.wlan_sta.connect_calls, [("Home", "pwd123456")],
+             "应该直接使用保存的账号密码连接")
+
+
+def test_network_requires_real_ip_not_just_association():
+    """连上 AP 但没拿到 IP 不算成功（DHCP 没完成时连 MQTT 必然失败）"""
+    import network_model as nm
+    m = nm.network_model()
+    original_ip = m.wlan_sta.sta_ip
+    m.wlan_sta.sta_ip = "0.0.0.0"          # 关联上了，但没分到地址
+    original_timeout = nm.CONNECT_TIMEOUT_MS
+    nm.CONNECT_TIMEOUT_MS = 30
+    try:
+        ok = m.do_connect("Home", "pwd")
+    finally:
+        nm.CONNECT_TIMEOUT_MS = original_timeout
+        m.wlan_sta.sta_ip = original_ip
+
+    check_eq(ok, False, "只有 0.0.0.0 时不应判定为连接成功")
+    check_eq(m.sta_ip(), "", "sta_ip() 在 0.0.0.0 时应返回空串")
+
+
+def test_network_falls_back_to_ap_after_three_attempts():
+    """★ 连不上时最多尝试 3 次，然后返回 None 让上层打开热点"""
+    import network_model as nm
+    m = nm.network_model()
+    m.wlan_sta.fail_connect = True
+
+    original_profiles = nm.read_profiles
+    original_timeout = nm.CONNECT_TIMEOUT_MS
+    nm.read_profiles = lambda: {"Home": "wrong-password"}
+    nm.CONNECT_TIMEOUT_MS = 30             # 缩短等待，测试跑得快
+    try:
+        result = m.auto_connection()
+    finally:
+        nm.read_profiles = original_profiles
+        nm.CONNECT_TIMEOUT_MS = original_timeout
+
+    check_eq(result, None, "连接失败时 auto_connection 应返回 None（触发开热点）")
+    check_eq(len(m.wlan_sta.connect_calls), nm.WIFI_BOOT_ATTEMPTS,
+             "应该恰好尝试 %d 次" % nm.WIFI_BOOT_ATTEMPTS)
+
+
+def test_network_without_saved_wifi_goes_straight_to_ap():
+    """没有任何已保存的 WiFi 时不要盲目重试，直接准备开热点"""
+    import network_model as nm
+    m = nm.network_model()
+    original = nm.read_profiles
+    nm.read_profiles = lambda: {}
+    try:
+        result = m.auto_connection()
+    finally:
+        nm.read_profiles = original
+
+    check_eq(result, None, "没有记录时应返回 None")
+    check_eq(len(m.wlan_sta.connect_calls), 0, "没有记录时不应尝试连接")
+
+
+def test_network_missing_wifi_dat_is_safe():
+    """wifi.dat 不存在（全新板子）时必须安全降级，不能抛异常"""
+    import network_model as nm
+    m = nm.network_model()
+    original = nm.read_profiles
+
+    def boom():
+        raise OSError("no wifi.dat")
+
+    nm.read_profiles = boom
+    try:
+        check_eq(m.auto_connection(), None, "wifi.dat 缺失时应安全返回 None")
+    finally:
+        nm.read_profiles = original
+
+
+def test_network_scan_is_cached_and_sorted():
+    """★ 扫描结果要按信号排序、去重，并且只在必要时才真的扫"""
+    import network_model as nm
+    m = nm.network_model()
+    m.wlan_sta.scan_result = [
+        (b"Weak", b"", 6, -80, 3, False),
+        (b"Strong", b"", 1, -40, 3, False),
+        (b"Strong", b"", 6, -52, 3, False),   # 同一个 SSID 出现在多个信道上
+    ]
+
+    first = m.scan_networks(force=True)
+    check_eq(first, ["Strong", "Weak"], "应按信号强度排序并去重（当前 %r）" % (first,))
+    check_eq(m.wlan_sta.scan_calls, 1, "第一次应该真的扫描")
+
+    m.scan_networks()
+    m.scan_networks()
+    check_eq(m.wlan_sta.scan_calls, 1,
+             "缓存有效期内不应重复扫描（否则每次刷新网页都要卡 2 秒）")
+
+    m.scan_networks(force=True)
+    check_eq(m.wlan_sta.scan_calls, 2, "force=True 必须真的重扫")
+
+
+def test_network_ap_switch_works():
+    """热点开关必须可用，且名字能读回来"""
+    import network_model as nm
+    m = nm.network_model()
+    check_eq(m.ap_is_on(), False, "初始状态热点应关闭")
+    check_eq(m.swcith_ap(1), True, "swcith_ap(1) 应打开热点")
+    check_eq(m.wlan_ap.config("ssid"), nm.AP_SSID, "热点名应与配置一致")
+    check_eq(m.swcith_ap(0), False, "swcith_ap(0) 应关闭热点")
+
+
+def test_network_switch_ap_alias_exists():
+    """swcith_ap 是历史拼写，switch_ap 是新名字，两者都要能用"""
+    import network_model as nm
+    check(hasattr(nm.network_model, "swcith_ap"), "应保留 swcith_ap（老调用方）")
+    check(hasattr(nm.network_model, "switch_ap"), "应提供 switch_ap 别名")
+
+
+# ===========================================================================
+# Web 服务（AMS_WEB.py）—— 重点防"网页非常慢 / 打不开"回归
+# ===========================================================================
+
+def test_web_status_aggregates_everything():
+    """★ /status 要一次给全页面需要的状态（把原来的 5 个请求合成 1 个）"""
+    from AMS_WEB import AMS_WEB
+    app = AMS_WEB()
+    d = app._status_dict()
+
+    for key in ("ip", "ap_ip", "ap_on", "ap_ssid", "wifi_isconnected", "wifi_ssid",
+                "wifi_status_text", "is_mqtt_con", "ssids", "color_list",
+                "access_list", "current_access", "hardware"):
+        check(key in d, "_status_dict 缺少字段: %s" % key)
+
+    hw = d["hardware"]
+    for key in ("channels", "engaged", "conflicts", "motor_direction", "limits"):
+        check(key in hw, "hardware 缺少字段: %s" % key)
+
+    check_eq(len(d["access_list"]), len(CLUTCH_PINS), "通道数应与离合路数一致")
+    check_eq(len(d["color_list"]), len(CLUTCH_PINS), "颜色数应与通道数一致")
+    check_eq(len(hw["limits"]), len(CLUTCH_PINS), "到位开关标志数应与通道数一致")
+
+
+def test_web_status_is_json_serialisable():
+    """/status 的返回必须能被 ujson 序列化，否则真机上会 500"""
+    import ujson
+    from AMS_WEB import AMS_WEB
+    app = AMS_WEB()
+    text = ujson.dumps(app._status_dict())
+    check("hardware" in text and "access_list" in text,
+          "序列化结果应包含关键字段")
+
+
+def test_web_root_is_sent_in_one_shot():
+    """★ index.html 必须整份一次发完。
+
+    旧写法是 `for line in f: sendall(line); await asyncio.sleep_ms(10)`，
+    400 多行的页面光发送就要 4 秒以上 —— 这就是"网页非常慢"的头号原因。
+    """
+    import inspect
+    from AMS_WEB import AMS_WEB
+    src = inspect.getsource(AMS_WEB.hanld_rootv2)
+    check("asyncio.sleep" not in src,
+          "hanld_rootv2 里不能再有任何 await sleep（逐行发+延时是网页极慢的元凶）")
+    check("send_response" in src, "应该把整份页面交给 send_response 一次发完")
+    check("_index_cache" in src, "应该把 index.html 缓存在内存里，避免每次读 flash")
+
+
+def test_web_response_has_content_length():
+    """响应必须带 Content-Length，否则浏览器只能等连接关闭才知道结束"""
+    import inspect
+    from AMS_WEB import AMS_WEB
+    src = inspect.getsource(AMS_WEB.send_header)
+    check("Content-Length" in src, "send_header 必须输出 Content-Length")
+    check("Connection: close" in src, "应显式声明 Connection: close")
+    check("HTTP/1.1" in src, "应使用 HTTP/1.1")
+
+
+def test_web_accept_loop_is_responsive():
+    """★ 轮询间隔与超时上限必须是"低延迟"的取值"""
+    from AMS_WEB import WEB_POLL_MS, HEADER_WAIT_MS, SEND_CHUNK
+    check(WEB_POLL_MS <= 50,
+          "accept 轮询间隔应 <= 50ms（旧值是 500ms，每个请求白等几百毫秒），当前 %d" % WEB_POLL_MS)
+    check(HEADER_WAIT_MS <= 1000,
+          "读请求头的等待上限应 <= 1 秒（旧代码阻塞 3 秒，浏览器的空闲预连接会把服务端拖死），当前 %d" % HEADER_WAIT_MS)
+    check(SEND_CHUNK > 0, "分片发送块大小必须大于 0")
+
+
+def test_web_header_read_is_not_blocking():
+    """请求头必须用非阻塞方式读，并且要有 await 让步"""
+    import inspect
+    from AMS_WEB import AMS_WEB
+    src = inspect.getsource(AMS_WEB._read_request)
+    check("setblocking(False)" in src, "读请求头前应把 socket 设为非阻塞")
+    check("setblocking(True)" in src, "读完后要恢复阻塞模式，便于后续发送")
+    check("await asyncio.sleep_ms" in src, "没数据时必须 await 让出 CPU，否则会卡住其它任务")
+    check("HEADER_WAIT_MS" in src, "必须有总等待上限，不能被空闲连接拖死")
+
+
+def test_web_gc_threshold_is_relaxed():
+    """gc 阈值不能是 1KB —— 那样发个网页会触发几十次垃圾回收"""
+    import gc
+    import inspect
+    import AMS_WEB
+    src = inspect.getsource(AMS_WEB)
+    check("gc.threshold(1024)" not in src,
+          "gc.threshold(1024) 会让每次内存分配都触发 GC，必须放宽")
+
+
+# ===========================================================================
+# 主循环不能饿死 Web 任务（AMS_MODEL.py / bambu_mqtt.py）
+# ===========================================================================
+
+def test_ams_loop_does_not_block_on_wait_msg():
+    """★ run_ams_loop 里绝对不能再用阻塞的 wait_msg()"""
+    import inspect
+    from AMS_MODEL import AMS
+    src = inspect.getsource(AMS.run_ams_loop)
+    check("wait_msg()" not in src.replace("wait_msg_timeout(", ""),
+          "run_ams_loop 不能用阻塞的 wait_msg()，它会把 uasyncio 事件循环按住不放，"
+          "Web 配置页和状态灯全被饿死")
+    check("poll_msg()" in src, "应该用非阻塞的 poll_msg() 收包")
+
+
+def test_exchange_uses_bounded_wait():
+    """换料流程里的等待必须有超时，打印机关机时不能把程序挂死"""
+    import inspect
+    from AMS_MODEL import AMS
+    src = inspect.getsource(AMS.exchange_fileament)
+    check("wait_msg()" not in src.replace("wait_msg_timeout(", ""),
+          "换料流程里不能用无超时的 wait_msg()")
+    check("wait_msg_timeout(" in src, "换料流程应该用带超时的等待")
+
+
+def test_ams_reconnect_is_time_based():
+    """定期重连要按时间节流，不能"每 N 轮"就断一次"""
+    import inspect
+    from AMS_MODEL import AMS, RECONNECT_INTERVAL_MS
+    check(RECONNECT_INTERVAL_MS >= 60000,
+          "重连间隔应 >= 1 分钟（旧代码几秒断一次，打印机侧极不稳定），当前 %d" % RECONNECT_INTERVAL_MS)
+    src = inspect.getsource(AMS.run_ams_loop)
+    check("RECONNECT_INTERVAL_MS" in src, "run_ams_loop 应按时间判断是否重连")
+
+
+def test_mqtt_check_is_throttled():
+    """MQTT 存活探测必须节流"""
+    import inspect
+    from bambu.bambu_mqtt import Bambu_mqtt_cliet
+    src = inspect.getsource(Bambu_mqtt_cliet.check_mqtt_connection)
+    check("MQTT_PING_INTERVAL_MS" in src, "check_mqtt_connection 应按间隔节流")
+    check("force" in src, "应提供 force 参数，供「改完配置立刻确认」的场景使用")
+
+
+def test_mqtt_ping_throttling_behaviour():
+    """连续调用 check_mqtt_connection 时，节流窗口内只应该真的 ping 一次"""
+    from bambu.bambu_mqtt import Bambu_mqtt_cliet
+
+    class FakeClient:
+        def __init__(self):
+            self.pings = 0
+
+        def ping(self):
+            self.pings += 1
+
+    m = Bambu_mqtt_cliet("127.0.0.1", "SERIAL", "pwd")
+    fake = FakeClient()
+    m.client = fake
+
+    check_eq(m.check_mqtt_connection(force=True), True, "force=True 应真的探测")
+    check_eq(fake.pings, 1, "force=True 时应该 ping 一次")
+
+    m.check_mqtt_connection()
+    m.check_mqtt_connection()
+    check_eq(fake.pings, 1, "节流窗口内不应重复 ping（旧代码每次都真的发）")
+
+
+def test_mqtt_no_client_is_safe():
+    """没连过 MQTT 时，各种探测都必须安全返回 False"""
+    from bambu.bambu_mqtt import Bambu_mqtt_cliet
+    m = Bambu_mqtt_cliet("127.0.0.1", "SERIAL", "pwd")
+    check_eq(m.check_mqtt_connection(), False, "client 为 None 时应返回 False")
+    check_eq(m.poll_msg(), None, "client 为 None 时 poll_msg 应返回 None")
+
+
+def test_wait_msg_timeout_respects_deadline():
+    """wait_msg_timeout 必须真的等满超时，且到时返回 False"""
+    from bambu.bambu_mqtt import Bambu_mqtt_cliet
+
+    class SilentClient:
+        def check_msg(self):
+            return None
+
+    m = Bambu_mqtt_cliet("127.0.0.1", "SERIAL", "pwd")
+    m.client = SilentClient()
+
+    started = _time.monotonic()
+    ok = m.wait_msg_timeout(80)
+    elapsed = _time.monotonic() - started
+
+    check_eq(ok, False, "一直没消息时应返回 False")
+    check(elapsed >= 0.06,
+          "应该真的等到接近超时才返回，实际只用了 %.3fs" % elapsed)
+
+
+# ===========================================================================
 # 运行
 # ===========================================================================
 CASES = [v for k, v in sorted(globals().items()) if k.startswith("test_")]

@@ -1,418 +1,911 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="zh-CN">
 <head>
-    <meta charset="UTF-8">
-    <title>AMS配置页面</title>
-    <style>
-        *{
-         margin: 0;
-            padding: 0;
-        }
-        .overlay {
-          position: fixed;
-          top: 0;
-          left: 0;
-          width: 100%;
-          height: 100%;
-          background-color: rgba(0, 0, 0, 0.5); /* 半透明灰色背景 */
-          z-index: 9998; /* 设置一个较高的z-index值，比loader小1 */
-        }
-        .loader {
-          border: 16px solid #f3f3f3; /* Light grey */
-          border-top: 16px solid #3498db; /* Blue */
-          border-radius: 50%;
-          width: 120px;
-          height: 120px;
-          animation: spin 2s linear infinite;
-          position: fixed;
-          top: 48%;
-          left: 48%;
-          transform: translate(-50%, -50%);
-          z-index: 9999; /* 设置一个较高的z-index值 */
-          text-align: center; /* 文字居中 */
-        }
-        .loader-text {
-          color: #fff; /* 白色文字 */
-          font-size: 16px;
-          margin-top: 60px; /* 调整文字位置 */
-        }
-        @keyframes spin {
-          0% { transform: rotate(0deg); }
-          100% { transform: rotate(360deg); }
-        }
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#1565c0">
+<title>AMS 配置</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+:root{
+  --blue:#1565c0; --green:#2e7d32; --red:#d32f2f;
+  --bg:#eef1f5; --card:#fff; --line:#dde3ea; --txt:#1f2937; --dim:#6b7280;
+}
+body{
+  font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;
+  background:var(--bg); color:var(--txt); font-size:15px; line-height:1.5;
+  padding-bottom:40px;
+}
 
-        h1{
-            text-align: center;
-            margin: 10px 0;
-        }
-        ul{
+/* ---------------- 顶部状态条 ---------------- */
+.topbar{
+  position:sticky; top:0; z-index:100;
+  background:var(--blue); color:#fff; padding:10px 14px;
+  display:flex; align-items:center; justify-content:space-between; gap:10px;
+  box-shadow:0 2px 8px rgba(0,0,0,.15);
+}
+.topbar .brand{font-weight:700; font-size:16px; letter-spacing:.5px}
+.topbar .netline{display:flex; align-items:center; gap:12px; font-size:13px; flex-wrap:wrap}
+.netitem{display:flex; align-items:center; gap:5px; white-space:nowrap}
+.dot{width:9px;height:9px;border-radius:50%;background:#ff5252;box-shadow:0 0 0 2px rgba(255,255,255,.25)}
+.dot.on{background:#69f0ae}
 
-            list-style: none;
-        }
-        button{
-            background-color: #4CAF50; /* 绿色背景 */
-            color: white; /* 白色文字 */
-            padding: 5px 10px; /* 内边距 */
-            text-align: center; /* 文字居中 */
-            text-decoration: none; /* 取消下划线 */
-            display: inline-block; /* 行内块元素 */
-            font-size: 16px; /* 字体大小 */
-            margin: 5px; /* 外边距 */
-            cursor: pointer; /* 鼠标样式为手型 */
-            border: none; /* 取消边框 */
-            border-radius: 5px; /* 圆角 */
-        }
-        input{
-            margin: 5px 0;
-        }
+/* ---------------- 布局 ---------------- */
+.wrap{max-width:760px;margin:0 auto;padding:12px}
+.card{background:var(--card);border-radius:12px;padding:14px;margin-bottom:12px;
+      box-shadow:0 1px 3px rgba(0,0,0,.08)}
+.card>h2{font-size:15px;margin-bottom:10px;display:flex;align-items:center;gap:7px;
+         padding-bottom:8px;border-bottom:1px solid var(--line)}
+.card>h2::before{content:"";width:4px;height:15px;border-radius:2px;background:var(--blue)}
+.card>h2 .sub{font-weight:400;font-size:12px;color:var(--dim);margin-left:auto}
+.tip{font-size:12.5px;color:var(--dim);margin-top:8px}
+.kv{display:flex;justify-content:space-between;gap:10px;padding:5px 0;font-size:13.5px;
+    border-bottom:1px dashed #eef1f5}
+.kv:last-child{border-bottom:none}
+.kv span{color:var(--dim)}
+.kv b{font-weight:600;text-align:right;word-break:break-all}
+.warn{color:var(--red);font-weight:600}
 
-        .box{
-            width: 50%;
-            margin: 100px auto;
-           text-align: center
-        }
-        .status{
-            width: 20px;
-            height: 20px;
-            border-radius: 25px;
-            display: inline-block;
-            background-color: red;
-        }
-        .color_span{
-            margin: 5px;
-            width: 20px;
-            height: 20px;
-            border-radius: 25px;
-            display: inline-block;
-            background-color: wheat;
-            box-shadow: #6C6F73 1px 1px 1px 2px;
-        }
+/* ---------------- 表单 ---------------- */
+.row{display:flex;gap:8px;align-items:center;margin-bottom:8px;flex-wrap:wrap}
+.row label{font-size:13.5px;color:var(--dim);min-width:86px}
+input[type=text],input[type=password],input[type=number]{
+  flex:1;min-width:0;padding:9px 11px;border:1px solid var(--line);border-radius:8px;
+  font-size:15px;background:#fbfcfe;color:var(--txt);font-family:inherit;
+}
+input:focus{outline:none;border-color:var(--blue);background:#fff;box-shadow:0 0 0 3px rgba(21,101,192,.12)}
+button{
+  font-family:inherit;font-size:14px;padding:9px 16px;border:none;border-radius:8px;
+  background:#e8edf3;color:var(--txt);cursor:pointer;font-weight:600;
+}
+button:active{transform:translateY(1px)}
+button.primary{background:var(--blue);color:#fff}
+button.ghost{background:#eef1f5;color:var(--txt);font-weight:500;border:1px solid var(--line)}
+button.mini{padding:6px 11px;font-size:13px}
 
-          .status_true{
-             background-color: green;
-        }
-        #mqtt{
-            display: none;
-        }
-        .warring{
-            color:red;}
-        .change{
-            background-color: #4CAF50;
-            border-radius: 3px;
-            margin: 0 10px;
-            display: inline-block;
-            width: 50px;
-            color: white;
-        }
-        .tip{
-            font-size: 13px;
-            color: #888;
-        }
-        .hw_row{
-            margin: 4px 0;
-        }
-        .hw_badge{
-            display: inline-block;
-            padding: 1px 8px;
-            border-radius: 10px;
-            font-size: 13px;
-            color: #fff;
-            background-color: #9e9e9e;
-        }
-        .hw_badge.on{ background-color: #e53935; }
-    </style>
+/* ---------------- WiFi 列表 ---------------- */
+.wifi-list{border:1px solid var(--line);border-radius:8px;max-height:190px;overflow-y:auto;background:#fbfcfe}
+.wifi-item{display:flex;align-items:center;gap:9px;padding:9px 11px;border-bottom:1px solid #f0f3f7;
+           cursor:pointer;font-size:14px}
+.wifi-item:last-child{border-bottom:none}
+.wifi-item.sel{background:#e3f0ff}
+.wifi-item .mark{width:16px;height:16px;border-radius:50%;border:2px solid #b9c3cf;flex:none}
+.wifi-item.sel .mark{border-color:var(--blue);background:var(--blue);
+                     box-shadow:inset 0 0 0 3px #fff}
+.wifi-item .nm{flex:1;word-break:break-all}
+.wifi-item .now{font-size:11.5px;color:var(--green);background:#e6f4ea;padding:1px 6px;border-radius:9px;flex:none}
+
+/* ---------------- 通道 ---------------- */
+.ch-row{display:flex;align-items:center;gap:9px;padding:9px 0;border-bottom:1px dashed #eef1f5;flex-wrap:wrap}
+.ch-row:last-child{border-bottom:none}
+.color_span{width:34px;height:34px;border-radius:8px;flex:none;cursor:pointer;
+            border:2px solid #fff;box-shadow:0 0 0 1px #c3ccd6,0 1px 3px rgba(0,0,0,.18)}
+.color_span:active{transform:scale(.94)}
+.ch-row input[type=number]{flex:none;width:64px;text-align:center}
+.ch-row .ch-name{font-size:13.5px;color:var(--dim);min-width:52px}
+.tag{font-size:12px;padding:2px 8px;border-radius:10px;background:#eef1f5;color:var(--dim)}
+.tag.using{background:#e6f4ea;color:var(--green)}
+
+/* ---------------- 硬件 ---------------- */
+.badges{display:flex;gap:7px;flex-wrap:wrap;margin:6px 0}
+.badge{font-size:12.5px;padding:4px 10px;border-radius:12px;background:#eef1f5;color:#54606e;
+       border:1px solid #e2e8ef}
+.badge.on{background:#ffe9e9;color:var(--red);border-color:#ffcdcd;font-weight:600}
+.hw-btns{display:flex;gap:7px;flex-wrap:wrap;margin-top:8px}
+.hw-btns button{flex:1;min-width:112px;white-space:nowrap}
+
+/* ---------------- 加载遮罩 ---------------- */
+.overlay{position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(15,23,42,.42);z-index:9000;
+         display:none;align-items:center;justify-content:center}
+.overlay.show{display:flex}
+.loader{width:64px;height:64px;border:6px solid rgba(255,255,255,.28);border-top-color:#fff;
+        border-radius:50%;animation:spin .9s linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
+
+/* ---------------- 消息条 ---------------- */
+.toast{position:fixed;left:50%;top:14px;transform:translate(-50%,-140%);z-index:9500;
+       max-width:88vw;padding:11px 18px;border-radius:10px;font-size:14px;color:#fff;
+       background:#37474f;box-shadow:0 6px 20px rgba(0,0,0,.28);transition:transform .25s;
+       word-break:break-all;text-align:center}
+.toast.show{transform:translate(-50%,0)}
+.toast.ok{background:var(--green)}
+.toast.err{background:var(--red)}
+
+/* ================= 颜色对话框 ================= */
+.modal-mask{position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(15,23,42,.45);z-index:9800;
+            display:none;align-items:center;justify-content:center;padding:12px;
+            overflow-y:auto}
+.modal-mask.show{display:flex}
+.color-dlg{background:#f0f0f0;border-radius:10px;box-shadow:0 12px 40px rgba(0,0,0,.4);
+           max-width:100%;width:560px;font-size:13px;overflow:hidden;
+           border:1px solid #b9c3cf}
+.dlg-title{background:#e4e8ec;padding:8px 12px;font-weight:600;font-size:13.5px;
+           display:flex;justify-content:space-between;align-items:center;
+           border-bottom:1px solid #cdd5dd}
+.dlg-title .x{cursor:pointer;font-size:16px;color:#5b6673;padding:0 4px;line-height:1}
+.dlg-body{display:flex;gap:12px;padding:12px;flex-wrap:wrap}
+
+.col-left{flex:1 1 210px;min-width:190px}
+.col-right{flex:1 1 280px;min-width:250px}
+.lbl{font-size:12.5px;color:#333;margin-bottom:5px}
+
+/* 色块网格 */
+.swatches{display:grid;grid-template-columns:repeat(8,1fr);gap:3px;
+          border:1px solid #b9c3cf;background:#fff;padding:3px;border-radius:3px;
+          margin-bottom:11px}
+.sw{height:22px;border:1px solid #949da6;cursor:pointer;border-radius:1px}
+.sw:hover{border-color:#1e6fd9;box-shadow:0 0 0 1px #1e6fd9}
+.sw.sel{outline:2px solid #1e6fd9;outline-offset:-3px}
+
+/* SV 渐变 + 色相条 */
+.sv-hue{display:flex;gap:6px;margin-bottom:10px}
+.sv{position:relative;flex:1;height:190px;border:1px solid #949da6;cursor:crosshair;
+    touch-action:none;border-radius:2px}
+.sv-marker{position:absolute;width:13px;height:13px;border:2px solid #fff;border-radius:50%;
+           box-shadow:0 0 0 1px #333,0 1px 3px rgba(0,0,0,.5);
+           transform:translate(-50%,-50%);pointer-events:none}
+.hue{position:relative;width:22px;height:190px;border:1px solid #949da6;cursor:pointer;
+     touch-action:none;border-radius:2px;
+     background:linear-gradient(to bottom,#f00 0%,#ff0 17%,#0f0 33%,#0ff 50%,
+                #00f 67%,#f0f 83%,#f00 100%)}
+.hue-marker{position:absolute;left:-4px;right:-4px;height:5px;background:#fff;
+            border:1px solid #333;border-radius:2px;transform:translateY(-50%);
+            pointer-events:none}
+
+/* 预览 + 数值 */
+.fields{display:flex;gap:11px;align-items:flex-start;flex-wrap:wrap}
+.preview{text-align:center;flex:none}
+.prev-box{width:56px;height:56px;border:1px solid #949da6;overflow:hidden;border-radius:2px}
+.prev-box .half{height:50%}
+.prev-label{font-size:11px;color:#333;margin-top:3px}
+.nums{flex:1;min-width:180px;display:grid;grid-template-columns:1fr 1fr;gap:5px 12px}
+.nf{display:flex;align-items:center;gap:5px;font-size:12.5px}
+.nf label{flex:1;color:#333;white-space:nowrap}
+.nf input{width:58px;padding:3px 5px;border:1px solid #949da6;border-radius:2px;
+          font-size:12.5px;background:#fff;text-align:right;font-family:inherit;flex:none}
+.nf input:focus{outline:1px solid #1e6fd9}
+
+.dlg-foot{display:flex;justify-content:space-between;align-items:center;gap:10px;
+          padding:10px 12px;background:#e4e8ec;border-top:1px solid #cdd5dd;flex-wrap:wrap}
+.dlg-foot .g{display:flex;gap:8px;flex-wrap:wrap}
+.dlg-foot button{padding:7px 18px;font-size:13px;border-radius:4px;background:#f5f7f9;
+                 border:1px solid #b9c3cf;font-weight:500}
+.dlg-foot button.primary{background:#1e6fd9;border-color:#1660c4;color:#fff;font-weight:600}
+
+@media (max-width:520px){
+  .sv,.hue{height:150px}
+  .color-dlg{width:100%}
+  .nums{grid-template-columns:1fr 1fr}
+}
+</style>
 </head>
-
 <body>
-<div class="overlay">
-    <div class="loader">
-        <div class="loader-text">请求中....</div>
-    </div>
+
+<div class="overlay" id="overlay"><div class="loader"></div></div>
+<div class="toast" id="toast"></div>
+
+<div class="topbar">
+  <div class="brand">YAO AMS</div>
+  <div class="netline">
+    <span class="netitem"><span class="dot" id="dot_wifi"></span><span id="top_wifi">WiFi</span></span>
+    <span class="netitem"><span class="dot" id="dot_mqtt"></span><span id="top_mqtt">MQTT</span></span>
+  </div>
 </div>
-<div class="box">
-    <div>
-        <p id="ip_addr">当前ip地址：</p>
-        <p class="warring">消息</p>
 
-    <h1>WIFI配置</h1>
-    <h3>
-        当前wifi连接状态：<span class="status"  id="wifi_status"></span><span id="wifi_statu_text">未连接</span>
-    </h3>
-    <ul id = "ssids">
-        <li>请选择要连接WiFi名称</li>
-    </ul>
-     <ul>
-         <li>密码<input type="password" name="wifi_password" ></li>
-        <button class="myButton" onclick="connect_wifi()">确定连接wifi</button>
-     </ul>
+<div class="wrap">
 
+  <!-- ============ 运行状态 ============ -->
+  <section class="card">
+    <h2>运行状态</h2>
+    <div class="kv"><span>IP 地址</span><b id="s_ip">-</b></div>
+    <div class="kv"><span>WiFi</span><b id="s_wifi">-</b></div>
+    <div class="kv"><span>打印机 MQTT</span><b id="s_mqtt">-</b></div>
+    <div class="kv"><span>配置热点</span><b id="s_ap">-</b></div>
+    <div class="kv"><span>当前料盘</span><b id="s_cur">-</b></div>
+  </section>
 
-   <div id="mqtt">
-        <h1>AMSmqtt配置</h1>
-    <h3>当前mqtt连接状态：<span class="status" id="mqtt_status"></span><span id="mqtt_statu_text">未连接</span></h3>
-        <div id="mqtt_info"></div>
-        <button class="myButton"  onclick="connect_mqtt()">确定修改</button>
-        <p>打印机通道设置</p>
-
-       <div id="access_info">
-
-
-       </div>
-       <button class="myButton" onclick="access_set()" >确定修改</button>
-
-       <h1>硬件调试</h1>
-       <h3>共享电机 + 4 路电磁离合</h3>
-       <p class="tip">同一时刻只会吸合 1 路离合，动作完成后自动全部断开</p>
-       <div id="hardware_info">加载中...</div>
-       <div id="hardware_test"></div>
-       <p>当前料盘：<span id="current_filament">-</span></p>
-           </div>
-</div>
+  <!-- ============ WiFi ============ -->
+  <section class="card">
+    <h2>WiFi 配置 <span class="sub" id="wifi_head"></span></h2>
+    <div class="wifi-list" id="wifi_list"><div class="wifi-item">加载中…</div></div>
+    <div class="row" style="margin-top:10px">
+      <label>密码</label>
+      <input type="password" id="wifi_pwd" placeholder="WiFi 密码" autocomplete="off">
     </div>
- <script>
-                // 获取加载动画元素和覆盖层元素
-                var loader = document.querySelector('.loader');
-                var overlay = document.querySelector('.overlay');
-                loader.style.display = 'none';
-                overlay.style.display = 'none';
-                document.documentElement.style.overflow = 'auto'
-                function loader_s(is_open=true){
-                    if(is_open){
-                        loader.style.display = 'block';
-                        overlay.style.display = 'block';
-                        document.documentElement.style.overflow = 'hidden';
-                    }else{
-                        loader.style.display = 'none';
-                        overlay.style.display = 'none';
-                        document.documentElement.style.overflow = 'auto';
-                    }
-                }
-                var wifi_status = document.getElementById('wifi_status');
-                var mqtt_div = document.getElementById('mqtt');
-                if(wifi_status.classList.contains('status_true')){
-                    mqtt_div.style.display='block'
-                }
-                var observer = new MutationObserver(function(mutationsList) {
-                    mutationsList.forEach(function(mutation) {
-                        if (mutation.attributeName === 'class' && wifi_status.classList.contains('status_true')) {
-                            mqtt_div.style.display='block'
+    <div class="row">
+      <button class="primary" style="flex:1" onclick="connect_wifi()">连接这个 WiFi</button>
+      <button class="ghost" onclick="rescan_wifi()">重新扫描</button>
+    </div>
+    <p class="tip">首次使用请在列表里选一个 2.4G 的 WiFi 并填密码。连接成功后设备会记住，
+      以后开机会直接连，不再重新扫描。</p>
+  </section>
 
-                        }
-                    });
-                    });
-                // 配置MutationObserver监视span元素的属性变化
-                observer.observe(wifi_status, { attributes: true });
+  <!-- ============ MQTT ============ -->
+  <section class="card" id="card_mqtt">
+    <h2>打印机 MQTT 配置 <span class="sub" id="mqtt_head"></span></h2>
+    <div id="mqtt_form"><div class="tip">加载中…</div></div>
+    <div class="row" style="margin-top:10px">
+      <button class="primary" style="flex:1" onclick="connect_mqtt()">保存并连接</button>
+    </div>
+    <p class="tip">打印机 IP 在打印机屏幕上「设置 → 网络」里看；访问码在
+      「设置 → 网络 → 访问码」。序列号是设备 SN，可在同一页找到。</p>
+  </section>
 
-                function connect_wifi_event(data){
-                    document.getElementById('wifi_status').classList.add("status_true")
-                    document.getElementById('wifi_statu_text').innerText="已连接"
-                    get_ip_data(data)
-                    alert("wifi连接成功"+data["info"])
-                }
-                function connect_wifi(){
-                    const jsonData = {
-                        name: selectedRadioButton = document.querySelector('input[name="wifi_name"]:checked').value,
-                        password: document.querySelector('input[name="wifi_password"]').value,
-                    };
+  <!-- ============ 通道 ============ -->
+  <section class="card">
+    <h2>打印机通道设置 <span class="sub">点色块改颜色</span></h2>
+    <div id="access_info"><div class="tip">加载中…</div></div>
+    <div class="row" style="margin-top:10px">
+      <button class="primary" style="flex:1" onclick="access_set()">保存通道与颜色</button>
+    </div>
+    <p class="tip">通道号要和切片软件里料盘位的编号一致；颜色只是显示用，方便对应料卷。</p>
+  </section>
 
-                    send_data("/wifi_connect",jsonData,connect_wifi_event)
-                }
-                function connect_mqtt_event(data){
-                    document.getElementById('mqtt_status').classList.add("status_true")
-                    document.getElementById('mqtt_statu_text').innerText="已连接"+data["info"]
-                    alert("mqtt连接成功:"+data["info"])
-                }
-                function connect_mqtt(){
-                    const jsonData = {
-                        mqtt_server: document.querySelector('input[name="mqtt_server"]').value,
-                        DEVICE_SERIAL: document.querySelector('input[name="DEVICE_SERIAL"]').value,
-                        mqtt_password: document.querySelector('input[name="mqtt_password"]').value,
-                        client_id: document.querySelector('input[name="client_id"]').value,
-                        username: document.querySelector('input[name="username"]').value,
-                        mqtt_port: document.querySelector('input[name="mqtt_port"]').value,
-                    };
-                    send_data("/mqtt_connect",jsonData,connect_mqtt_event)
-                }
-                function connect_access_set_event(data){
-                    alert("通道设置成功:"+data["info"])
-                }
-                function access_set(){
-                    const access_list = [];
-                    var filamentInputs = document.getElementsByClassName('fileament_class')
-                    for (var i = 0; i < filamentInputs.length; i++) {
-                                var value = filamentInputs[i].value;
-                                access_list.push(parseInt(value))
-                            }
+  <!-- ============ 硬件调试 ============ -->
+  <section class="card">
+    <h2>硬件调试 <span class="sub">共享电机 + 4 路电磁离合</span></h2>
+    <div id="hardware_info"><div class="tip">加载中…</div></div>
+    <div class="hw-btns" id="hardware_test"></div>
+    <p class="tip">同一时刻只会吸合 1 路离合，动作完成后自动全部断开。
+      点动仅在调试时使用，正常打印请勿操作。</p>
+  </section>
 
-                    const color_list =  []
-                    const color_span = document.getElementsByClassName("color_span")
-                    for (var i = 0; i < color_span.length; i++) {
-                        var value2 = color_span[i].style.backgroundColor
-                        color_list.push(value2)
-                    }
-                    const jsonData = {
-                        access_list:access_list,
-                        color_list:color_list
-                    }
-                    console.log(jsonData)
-                    send_data("/access_set",jsonData,connect_access_set_event)
-                }
-                function send_data(url,data,event_fun){
-                    loader_s()
-                    const requestOptions = {
-                        method: 'POST',
-                        headers: {
-                            'Content-Type': 'application/json',
-                            'Access-Control-Allow-Origin':'*'
-                        },
-                        body: JSON.stringify(data)
-                    };
-                    fetch(url, requestOptions)
-                        .then(response => {
-                            if (!response.ok) {
-                                return response.json().then(errorData => {
-                                throw new Error(errorData.info);
-                                                }); }
-                            return response.json();
-                        })
-                        .then(data => {
-                            event_fun(data)
-                            loader_s(false)
-                        })
-                        .catch(error => {
-                            loader_s(false);
-                            alert('出现问题'+ error)
-                        });
+</div>
 
-                }
-                // 获取wifi信息
-                function get_wifi_info(data){
-                    const status_span = document.getElementById("wifi_status");
-                    const wifi_statu_text_span = document.getElementById("wifi_statu_text");
-                    if("wifi_isconnected" in data){
-                        if(data["wifi_isconnected"]){
-                            status_span.classList.add("status_true");
-                            wifi_statu_text_span.innerText = "已连接"
+<!-- ================= 颜色对话框（Windows 样式） ================= -->
+<div class="modal-mask" id="color_mask">
+  <div class="color-dlg">
+    <div class="dlg-title"><span>颜色</span><span class="x" onclick="ColorDlg.cancel()">✕</span></div>
+    <div class="dlg-body">
+      <div class="col-left">
+        <div class="lbl">基本颜色(B)：</div>
+        <div class="swatches" id="basic_grid"></div>
+        <div class="lbl">自定义颜色(C)：</div>
+        <div class="swatches" id="custom_grid"></div>
+      </div>
+      <div class="col-right">
+        <div class="sv-hue">
+          <div class="sv" id="sv_area"><div class="sv-marker" id="sv_marker"></div></div>
+          <div class="hue" id="hue_bar"><div class="hue-marker" id="hue_marker"></div></div>
+        </div>
+        <div class="fields">
+          <div class="preview">
+            <div class="prev-box">
+              <div class="half" id="prev_new"></div>
+              <div class="half" id="prev_old"></div>
+            </div>
+            <div class="prev-label">颜色|纯色(O)</div>
+          </div>
+          <div class="nums">
+            <div class="nf"><label>色调(E)</label><input type="number" id="in_h" min="0" max="360" step="1"></div>
+            <div class="nf"><label>红(R)</label><input type="number" id="in_r" min="0" max="255" step="1"></div>
+            <div class="nf"><label>饱和度(S)</label><input type="number" id="in_s" min="0" max="100" step="1"></div>
+            <div class="nf"><label>绿(G)</label><input type="number" id="in_g" min="0" max="255" step="1"></div>
+            <div class="nf"><label>亮度(L)</label><input type="number" id="in_v" min="0" max="100" step="1"></div>
+            <div class="nf"><label>蓝(U)</label><input type="number" id="in_b" min="0" max="255" step="1"></div>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div class="dlg-foot">
+      <div class="g">
+        <button class="primary" id="btn_ok">确定</button>
+        <button id="btn_cancel">取消</button>
+      </div>
+      <div class="g">
+        <button id="btn_add_custom">添加到自定义颜色(A)</button>
+      </div>
+    </div>
+  </div>
+</div>
 
-                        }
-                        const ssids_ul = document.getElementById("ssids");
-                        for(var ssid of data["ssids"]){
-                            ssids_ul.innerHTML += '<li><input type="radio" name="wifi_name" value="'+ssid+'">'+ssid+'</li>'
-                        }
-                    }
+<script>
+/* ==========================================================================
+   1. 基础工具
+   ========================================================================== */
+var $ = function(id){ return document.getElementById(id); };
+var overlay = $('overlay'), toastEl = $('toast'), toastTimer = null;
 
-                }
-                // 获取mqtt信息
-                function get_mqtt_data(data){
-                    const status_span = document.getElementById("mqtt_status");
-                    const mqtt_statu_text_span = document.getElementById("mqtt_statu_text");
-                    if("is_mqtt_con" in data){
-                        if(data["is_mqtt_con"]){
-                            status_span.classList.add("status_true");
-                            mqtt_statu_text_span.innerText = "已连接"
-                        }
-                        const mqtt_info_div = document.getElementById("mqtt_info");
-                        mqtt_info_div.innerHTML = '打印机ip地址：<input name="mqtt_server" type="text" value="'+data["mqtt_server"]+'" ><br>\n' +
-                            '        打印机序列号：<input name="DEVICE_SERIAL" type="text" value="'+data["DEVICE_SERIAL"]+'"><br>\n' +
-                            '        打印机密码：<input name="mqtt_password" type="password" value="'+data["mqtt_password"]+'"><br>\n' +
-                            '        MQTT客户端名称：<input name="client_id" type="text" value="'+data["client_id"]+'"><br>\n' +
-                            '        MQTT服务端名称：<input name="username" type="text" value="'+data["username"]+'"><br>\n' +
-                            '        MQTT端口：<input name="mqtt_port" type="number" value="'+data["mqtt_port"]+'"><br>'
+function busy(on){
+  if(on){ overlay.classList.add('show'); }
+  else  { overlay.classList.remove('show'); }
+}
+function toast(msg, kind){
+  toastEl.className = 'toast show' + (kind ? ' ' + kind : '');
+  toastEl.textContent = msg;
+  if(toastTimer) clearTimeout(toastTimer);
+  toastTimer = setTimeout(function(){ toastEl.className = 'toast'; }, 3200);
+}
 
-                    }
-                }
-                // 获取通道信息
-                function get_access_data(data){
-                    const access_info_div = document.getElementById("access_info");
-                    const cur = document.getElementById("current_filament");
-                    if(cur){ cur.innerText = data["current_access"] ? ("通道 " + data["current_access"]) : "未知（未安装到位开关时为 0）"; }
-                    for(let n = 0; n<data["access_list"].length; n++){
-                        const item_div = document.createElement("div")
+/* 统一的请求封装。
+   silent=true 时不显示遮罩（用于后台轮询），出错也不弹提示。 */
+function send(url, data, onok, silent){
+  var opts = { method:'POST', headers:{'Content-Type':'application/json'} };
+  if(data !== undefined && data !== null) opts.body = JSON.stringify(data);
+  if(!silent) busy(true);
 
-                        item_div.innerHTML+= '<span onclick="opthon_color(this)" id="color'+data["access_list"][n]+'" class="color_span" style="background-color: '+  data["color_list"][n]+'" ></span>'
+  fetch(url, opts).then(function(res){
+    return res.json().catch(function(){ return {}; }).then(function(body){
+      if(!res.ok){
+        var e = new Error(body && body.info ? body.info : ('HTTP ' + res.status));
+        e.body = body; throw e;
+      }
+      return body;
+    });
+  }).then(function(body){
+    if(!silent) busy(false);
+    if(onok) onok(body);
+  }).catch(function(err){
+    if(!silent) busy(false);
+    if(silent) return;                       // 后台轮询失败不打扰用户
+    toast(err.message || '请求失败', 'err');
+  });
+}
 
-                        item_div.innerHTML += '料盘'+(n+1)+': <input class="fileament_class" name="access'+(data["access_list"][n])+'" type="number" value="'+(data["access_list"][n])+'">'
-                        if(data["access_list"][n]==data["current_access"]){
-                            item_div.innerHTML+='<input type="button"  value="退料" class="change" style="background-color: #007bff">'
-                        }else {
-                            item_div.innerHTML+='<input type="button"  value="换料"   class="change">'
-                        }
+/* 简单的 GET（/status 用） */
+function get(url, onok, silent){
+  if(!silent) busy(true);
+  fetch(url, { method:'GET', cache:'no-store' })
+    .then(function(res){ return res.json(); })
+    .then(function(body){ if(!silent) busy(false); if(onok) onok(body); })
+    .catch(function(){
+      if(!silent) busy(false);
+      if(!silent) toast('连接失败，请刷新页面', 'err');
+    });
+}
 
-                        access_info_div.append(item_div)
-                    }
+/* ==========================================================================
+   2. 颜色工具
+   ========================================================================== */
+function hsvToRgb(h, s, v){
+  h = ((h % 360) + 360) % 360;
+  var c = v * s, x = c * (1 - Math.abs((h / 60) % 2 - 1)), m = v - c, r = 0, g = 0, b = 0;
+  if(h < 60){ r = c; g = x; }
+  else if(h < 120){ r = x; g = c; }
+  else if(h < 180){ g = c; b = x; }
+  else if(h < 240){ g = x; b = c; }
+  else if(h < 300){ r = x; b = c; }
+  else { r = c; b = x; }
+  return [Math.round((r + m) * 255), Math.round((g + m) * 255), Math.round((b + m) * 255)];
+}
+function rgbToHsv(r, g, b){
+  r /= 255; g /= 255; b /= 255;
+  var mx = Math.max(r, g, b), mn = Math.min(r, g, b), d = mx - mn, h = 0;
+  if(d !== 0){
+    if(mx === r) h = 60 * (((g - b) / d) % 6);
+    else if(mx === g) h = 60 * ((b - r) / d + 2);
+    else h = 60 * ((r - g) / d + 4);
+  }
+  if(h < 0) h += 360;
+  return [h, mx === 0 ? 0 : d / mx, mx];
+}
+function toHex(r, g, b){
+  var f = function(n){ var t = n.toString(16).toUpperCase(); return t.length < 2 ? '0' + t : t; };
+  return '#' + f(r) + f(g) + f(b);
+}
+var rgbToHex = function(c){ return toHex(c[0], c[1], c[2]); };
 
-                }
-                function get_ip_data(data){
-                    ip_p =document.getElementById("ip_addr");
-                    console.log(data["ip"])
-                    ip_p.innerText = "当前ip地址："+ data["ip"]
-                }
-                // ===== 硬件状态（共享电机 + 4 路电磁离合）=====
-                function get_hardware_data(data){
-                    const box = document.getElementById("hardware_info");
-                    const test_box = document.getElementById("hardware_test");
-                    const engaged = data["engaged"] || [];
-                    const channels = data["channels"] || [];
-                    const limits = data["limits"] || [];
+/* 把任意颜色写法解析成 [r,g,b]，兼容 "red" / "#f00" / "rgb(255,0,0)" */
+function parseColor(str){
+  str = (str || '').trim();
+  var m = /^#([0-9a-f]{3})$/i.exec(str);
+  if(m){ return [parseInt(m[1][0] + m[1][0], 16), parseInt(m[1][1] + m[1][1], 16), parseInt(m[1][2] + m[1][2], 16)]; }
+  m = /^#([0-9a-f]{6})$/i.exec(str);
+  if(m){ var v = parseInt(m[1], 16); return [(v >> 16) & 255, (v >> 8) & 255, v & 255]; }
+  m = /rgba?\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)/i.exec(str);
+  if(m){ return [+m[1], +m[2], +m[3]]; }
+  var probe = document.createElement('div');
+  probe.style.color = str;
+  if(probe.style.color){
+    document.body.appendChild(probe);
+    var cs = getComputedStyle(probe).color;
+    document.body.removeChild(probe);
+    m = /rgba?\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)/i.exec(cs);
+    if(m) return [+m[1], +m[2], +m[3]];
+  }
+  return [128, 128, 128];
+}
+function normalizeHex(str){ return rgbToHex(parseColor(str)); }
 
-                    let html = '';
-                    html += '<div class="hw_row">电机方向：'+data["motor_direction"]+'（1=进料　-1=退料　0=停止）</div>';
-                    html += '<div class="hw_row">冲突次数：'+data["conflicts"]+'（正常应始终为 0）</div>';
-                    html += '<div class="hw_row">离合状态：';
-                    for(let i = 0; i < channels.length; i++){
-                        const ch = channels[i];
-                        const on = engaged.indexOf(ch) >= 0;
-                        html += '<span class="hw_badge'+(on?' on':'')+'">离合'+ch+
-                                (on?' 吸合':' 断开')+(limits[i]?' · 有到位开关':'')+'</span> ';
-                    }
-                    html += '</div>';
-                    if(engaged.length > 1){
-                        html += '<div class="hw_row warring">⚠️ 检测到多路离合同时吸合，请立即断电检查驱动电路！</div>';
-                    }
-                    box.innerHTML = html;
+/* ==========================================================================
+   3. Windows 风格颜色对话框
+   ========================================================================== */
+var ColorDlg = (function(){
+  var mask, svArea, svMarker, hueBar, hueMarker, basicGrid, customGrid;
+  var inH, inS, inV, inR, inG, inB, prevNew, prevOld;
+  var CUSTOM_KEY = 'ams_custom_colors';
+  var customColors = [];
 
-                    if(test_box.innerHTML === ''){
-                        for(let i = 0; i < channels.length; i++){
-                            const ch = channels[i];
-                            const row = document.createElement('div');
-                            row.innerHTML = '通道'+ch+'：'+
-                                '<button class="myButton" onclick="hardware_test('+ch+',1)">进料 1s</button>'+
-                                '<button class="myButton" onclick="hardware_test('+ch+',-1)">退料 1s</button>';
-                            test_box.append(row);
-                        }
-                    }
-                }
-                // 手动点动：同一时刻只会吸合 1 路离合
-                function hardware_test(channel, direction){
-                    const jsonData = {channel:channel, direction:direction, times_ms:1000};
-                    send_data("/hardware_test", jsonData, function(data){
-                        alert(data["info"]);
-                        send_data("/get_hardware_info",{},get_hardware_data);
-                    });
-                }
+  var cur = { h: 0, s: 0, v: 0 };   // 当前选中（HSV）
+  var oldHex = '#000000';           // 打开时的原色，用于预览对比
+  var target = null;                // 正在编辑的色块元素
+  var dragging = null;              // 'sv' | 'hue' | null
 
-                send_data("/get_ip_info",{},get_ip_data)
-                send_data("/get_wifi_info",{},get_wifi_info)
-                send_data("/get_mqtt_info",{},get_mqtt_data)
-                send_data("/get_access_info",{},get_access_data)
-                send_data("/get_hardware_info",{},get_hardware_data)
-                function opthon_color(event){
-                    // 创建一个颜色输入框，type="color" 会弹出颜色选择器
-                    const colorInput = document.createElement('input');
-                     colorInput.style.position = 'absolute';
-                    colorInput.style.left = '50%';
-                    colorInput.style.top = '50%';
-                    colorInput.style.transform = 'translate(-50%, -50%)'
-                    colorInput.type = 'color';
-                    colorInput.addEventListener('change', function () {
-                        const selectedColor = colorInput.value;
-                        event.style.backgroundColor = selectedColor;
-                    });
+  /* ---- 基本颜色：6 行 × 8 列，前 7 列按色相铺开，第 8 列是无彩色 ---- */
+  function buildBasic(){
+    var rows = [
+      { l:0.93, s:0.80 }, { l:0.79, s:0.90 }, { l:0.63, s:1.00 },
+      { l:0.47, s:1.00 }, { l:0.31, s:1.00 }, { l:0.16, s:0.95 }
+    ];
+    var grays = ['#FFFFFF', '#D9D9D9', '#BFBFBF', '#A6A6A6', '#808080', '#404040'];
+    var out = [];
+    for(var r = 0; r < rows.length; r++){
+      for(var c = 0; c < 7; c++){
+        out.push(rgbToHex(hsvToRgb(c * 360 / 7, rows[r].s, rows[r].l)));
+      }
+      out.push(grays[r]);
+    }
+    return out;
+  }
 
-                    // 模拟点击颜色输入框，弹出颜色选择器
-                    colorInput.click();
-                }
+  function loadCustom(){
+    try{
+      var raw = localStorage.getItem(CUSTOM_KEY);
+      if(raw){ customColors = JSON.parse(raw) || []; }
+    }catch(e){ customColors = []; }
+    if(!(customColors instanceof Array)) customColors = [];
+    customColors = customColors.slice(0, 16);
+  }
+  function saveCustom(){
+    try{ localStorage.setItem(CUSTOM_KEY, JSON.stringify(customColors)); }catch(e){}
+  }
 
-        </script>
-        </body>
-        </html>
+  function makeSwatch(hex, cls){
+    var d = document.createElement('div');
+    d.className = 'sw' + (cls ? ' ' + cls : '');
+    d.style.background = hex;
+    d.title = hex;
+    d.dataset.color = hex;
+    d.onclick = function(){ setFromHex(hex, true); };
+    return d;
+  }
+
+  function renderBasic(){
+    basicGrid.innerHTML = '';
+    var list = buildBasic();
+    for(var i = 0; i < list.length; i++) basicGrid.appendChild(makeSwatch(list[i]));
+  }
+  function renderCustom(){
+    customGrid.innerHTML = '';
+    for(var i = 0; i < 16; i++){
+      var hex = customColors[i];
+      var d = document.createElement('div');
+      d.className = 'sw';
+      if(hex){ d.style.background = hex; d.title = hex; d.dataset.color = hex;
+               d.onclick = function(){ setFromHex(this.dataset.color, true); }; }
+      else   { d.style.background = '#fff'; d.style.cursor = 'default'; }
+      customGrid.appendChild(d);
+    }
+  }
+
+  /* ---- 渲染当前颜色到各处 ---- */
+  function paint(){
+    var rgb = hsvToRgb(cur.h, cur.s, cur.v);
+    var hex = rgbToHex(rgb);
+
+    svArea.style.background =
+      'linear-gradient(to top, #000, rgba(0,0,0,0)),' +
+      'linear-gradient(to right, #fff, ' + rgbToHex(hsvToRgb(cur.h, 1, 1)) + ')';
+    svMarker.style.left = (cur.s * 100) + '%';
+    svMarker.style.top = ((1 - cur.v) * 100) + '%';
+    svMarker.style.background = hex;
+
+    hueMarker.style.top = (cur.h / 360 * 100) + '%';
+    prevNew.style.background = hex;
+
+    // 只在输入框没被聚焦时回写，避免打字时被覆盖
+    var act = document.activeElement;
+    if(act !== inH) inH.value = Math.round(cur.h);
+    if(act !== inS) inS.value = Math.round(cur.s * 100);
+    if(act !== inV) inV.value = Math.round(cur.v * 100);
+    if(act !== inR) inR.value = rgb[0];
+    if(act !== inG) inG.value = rgb[1];
+    if(act !== inB) inB.value = rgb[2];
+
+    // 高亮匹配的基本色 / 自定义色
+    highlight(basicGrid, hex);
+    highlight(customGrid, hex);
+  }
+  function highlight(grid, hex){
+    var kids = grid.children;
+    for(var i = 0; i < kids.length; i++){
+      var c = kids[i].dataset.color;
+      if(c && c.toUpperCase() === hex.toUpperCase()) kids[i].classList.add('sel');
+      else kids[i].classList.remove('sel');
+    }
+  }
+
+  function setFromHsv(h, s, v){ cur.h = h; cur.s = s; cur.v = v; paint(); }
+  function setFromHex(hex, keepHue){
+    var rgb = parseColor(hex);
+    var hsv = rgbToHsv(rgb[0], rgb[1], rgb[2]);
+    // 灰色没有色相，保留原来的色相，用户体验更顺
+    if(keepHue && hsv[1] === 0) hsv[0] = cur.h;
+    setFromHsv(hsv[0], hsv[1], hsv[2]);
+  }
+  function setFromRgb(r, g, b){
+    var hsv = rgbToHsv(r, g, b);
+    if(hsv[1] === 0) hsv[0] = cur.h;
+    setFromHsv(hsv[0], hsv[1], hsv[2]);
+  }
+
+  /* ---- 拖拽：用 Pointer 事件，鼠标 / 触屏通用 ---- */
+  function bindDrag(el, kind){
+    el.addEventListener('pointerdown', function(e){
+      dragging = kind; el.setPointerCapture(e.pointerId);
+      applyDrag(e); e.preventDefault();
+    });
+    el.addEventListener('pointermove', function(e){
+      if(dragging === kind) { applyDrag(e); e.preventDefault(); }
+    });
+    var end = function(e){
+      if(dragging === kind){ dragging = null; try{ el.releasePointerCapture(e.pointerId); }catch(err){} }
+    };
+    el.addEventListener('pointerup', end);
+    el.addEventListener('pointercancel', end);
+  }
+  function applyDrag(e){
+    var r;
+    if(dragging === 'sv'){
+      r = svArea.getBoundingClientRect();
+      var sx = Math.min(Math.max((e.clientX - r.left) / r.width, 0), 1);
+      var sy = Math.min(Math.max((e.clientY - r.top) / r.height, 0), 1);
+      cur.s = sx; cur.v = 1 - sy; paint();
+    } else if(dragging === 'hue'){
+      r = hueBar.getBoundingClientRect();
+      var hy = Math.min(Math.max((e.clientY - r.top) / r.height, 0), 1);
+      cur.h = hy * 360; paint();
+    }
+  }
+
+  function clampNum(input, min, max, def){
+    var n = parseFloat(input.value);
+    if(isNaN(n)) n = def;
+    return Math.min(Math.max(n, min), max);
+  }
+
+  function bindInputs(){
+    inH.addEventListener('input', function(){ cur.h = clampNum(inH, 0, 360, cur.h); paint(); });
+    inS.addEventListener('input', function(){ cur.s = clampNum(inS, 0, 100, cur.s * 100) / 100; paint(); });
+    inV.addEventListener('input', function(){ cur.v = clampNum(inV, 0, 100, cur.v * 100) / 100; paint(); });
+    var onRgb = function(){
+      setFromRgb(clampNum(inR, 0, 255, 0), clampNum(inG, 0, 255, 0), clampNum(inB, 0, 255, 0));
+    };
+    inR.addEventListener('input', onRgb);
+    inG.addEventListener('input', onRgb);
+    inB.addEventListener('input', onRgb);
+  }
+
+  function open(el){
+    target = el;
+    oldHex = el.dataset.color ? el.dataset.color : normalizeHex(el.style.backgroundColor);
+    setFromHex(oldHex, false);
+    prevOld.style.background = oldHex;
+    mask.classList.add('show');
+  }
+  function close(){ mask.classList.remove('show'); target = null; }
+  function cancel(){ close(); }
+  function ok(){
+    if(target){
+      var hex = rgbToHex(hsvToRgb(cur.h, cur.s, cur.v));
+      target.style.backgroundColor = hex;
+      target.dataset.color = hex;
+      target.title = hex;
+    }
+    close();
+  }
+  function addCustom(){
+    var hex = rgbToHex(hsvToRgb(cur.h, cur.s, cur.v));
+    var i = customColors.indexOf(hex);
+    if(i >= 0) customColors.splice(i, 1);
+    customColors.unshift(hex);
+    if(customColors.length > 16) customColors.length = 16;
+    saveCustom(); renderCustom(); highlight(customGrid, hex);
+  }
+
+  function init(){
+    mask = $('color_mask'); svArea = $('sv_area'); svMarker = $('sv_marker');
+    hueBar = $('hue_bar'); hueMarker = $('hue_marker');
+    basicGrid = $('basic_grid'); customGrid = $('custom_grid');
+    inH = $('in_h'); inS = $('in_s'); inV = $('in_v');
+    inR = $('in_r'); inG = $('in_g'); inB = $('in_b');
+    prevNew = $('prev_new'); prevOld = $('prev_old');
+
+    loadCustom();
+    renderBasic(); renderCustom();
+    bindDrag(svArea, 'sv'); bindDrag(hueBar, 'hue');
+    bindInputs();
+
+    $('btn_ok').onclick = ok;
+    $('btn_cancel').onclick = cancel;
+    $('btn_add_custom').onclick = addCustom;
+
+    // 点遮罩空白处关闭
+    mask.addEventListener('click', function(e){ if(e.target === mask) cancel(); });
+    // 回车确定 / ESC 取消
+    document.addEventListener('keydown', function(e){
+      if(!mask.classList.contains('show')) return;
+      if(e.key === 'Enter') ok();
+      if(e.key === 'Escape') cancel();
+    });
+  }
+
+  return { init: init, open: open, ok: ok, cancel: cancel, addCustom: addCustom };
+})();
+
+/* ==========================================================================
+   4. 页面渲染
+   ========================================================================== */
+var accessRendered = false;
+var wifiSig = null;
+var wifiScanned = false;
+var curSsid = '';
+var lastAccess = [];
+
+function dot(el, on){ el.className = 'dot' + (on ? ' on' : ''); }
+
+function applyStatus(d){
+  // ---- 顶部与状态卡 ----
+  var wifiOn = !!d.wifi_isconnected;
+  var mqttOn = !!d.is_mqtt_con;
+  curSsid = wifiOn ? (d.wifi_ssid || '') : '';
+  dot($('dot_wifi'), wifiOn); dot($('dot_mqtt'), mqttOn);
+  $('top_wifi').textContent = wifiOn ? (d.wifi_ssid || 'WiFi 已连接') : (d.ap_on ? '配网热点' : '未连接');
+  $('top_mqtt').textContent = mqttOn ? 'MQTT 已连接' : 'MQTT 未连接';
+
+  $('s_ip').textContent = d.ip ? d.ip : (d.ap_on ? '—（手机请访问 ' + d.ap_ip + '）' : '未获取');
+  $('s_wifi').innerHTML = wifiOn
+      ? '<span style="color:#2e7d32">已连接 ' + esc(d.wifi_ssid || '') + '</span>'
+      : '<span class="warn">未连接' + (d.wifi_status_text ? '（' + esc(d.wifi_status_text) + '）' : '') + '</span>';
+  $('s_mqtt').innerHTML = mqttOn
+      ? '<span style="color:#2e7d32">已连接</span>' : '<span class="warn">未连接</span>';
+  $('s_ap').textContent = d.ap_on ? ('已打开 ' + esc(d.ap_ssid || 'AMS_WIFI')) : '已关闭';
+  $('s_cur').textContent = d.current_access ? ('通道 ' + d.current_access) : '未知（未装到位开关）';
+
+  $('wifi_head').textContent = wifiOn ? ('已连 ' + (d.wifi_ssid || '')) : (d.ap_on ? '未联网 · 热点已开' : '未联网');
+
+  // ---- 首次渲染：通道 / MQTT 表单（只渲染一次，避免覆盖用户正在输入的内容）----
+  if(!accessRendered){ renderAccess(d.access_list, d.color_list, d.current_access); accessRendered = true; }
+  else { updateCurrentOnly(d.access_list, d.current_access); }
+
+  renderWifiList(d.ssids, curSsid, false);
+  updateHardware(d.hardware);
+}
+
+function esc(s){
+  return String(s === undefined || s === null ? '' : s)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+
+/* ---------- WiFi 列表 ---------- */
+function renderWifiList(ssids, currentSsid, scanned){
+  ssids = ssids || [];
+  if(scanned) wifiScanned = true;
+
+  // 还没扫过、缓存也是空的 → 显示"扫描中"，不要谎报"没扫到"
+  if(!wifiScanned && !ssids.length){
+    $('wifi_list').innerHTML = '<div class="wifi-item" style="color:#6b7280">正在扫描附近 WiFi…</div>';
+    return;
+  }
+
+  var sig = ssids.join('|');
+  if(sig === wifiSig) return;                 // 内容没变就不重建，保住用户的选择
+  wifiSig = sig;
+
+  var box = $('wifi_list');
+  box.innerHTML = '';
+  if(!ssids.length){
+    box.innerHTML = '<div class="wifi-item" style="color:#6b7280">' +
+                    '没有扫描到 WiFi，点「重新扫描」试试</div>';
+    return;
+  }
+  var selected = false;
+  for(var i = 0; i < ssids.length; i++){
+    var nm = ssids[i];
+    var item = document.createElement('div');
+    item.className = 'wifi-item';
+    // 默认选中当前连着的那个，否则选第一个
+    var isCur = (nm === currentSsid);
+    if(isCur || (!selected && i === 0)){ item.classList.add('sel'); selected = true; }
+
+    var mark = document.createElement('span'); mark.className = 'mark';
+    var name = document.createElement('span'); name.className = 'nm'; name.textContent = nm;
+    item.appendChild(mark); item.appendChild(name);
+    if(isCur){
+      var tag = document.createElement('span'); tag.className = 'now'; tag.textContent = '当前';
+      item.appendChild(tag);
+    }
+    item.onclick = function(){
+      var all = box.getElementsByClassName('wifi-item');
+      for(var k = 0; k < all.length; k++) all[k].classList.remove('sel');
+      this.classList.add('sel');
+    };
+    box.appendChild(item);
+  }
+}
+function rescan_wifi(){
+  wifiSig = null;
+  send('/wifi_scan', null, function(d){
+    renderWifiList(d.ssids, curSsid, true);
+    toast('扫描完成，共 ' + (d.ssids || []).length + ' 个网络');
+  });
+}
+function connect_wifi(){
+  var sel = document.querySelector('#wifi_list .wifi-item.sel');
+  if(!sel || !sel.getElementsByClassName('nm').length){ toast('请先选择一个 WiFi', 'err'); return; }
+  var nm = sel.getElementsByClassName('nm')[0].textContent;
+  var pwd = $('wifi_pwd').value;
+  send('/wifi_connect', { name:nm, password:pwd }, function(d){
+    toast(d.info || '连接成功', 'ok');
+    $('wifi_pwd').value = '';
+    wifiSig = null;
+    refresh();
+  });
+}
+
+/* ---------- MQTT 表单 ---------- */
+var MQTT_FIELDS = [
+  ['mqtt_server',   '打印机 IP',   'text'],
+  ['DEVICE_SERIAL', '设备序列号',  'text'],
+  ['mqtt_password', '访问码',      'password'],
+  ['client_id',     '客户端名称',  'text'],
+  ['username',      '服务端用户名', 'text'],
+  ['mqtt_port',     'MQTT 端口',   'number']
+];
+function renderMqttForm(d){
+  var html = '';
+  for(var i = 0; i < MQTT_FIELDS.length; i++){
+    var f = MQTT_FIELDS[i];
+    html += '<div class="row"><label>' + f[1] + '</label>' +
+            '<input type="' + f[2] + '" name="' + f[0] + '" value="' + esc(d[f[0]] || '') + '"></div>';
+  }
+  $('mqtt_form').innerHTML = html;
+}
+function connect_mqtt(){
+  var data = {};
+  for(var i = 0; i < MQTT_FIELDS.length; i++){
+    var el = document.querySelector('[name="' + MQTT_FIELDS[i][0] + '"]');
+    data[MQTT_FIELDS[i][0]] = el ? el.value.trim() : '';
+  }
+  send('/mqtt_connect', data, function(d){ toast(d.info || 'MQTT 已连接', 'ok'); refresh(); });
+}
+
+/* ---------- 通道 ---------- */
+function renderAccess(accessList, colorList, current){
+  lastAccess = accessList.slice();
+  var box = $('access_info');
+  box.innerHTML = '';
+  for(var i = 0; i < accessList.length; i++){
+    var chNo = accessList[i];
+    var hex = normalizeHex(colorList[i]);
+    var row = document.createElement('div');
+    row.className = 'ch-row';
+
+    var span = document.createElement('span');
+    span.className = 'color_span';
+    span.id = 'color' + chNo;
+    span.style.backgroundColor = hex;
+    span.dataset.color = hex;
+    span.title = hex;
+    span.onclick = function(){ ColorDlg.open(this); };
+    row.appendChild(span);
+
+    var nm = document.createElement('span');
+    nm.className = 'ch-name';
+    nm.textContent = '料盘' + (i + 1);
+    row.appendChild(nm);
+
+    var inp = document.createElement('input');
+    inp.type = 'number'; inp.className = 'fileament_class';
+    inp.name = 'access' + chNo;
+    inp.value = chNo;
+    inp.min = 1; inp.max = accessList.length;
+    row.appendChild(inp);
+
+    var tag = document.createElement('span');
+    tag.className = 'tag' + (chNo === current ? ' using' : '');
+    tag.textContent = (chNo === current) ? '使用中' : '待机';
+    row.appendChild(tag);
+
+    box.appendChild(row);
+  }
+}
+function updateCurrentOnly(accessList, current){
+  var box = $('access_info');
+  var rows = box.getElementsByClassName('ch-row');
+  for(var i = 0; i < rows.length; i++){
+    var tag = rows[i].getElementsByClassName('tag')[0];
+    if(!tag) continue;
+    var ch = accessList[i];
+    if(ch === current){ tag.className = 'tag using'; tag.textContent = '使用中'; }
+    else { tag.className = 'tag'; tag.textContent = '待机'; }
+  }
+}
+function access_set(){
+  var list = [], colors = [];
+  var inputs = document.getElementsByClassName('fileament_class');
+  var spans = document.getElementsByClassName('color_span');
+  for(var i = 0; i < inputs.length; i++) list.push(parseInt(inputs[i].value, 10));
+  for(var j = 0; j < spans.length; j++){
+    colors.push(spans[j].dataset.color || normalizeHex(spans[j].style.backgroundColor));
+  }
+  send('/access_set', { access_list:list, color_list:colors }, function(d){
+    toast(d.info || '保存成功', 'ok');
+  });
+}
+
+/* ---------- 硬件 ---------- */
+function updateHardware(hw){
+  if(!hw) return;
+  var eng = hw.engaged || [];                 // 当前吸合的通道号列表
+  var channels = hw.channels || [];           // 全部通道号
+  var limits = hw.limits || [];
+  var html = '';
+  html += '<div class="kv"><span>电机方向</span><b>' + esc(hw.motor_direction) +
+          '（1=进料　-1=退料　0=停止）</b></div>';
+  html += '<div class="kv"><span>离合冲突次数</span><b' + (hw.conflicts ? ' class="warn"' : '') +
+          '>' + esc(hw.conflicts) + '</b></div>';
+
+  html += '<div style="margin-top:8px;font-size:13px;color:#6b7280">离合状态</div><div class="badges">';
+  for(var i = 0; i < channels.length; i++){
+    var ch = channels[i];
+    var on = eng.indexOf(ch) >= 0;
+    html += '<span class="badge' + (on ? ' on' : '') + '">离合' + ch +
+            (on ? ' 吸合' : ' 断开') + (limits[i] ? ' · 有到位开关' : '') + '</span>';
+  }
+  html += '</div>';
+  if(eng.length > 1){
+    html += '<div class="warn" style="margin-top:6px">检测到多路离合同时吸合，请立即断电检查驱动电路！</div>';
+  }
+  $('hardware_info').innerHTML = html;
+
+  var testBox = $('hardware_test');
+  if(testBox.innerHTML === ''){
+    for(var k = 0; k < channels.length; k++){
+      var c = channels[k];
+      var b = document.createElement('button');
+      b.textContent = '通道' + c + ' 进料 1s';
+      b.onclick = (function(ch){ return function(){ hardware_test(ch, 1); }; })(c);
+      testBox.appendChild(b);
+
+      var b2 = document.createElement('button');
+      b2.className = 'ghost';
+      b2.textContent = '通道' + c + ' 退料 1s';
+      b2.onclick = (function(ch){ return function(){ hardware_test(ch, -1); }; })(c);
+      testBox.appendChild(b2);
+    }
+  }
+}
+function hardware_test(channel, direction){
+  send('/hardware_test', { channel:channel, direction:direction, times_ms:1000 }, function(d){
+    toast(d.info || '动作完成', 'ok');
+    refresh();
+  });
+}
+
+/* ==========================================================================
+   5. 启动与轮询
+   ========================================================================== */
+function refresh(){
+  get('/status', applyStatus, true);   // silent：后台轮询不显示遮罩
+}
+
+function boot(){
+  ColorDlg.init();
+
+  // 第一次加载：显示遮罩，拿到状态后再放开
+  get('/status', function(d){ applyStatus(d); busy(false); }, false);
+  // MQTT 表单只拉一次（/status 里不含打印机凭据，避免每 2 秒重复下发）
+  get('/get_mqtt_info', renderMqttForm, true);
+  // WiFi 列表：/status 里给的是缓存，可能为空，这里补一次真实扫描
+  get('/wifi_scan', function(d){ renderWifiList(d.ssids, curSsid, true); }, true);
+
+  // 每 2 秒刷新状态
+  setInterval(refresh, 2000);
+}
+
+if(document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot);
+else boot();
+</script>
+</body>
+</html>

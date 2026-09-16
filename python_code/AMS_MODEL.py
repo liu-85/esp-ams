@@ -60,6 +60,21 @@ from hardware_config import (
 from motor_clutch import ClutchConflictError, MotorBusError
 
 
+# ==========================================================================
+# 主循环节奏（毫秒）
+# ==========================================================================
+#   AMS_POLL_MS        非阻塞收包的轮询间隔。越小响应越快，200ms 足够，
+#                      而且这个 await 会把 CPU 让给 Web / 状态灯任务。
+#   PUSH_INTERVAL_MS   多久向打印机查询一次状态。打印机自己也会主动上报，
+#                      1 秒一次就够。旧代码隐含节奏也是 ~1 次/秒。
+#   RECONNECT_INTERVAL_MS  定期重建 MQTT 连接的间隔。旧代码是"每 20 轮"，
+#                      而每轮都阻塞等消息，实际变成几秒断一次，非常不稳；
+#                      改成 5 分钟一次。
+AMS_POLL_MS = 200
+PUSH_INTERVAL_MS = 1000
+RECONNECT_INTERVAL_MS = 300000
+
+
 class AMS(Bambu_mqtt_cliet):
     def __init__(self):
         super().__init__(mqtt_server="", DEVICE_SERIAL="", password="")   # 继承MQTT类
@@ -274,7 +289,8 @@ class AMS(Bambu_mqtt_cliet):
 
             # ---------- 通知打印机进入相对挤出模式 ----------
             self.piblish_gcode("M83")
-            self.client.wait_msg()
+            # 等打印机回应。用带超时的等待，打印机掉线时不会把程序挂死
+            self.wait_msg_timeout(2000)
             time.sleep(0.1)
 
             # ---------- 步骤一：退料 ----------
@@ -282,7 +298,7 @@ class AMS(Bambu_mqtt_cliet):
                 logout("开始退料")
                 # 打印机自己先把喷嘴里的料退出来
                 self.piblish_gcode("M400;\n G1 E-50 F200;")
-                self.client.wait_msg()
+                self.wait_msg_timeout(8000)
                 logout(self.update_print_info())
                 # AMS 侧再把料从挤出机/缓冲区收回到料盘
                 if not self.fileament_move(self.filament_current,
@@ -311,7 +327,7 @@ class AMS(Bambu_mqtt_cliet):
 
             # ---------- 步骤三：打印机拉料，AMS 辅助送料 ----------
             self.piblish_gcode("M400;\n G1 E50 F200;")
-            self.client.wait_msg()
+            self.wait_msg_timeout(8000)
             logout(self.update_print_info())
             mat_new.dianji_roll(1, LOAD_ASSIST_MS)
 
@@ -350,65 +366,96 @@ class AMS(Bambu_mqtt_cliet):
     # 主循环
     # ======================================================================
     async def run_ams_loop(self):
-        exchange_count = 0   # 重复换料次数
-        # 主要运行线程
-        # 接受消息获取运行信息
-        try:
-            count = 0
-            con_num = 0
-            while True:
+        """主循环：轮询打印机状态 → 需要换料就换料 → 通知继续打印。
+
+        ★ 性能关键：这里**绝不能**再出现阻塞式收包（带 await 名字的那种）。
+          旧写法在没有消息时会把整个 uasyncio 事件循环按住，
+          Web 配置页面和状态灯任务全被饿死 —— 就是"网页偶尔打不开"的元凶。
+          现在统一用 poll_msg()（非阻塞，没消息立刻返回 None）。
+        """
+        exchange_count = 0        # 重复换料次数
+        push_count = 0            # 重连计数（只用来少打点日志）
+        last_push = time.ticks_ms()
+        last_reconnect = time.ticks_ms()
+
+        while True:
+            try:
+                # ---------------- 没连上 MQTT ----------------
                 if not self.check_mqtt_connection():
-                    logout("mqtt未连接")
-                    # 尝试连接
-                    if con_num < 5:
-                        self.conent_and_subscribe()
-                        con_num += 1
+                    push_count += 1
+                    if push_count % 6 == 1:
+                        logout("MQTT 未连接，尝试重连（第 %d 次）" % push_count)
+                    self.conent_and_subscribe()
                     await asyncio.sleep(10)
                     continue
-                try:
-                    con_num = 0
-                    count += 1
-                    if count % 20 == 0:
-                        count = 0
-                        self.client.disconnect()
-                        await asyncio.sleep(3)
-                        self.conent_and_subscribe()
+                push_count = 0
 
-                    # ★ 硬件体检：确保任何时刻最多只有 1 路电磁离合吸合
-                    #   每次循环读几个 GPIO，开销极小；发现异常会自动全部断开
+                # ---------------- 定期重建连接 ----------------
+                # 旧代码是"每 20 轮重连一次"，而每轮都阻塞等消息，
+                # 实际约等于每几秒就断一次 → 打印机侧看起来极不稳定。
+                # 现在改成按时间：每 5 分钟才重建一次。
+                now = time.ticks_ms()
+                if time.ticks_diff(now, last_reconnect) >= RECONNECT_INTERVAL_MS:
+                    last_reconnect = now
+                    logout("定期重建 MQTT 连接")
                     try:
-                        self.motor_bus.assert_single()
-                    except ClutchConflictError as e:
-                        logout("离合体检异常: " + str(e), is_error=True)
+                        self.client.disconnect()
+                    except Exception:
+                        pass
+                    await asyncio.sleep(1)
+                    self.conent_and_subscribe()
+                    continue
 
-                    await asyncio.sleep_ms(200)
+                # ★ 硬件体检：确保任何时刻最多只有 1 路电磁离合吸合
+                try:
+                    self.motor_bus.assert_single()
+                except ClutchConflictError as e:
+                    logout("离合体检异常: " + str(e), is_error=True)
+
+                # ---------------- 定时向打印机查询状态 ----------------
+                # 打印机自己也会主动上报，1 秒问一次足够了。
+                if time.ticks_diff(now, last_push) >= PUSH_INTERVAL_MS:
+                    last_push = now
                     self.piblish(START_PUSH)
                     #self.piblish(banbu_start)
-                    self.client.wait_msg()   # 检查是否有新的消息到达
-                    info = self.update_print_info()
 
-                    # 判断是否换料
-                    if info["change_info"]["code"] and exchange_count <= 5:
-                        exchange_count += 1
-                        if self.exchange_fileament(info["change_info"]["filament_next"] + 1, exchange_count):
-                            exchange_count = 0
-                            self.piblish(bambu_resume)   # 继续打印
-                            for n in range(10):
-                                await asyncio.sleep_ms(500)
-                                self.client.wait_msg()
+                # ---------------- 非阻塞收包 ----------------
+                if self.poll_msg() is None:
+                    await asyncio.sleep_ms(AMS_POLL_MS)
+                    continue
+
+                # 只有真的收到新消息才去解析，否则会把上一条旧消息反复处理
+                info = self.update_print_info()
+
+                # ---------------- 判断是否需要换料 ----------------
+                if info["change_info"]["code"] and exchange_count <= 5:
+                    exchange_count += 1
+                    if self.exchange_fileament(info["change_info"]["filament_next"] + 1, exchange_count):
+                        exchange_count = 0
+                        self.piblish(bambu_resume)   # 继续打印
+                        for n in range(10):
+                            await asyncio.sleep_ms(500)
+                            if self.poll_msg() is None:
+                                continue
+                            try:
                                 data = ujson.loads(self.new_message).get("print", {})
-                                if data.get("command", "") == "resume" and data.get("result", "") == "success":
-                                    logout("继续打印")
-                                    break
-                    if exchange_count > 3:
-                        logout("AMS异常，已经暂停")
-                except ClutchConflictError as e:
-                    logout("error:" + str(e), is_error=True)
-                    self.motor_bus.release_all()
-                except Exception as e:
-                    logout("error:" + str(e))
-        except Exception as e:
-            logout("error:" + str(e), is_error=True)
+                            except Exception:
+                                continue
+                            if data.get("command", "") == "resume" and data.get("result", "") == "success":
+                                logout("继续打印")
+                                break
+                if exchange_count > 3:
+                    logout("AMS异常，已经暂停")
+
+                await asyncio.sleep_ms(AMS_POLL_MS)
+
+            except ClutchConflictError as e:
+                logout("error:" + str(e), is_error=True)
+                self.motor_bus.release_all()
+                await asyncio.sleep(1)
+            except Exception as e:
+                logout("error:" + str(e))
+                await asyncio.sleep(1)
 
 
 if __name__ == "__main__":
