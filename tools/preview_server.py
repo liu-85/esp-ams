@@ -27,7 +27,7 @@ import sys
 import tempfile
 import threading
 import time
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 INDEX = os.path.join(ROOT, "python_code", "index.html")
@@ -147,18 +147,27 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def _body(self):
-        length = int(self.headers.get("Content-Length") or 0)
-        raw = self.rfile.read(length) if length else b""
-        try:
-            return json.loads(raw) if raw else {}
-        except Exception:
-            return {}
+    def _read_body(self):
+        """把请求体原样读出来 —— **每个请求只允许读一次**。
 
-    def _raw_body(self):
-        """原样读请求体（OTA 上传的是二进制包，不能当 JSON 解）"""
+        ★ 这是个坑：socket 是单向流，读完就没了。之前 do_POST 一进来就
+          无条件调 _body() 把体读掉当 JSON 解，轮到 /ota_upload 再调
+          _raw_body() 时已经没数据可读，于是永远卡在 recv 上等一个
+          永不到来的 308KB —— 表现就是上传一直"正在上传…"，直到超时。
+        """
         length = int(self.headers.get("Content-Length") or 0)
         return self.rfile.read(length) if length else b""
+
+    @staticmethod
+    def _parse_json(raw):
+        """把请求体当 JSON 解；解不出来就当空字典（和真机上一样宽容）。"""
+        if not raw:
+            return {}
+        try:
+            obj = json.loads(raw)
+        except Exception:
+            return {}
+        return obj if isinstance(obj, dict) else {}
 
     def do_GET(self):
         path = self.path.split("?")[0].rstrip("/") or "/"
@@ -184,7 +193,9 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         path = self.path.split("?")[0].rstrip("/")
-        data = self._body()
+        # ★ 请求体只能读一次：先原样读出来，再决定当 JSON 还是当二进制包用。
+        raw = self._read_body()
+        data = self._parse_json(raw)
 
         if path == "/wifi_scan":
             self._json({"ssids": STATUS["ssids"]})
@@ -269,7 +280,7 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/ota_upload":
             # ★ 预览模式下**只演练、不落盘**：把包解到临时目录里校验一遍，
             #   再把临时目录删掉。这样不会把 python_code/ 覆盖掉。
-            raw = self._raw_body()
+            #   raw 是上面读好的原始字节（不能用 data，那是 JSON 解失败的产物）。
             tmp = tempfile.mkdtemp(prefix="ams-ota-preview-")
             cwd = os.getcwd()
             try:
@@ -310,4 +321,7 @@ if __name__ == "__main__":
         print("预览模式: 配置热点（左侧菜单会显示 WiFi 配置）")
     print("预览地址: http://127.0.0.1:%d" % port)
     print("页面来源: %s" % INDEX)
-    HTTPServer(("127.0.0.1", port), Handler).serve_forever()
+    # ★ 必须多线程：页面每 2 秒就要拉 /status 和 /log，
+    #   上传 300KB 更新包时单线程服务器会把这两个轮询全部挡住，
+    #   浏览器等不到响应就会把上传连接一起掐掉（看起来像"升级失败"）。
+    ThreadingHTTPServer(("127.0.0.1", port), Handler).serve_forever()
