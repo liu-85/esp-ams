@@ -597,19 +597,167 @@ def test_web_status_is_json_serialisable():
           "序列化结果应包含关键字段")
 
 
-def test_web_root_is_sent_in_one_shot():
-    """★ index.html 必须整份一次发完。
+# ---------------------------------------------------------------------------
+# 假 socket：只记录每次 sendall 的内容与大小，用来验证"分块发送"的真实行为
+# ---------------------------------------------------------------------------
+class _FakeSocket:
+    def __init__(self):
+        self.parts = []
+        self.chunks = []
 
-    旧写法是 `for line in f: sendall(line); await asyncio.sleep_ms(10)`，
-    400 多行的页面光发送就要 4 秒以上 —— 这就是"网页非常慢"的头号原因。
+    def sendall(self, data):
+        if isinstance(data, str):          # 真机 socket 也接受 str，这里对齐一下
+            data = data.encode("utf-8")
+        data = bytes(data)
+        self.parts.append(data)
+        self.chunks.append(len(data))
+
+    def content(self):
+        return b"".join(self.parts)
+
+
+def _split_head(raw):
+    pos = raw.find(b"\r\n\r\n")
+    check(pos > 0, "HTTP 响应里必须有空行分隔响应头和正文")
+    return raw[:pos + 4], raw[pos + 4:]
+
+
+def _code_only(fn):
+    """取函数的源码，但去掉文档字符串和注释行。
+
+    否则"提示性文字"会把源码检查带偏 ——
+    比如注释里写着"千万别用 f.read() 整份读"，断言却把它当成真的这么写了。
+    （不用 `src.replace(fn.__doc__, "")`：编译器给的 __doc__ 和源码文本
+      在缩进/转义上不保证逐字相同，直接按行跳过更可靠。）
     """
     import inspect
+    out = []
+    in_doc = False
+    for line in inspect.getsource(fn).split("\n"):
+        s = line.strip()
+        if in_doc:
+            if s.endswith('"""') or s.endswith("'''"):
+                in_doc = False
+            continue
+        if s[:3] in ('"""', "'''"):
+            if not (s.endswith('"""') or s.endswith("'''")) or len(s) <= 6:
+                in_doc = True          # 多行文档字符串的开始
+            continue
+        if s.startswith("#"):
+            continue
+        out.append(line)
+    return "\n".join(out)
+
+
+def test_web_root_is_streamed_not_read_into_ram():
+    """★ 页面必须分块流式发送，绝不能整份读进内存。
+
+    真实故障：ESP32-C3 空闲堆只有几十 KB 且碎片化，
+    `open("index.html").read()` 要一次性拿到 40KB 连续内存
+      → memory allocation failed, allocating 36096 bytes。
+    更坑的是整份缓存根本没写进去，于是**每个请求都在同一处再失败一次**，
+    现象就是"AP 能连上、管理页怎么都打不开、串口疯狂刷错误"。
+    """
+    import inspect
+    from AMS_WEB import AMS_WEB, FILE_CHUNK
+
+    src = _code_only(AMS_WEB.hanld_rootv2)
+    check(".read()" not in src, "hanld_rootv2 不能再出现无参数的 read()（整份读进内存）")
+    check("_index_cache" not in src, "页面不能再做整份内存缓存")
+    check("send_file" in src, "应该交给 send_file 分块发送")
+
+    src_file = _code_only(AMS_WEB.send_file)
+    check("FILE_CHUNK" in src_file, "send_file 必须按 FILE_CHUNK 分块读")
+    check(".read()" not in src_file, "send_file 里不能有无参数的 read()")
+    check("gc.collect()" in src_file, "发文件之前要先 gc.collect() 收拢碎片")
+    check("await asyncio.sleep_ms" in src_file,
+          "块与块之间必须 await 让步，否则发 40KB 期间其它任务全被饿死")
+    check("file_size" in src_file,
+          "Content-Length 要用 os.stat 取文件长度，不能靠先读一遍")
+    check(FILE_CHUNK <= 2048,
+          "单块大小必须远小于空闲堆（<=2KB），当前 %d 字节" % FILE_CHUNK)
+
+    app = AMS_WEB()
+    check(not hasattr(app, "_index_cache"),
+          "不应该再有 _index_cache 这种「整份页面」字段")
+
+
+def test_web_streams_real_index_html_byte_for_byte():
+    """★ 拿真机上那份 40KB 的 index.html 实跑：内容逐字节一致，
+    且**单次发送不超过 FILE_CHUNK** —— 这就是"不会再 OOM"的硬证据。"""
+    import asyncio
+    from AMS_WEB import AMS_WEB, FILE_CHUNK
+
+    app = AMS_WEB()
+    cwd = os.getcwd()
+    try:
+        os.chdir(SRC_DIR)                 # hanld_rootv2 是按相对路径打开页面的
+        with open("index.html", "rb") as f:
+            page = f.read()
+        check(len(page) > 30000, "页面应该足够大（这次故障就是它太大导致的）")
+
+        client = _FakeSocket()
+        asyncio.run(app.hanld_rootv2(client))
+    finally:
+        os.chdir(cwd)
+
+    raw = client.content()
+    head, body = _split_head(raw)
+    check(b"200 OK" in head, "首页应该返回 200")
+    check(("Content-Length: %d" % len(page)).encode() in head,
+          "Content-Length 必须等于文件真实字节数，浏览器才知道何时读完")
+    check_eq(body, page, "分块拼回来的正文必须和磁盘上的 index.html 逐字节一致")
+
+    biggest = max(client.chunks)
+    check(biggest <= FILE_CHUNK,
+          "单次发送最大 %d 字节，超过 FILE_CHUNK=%d 就又会一次性占满内存"
+          % (biggest, FILE_CHUNK))
+    check(len(client.chunks) > 10,
+          "40KB 页面应该被拆成很多块发（实际 %d 块）" % len(client.chunks))
+
+
+def test_web_send_file_reports_missing_file():
+    """文件缺失要回 500，不能把异常抛给请求循环（那样每次都是"处理请求出错"）"""
+    import asyncio
     from AMS_WEB import AMS_WEB
-    src = inspect.getsource(AMS_WEB.hanld_rootv2)
-    check("asyncio.sleep" not in src,
-          "hanld_rootv2 里不能再有任何 await sleep（逐行发+延时是网页极慢的元凶）")
-    check("send_response" in src, "应该把整份页面交给 send_response 一次发完")
-    check("_index_cache" in src, "应该把 index.html 缓存在内存里，避免每次读 flash")
+
+    app = AMS_WEB()
+    client = _FakeSocket()
+    ok = asyncio.run(app.send_file(client, "这个文件不存在.html"))
+    check(ok is False, "文件不存在时 send_file 应返回 False")
+    head, _ = _split_head(client.content())
+    check(b"500" in head, "应该返回 500")
+
+
+def test_web_memory_error_sends_tiny_page_not_blank():
+    """★ 万一真的分配不出内存：要给浏览器一个极小的提示页，而不是白屏。
+
+    但只有"一个字都还没发出去"时才能补响应 —— 否则会把半个响应拼坏。
+    """
+    import inspect
+    import AMS_WEB as web_module
+
+    src = _code_only(web_module.AMS_WEB.run_web_loop)
+    check("MemoryError" in src, "请求循环必须单独接住 MemoryError")
+    check("oom_respond" in src, "内存不足时要走 oom_respond 兜底")
+    check("mem_note" in src, "异常日志里要带空闲内存，否则下次 OOM 还是只能猜")
+
+    check(len(web_module._OOM_PAGE) < 1024,
+          "兜底页面必须很小（几百字节），否则它自己也会分配失败，当前 %d 字节"
+          % len(web_module._OOM_PAGE))
+
+    app = web_module.AMS_WEB()
+    client = _FakeSocket()
+    app._sent = 0
+    check(app.oom_respond(client), "还没发过数据时应该能补上兜底响应")
+    head, _ = _split_head(client.content())
+    check(b"503" in head, "兜底响应状态码应该是 503")
+
+    app2 = web_module.AMS_WEB()
+    client2 = _FakeSocket()
+    app2._sent = 100          # 假装响应已经发出去一半了
+    check(not app2.oom_respond(client2), "已经发过数据时不能再补响应")
+    check_eq(len(client2.parts), 0, "此时不应该再往连接里写任何东西")
 
 
 def test_web_response_has_content_length():
@@ -676,6 +824,24 @@ def test_exchange_uses_bounded_wait():
     check("wait_msg()" not in src.replace("wait_msg_timeout(", ""),
           "换料流程里不能用无超时的 wait_msg()")
     check("wait_msg_timeout(" in src, "换料流程应该用带超时的等待")
+
+
+def test_ams_loop_waits_for_wifi_before_mqtt():
+    """★ WiFi 都没连上时不要空转重连 MQTT。
+
+    AP 配置模式下 STA 本来就没连网，旧逻辑每 10 秒建一次 MQTT 并打印
+    "未连接wifi"，串口日志全被噪音淹没，真正有用的报错反而看不清。
+    """
+    import inspect
+    from AMS_MODEL import AMS
+
+    src = inspect.getsource(AMS.run_ams_loop)
+    check("wlan_sta.isconnected()" in src, "重连 MQTT 之前必须先确认 WiFi 已连接")
+
+    idx_wifi = src.find("wlan_sta.isconnected()")
+    idx_conn = src.find("conent_and_subscribe()")
+    check(idx_wifi != -1 and idx_conn != -1 and idx_wifi < idx_conn,
+          "判断顺序不对：应该先看 WiFi，再决定要不要真的去连 MQTT")
 
 
 def test_ams_reconnect_is_time_based():

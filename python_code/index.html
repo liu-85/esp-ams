@@ -215,6 +215,7 @@ button.mini{padding:6px 11px;font-size:13px}
     <div class="kv"><span>原因说明</span><b id="d_cause_desc" class="diag-desc">-</b></div>
     <div class="kv"><span>启动次数</span><b id="d_boots">-</b></div>
     <div class="kv"><span>本次已运行</span><b id="d_uptime">-</b></div>
+    <div class="kv"><span>空闲内存</span><b id="d_mem">-</b></div>
     <div id="d_pins"></div>
     <div class="row" style="margin-top:10px">
       <button class="ghost" style="flex:1" onclick="reset_boot_count()">重置启动计数</button>
@@ -222,7 +223,8 @@ button.mini{padding:6px 11px;font-size:13px}
     <p class="tip">排查方法：点一次「重置启动计数」，然后**拔电重插**。等网页能打开时回来看这个数字 ——
       如果一次上电就涨了十几甚至几十，说明板子在反复重启。<br>
       复位原因是「冷启动」或「欠压复位」→ 先查供电（电源功率、线径、共地）；
-      是「看门狗复位」→ 有任务卡住了事件循环。</p>
+      是「看门狗复位」→ 有任务卡住了事件循环。<br>
+      空闲内存持续偏低（&lt; 20KB）→ 网页会变得不稳甚至打不开，先查是不是有任务在漏内存。</p>
   </section>
 
   <!-- ============ WiFi ============ -->
@@ -930,6 +932,17 @@ function updateDiagnostics(d){
       ? '<span class="warn">' + n + ' 次 · 在反复重启</span>'
       : n + ' 次';
   $('d_uptime').textContent = fmtUptime(r.uptime_ms);
+
+  // 空闲内存：页面有 40KB，靠"分块发送"才发得出去；
+  // 余量太小（< 20KB）时任何一次大分配都可能失败 → 页面打不开，所以标红。
+  var mem = (d && typeof d.mem_free === 'number') ? d.mem_free : -1;
+  if(mem < 0){
+    $('d_mem').textContent = '未知';
+  } else {
+    var memKb = (mem / 1024).toFixed(1) + ' KB';
+    $('d_mem').innerHTML = mem < 20480
+        ? '<span class="warn">' + memKb + ' · 偏低</span>' : memKb;
+  }
 
   var safety = (d && d.boot_safety) || {};
   var box = $('d_pins');

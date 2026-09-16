@@ -490,7 +490,7 @@ M400 U1
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | `GET` | `/` | 配置页面 |
-| `GET` | `/status` | ★ 聚合状态：IP / WiFi / MQTT / 通道 / 颜色 / 硬件 / 复位诊断，一次拿全 |
+| `GET` | `/status` | ★ 聚合状态：IP / WiFi / MQTT / 通道 / 颜色 / 硬件 / 复位诊断 / 内存余量，一次拿全 |
 | `GET` | `/wifi_scan` | 强制重新扫描 WiFi（阻塞约 2 秒，仅用户点击时调用） |
 | `GET` | `/boot_clear` | 把「启动次数」清零（排查复位循环时用） |
 | `POST` | `/wifi_connect` | `{"name":ssid,"password":pwd}` |
@@ -506,13 +506,17 @@ M400 U1
 
 | 问题 | 旧做法 | 现在 |
 | --- | --- | --- |
-| 页面极慢 | `index.html` **逐行发送**，每行 `await sleep(10ms)`，400 多行要 4 秒以上 | 整份读进内存缓存，带 `Content-Length` 一次发完 |
+| 页面极慢 | `index.html` **逐行发送**，每行 `await sleep(10ms)`，400 多行要 4 秒以上 | 整份文件用 `os.stat` 取长度、带 `Content-Length` 分块流式发送 |
+| **页面打不开**<br>`memory allocation failed` | 把 40KB 的页面 `f.read()` **整份读进内存**（还有一份 `.encode()` 拷贝），ESP32-C3 拿不到这么长的连续内存；而且缓存写不进去，**每个请求都在同一处再失败一次** | 每次只读 1KB（`FILE_CHUNK`）读一块发一块，单次最大分配 1KB；发送前 `gc.collect()` 收拢碎片 |
 | 每个请求白等 | accept 循环里 `await sleep(500ms)` | 改成 20ms 轮询 |
 | 偶尔打不开 | 读请求头用阻塞 `recv` + 3 秒超时，浏览器的空闲预连接会把服务端卡满 3 秒 | 非阻塞读 + `await` 让步，总上限 0.6 秒，等不到就丢掉连接 |
 | 页面卡死 | 主循环用阻塞的 `wait_msg()` 收 MQTT，把整个事件循环按住 | 改用非阻塞的 `poll_msg()`，没消息立刻返回 |
 | MQTT 频繁重连 | 「每 20 轮重连一次」，而每轮都阻塞，实际几秒断一次 | 改成按时间，每 5 分钟才重建 |
 | 状态灯拖慢网页 | `check_mqtt_connection()` 每秒真的发一次 `PINGREQ` | 按 5 秒节流（`MQTT_PING_INTERVAL_MS`） |
 | GC 过频 | `gc.threshold(1024)`：每分配 1KB 就回收一次 | 放宽到 16KB |
+
+> 🔴 **`FILE_CHUNK` 不要调大。** 它直接决定"服务网页时的最大单次内存分配"。
+> 1KB 在任何情况下都分配得出来；一调到 40KB 就退回上面那条 OOM 故障。
 
 这些改动都有对应的自动化测试守着（见 [本地开发与自测](#本地开发与自测)），
 防止以后改回去。
@@ -580,6 +584,11 @@ import device_processing
 | `PWRON_RESET`（反复出现） | 反复冷启动 | 同上；供电正常则查引脚是否被拉低 |
 | `WDT_RESET` / `RTC_WDT_RESET` | 看门狗复位 | 有任务阻塞了事件循环 |
 | `SOFT_RESET` | 软复位 | 正常（软件主动复位） |
+
+卡片里还有一行 **空闲内存**（`/status` 的 `mem_free` 字段），低于 20KB 会标红。
+配置页面有 40KB，是靠「分块发送」才发得出去的 —— 余量太小的时候，
+任何一次大分配都可能失败，网页就会不稳甚至打不开。另外**任何请求出错时，
+串口日志都会带上一句「空闲内存 xxx 字节」**，出问题先看这个数。
 
 ### 网页硬件面板
 
@@ -685,7 +694,7 @@ python tools/make_firmware_bin.py \
 python tests/run_tests.py
 ```
 
-共 54 项测试，分四块。
+共 58 项测试，分四块。
 
 **① 电磁离合安全约束**（核心，改动硬件层时必看）
 
@@ -708,16 +717,20 @@ python tests/run_tests.py
 | `test_network_scan_is_cached_and_sorted` | 扫描结果按信号排序去重，缓存有效期内不重复扫描 |
 | `test_network_missing_wifi_dat_is_safe` | 全新板子没有 `wifi.dat` 时必须安全降级，不能抛异常 |
 
-**③ 网页不会变慢的回归保护**
+**③ 网页不会变慢 / 不会打不开的回归保护**
 
 | 测试 | 验证内容 |
 | --- | --- |
-| `test_web_root_is_sent_in_one_shot` | ★ `index.html` 不能再逐行发送 + `sleep`，必须整份一次发完并内存缓存 |
+| `test_web_root_is_streamed_not_read_into_ram` | ★ 页面必须分块流式发送：不能有整份 `f.read()`、不能整份内存缓存、单块 ≤ 2KB |
+| `test_web_streams_real_index_html_byte_for_byte` | ★ 拿真机上那份 40KB 页面实跑：逐字节一致，且**单次发送不超过 1KB** |
+| `test_web_memory_error_sends_tiny_page_not_blank` | 内存不足时回一个极小的 503 提示页（且只在「一个字都没发出去」时才补） |
+| `test_web_send_file_reports_missing_file` | 页面文件缺失要回 500，不能把异常抛给请求循环 |
 | `test_web_header_read_is_not_blocking` | 读请求头必须非阻塞 + `await` 让步，且有总等待上限 |
 | `test_ams_loop_does_not_block_on_wait_msg` | ★ 主循环里不能再出现阻塞收包，必须用 `poll_msg()` |
+| `test_ams_loop_waits_for_wifi_before_mqtt` | WiFi 没连上时不要空转重连 MQTT（AP 模式下日志会被刷爆） |
 | `test_ams_reconnect_is_time_based` | 定期重连要按时间节流（≥1 分钟），不能几秒断一次 |
 | `test_mqtt_ping_throttling_behaviour` | 连续探测时，节流窗口内只应真的 `ping` 一次 |
-| `test_web_status_aggregates_everything` | `/status` 必须把页面需要的字段一次给全 |
+| `test_web_status_aggregates_everything` | `/status` 必须把页面需要的字段一次给全（含 `mem_free`） |
 
 **④ 复位诊断与引脚安全**（「接上负载就一直重启」的回归保护）
 
@@ -878,7 +891,8 @@ esptool.py --chip esp32c3 --port COM5 write_flash -z 0x0 esp32c3-ams-firmware.bi
 
 - **慢** —— `index.html` 以前是逐行发送、每行还 `await sleep(10ms)`，400 多行的
   页面光发 HTML 就要 4 秒以上；再加上 accept 循环里 `await sleep(500ms)`，
-  每个请求都要多等几百毫秒。现在整份缓存后一次发完，轮询间隔 20ms。
+  每个请求都要多等几百毫秒。现在用 `os.stat` 取长度、分块流式发送，
+  轮询间隔 20ms。
 - **偶尔打不开** —— 读请求头原来是阻塞 `recv` + 3 秒超时。浏览器会开「预连接」
   套接字却什么都不发，服务端就在那里卡满 3 秒，期间所有任务停摆。现在是非阻塞
   读 + `await` 让步，总等待上限 0.6 秒。
@@ -890,6 +904,41 @@ esptool.py --chip esp32c3 --port COM5 write_flash -z 0x0 esp32c3-ams-firmware.bi
 
 > 例外：**正在换料的那十几秒页面会卡一下**，这是有意为之。换料要精确控制电机
 > 时序，不能被协程调度打断。换料结束后页面会自己恢复。
+</details>
+
+<details>
+<summary><b>AP 能连上，但管理页打不开，串口一直刷 <code>memory allocation failed, allocating 36096 bytes</code></b></summary>
+
+这是**页面太大、被整份读进内存**导致的（已修）。
+
+ESP32-C3 的空闲堆只有几十 KB，而且碎片化严重；`index.html` 有 40KB，
+`f.read()` 要一次性拿到连续 40KB —— 直接失败。**更坑的是**：原来第二次请求
+想复用内存缓存，可是缓存根本没写进去，于是**每个请求都在同一个地方再失败一次**，
+页面就永远打不开，串口一直刷同一行错误。
+
+现在改成**分块流式发送**：`os.stat()` 取文件长度写进 `Content-Length`，
+正文每次只读 1KB（`FILE_CHUNK`）读一块发一块，单次最大分配 1KB，
+也不再有第二份 `.encode()` 拷贝；块与块之间 `await` 让步，发页面时换料主循环
+和状态灯不会被饿死。
+
+排查步骤：
+
+1. 刷最新的 `esp32c3-ams-firmware.bin`（地址 `0x0`，整片）。
+2. 看串口第一行：`配置页面 index.html（42088 字节）按 1024 字节分块发送，空闲内存 xxx 字节`。
+   **空闲内存低于 20KB 就不正常**（说明别处有泄漏），把这行日志发出来。
+3. 页面打开后看「上电诊断」卡片里的**空闲内存**一行，正常是几十 KB。
+
+> 顺带说一句：以后只要在串口看到「…（空闲内存 xxx 字节）」，就先看这个数字 ——
+> 所有请求异常都会带上它，OOM 类问题一眼就能判断余量。
+</details>
+
+<details>
+<summary><b>AP 模式下串口一直在刷「未连接wifi」/「MQTT 未连接，尝试重连」</b></summary>
+
+配置热点模式下 STA 本来就没连上路由器，反复去建 MQTT 是白费功夫。
+现在 `run_ams_loop` 会先判断 WiFi：没连上就退避 30 秒、日志降频，
+只打印 `WiFi 未连接，暂不重连 MQTT（等待配网）`。
+连上 WiFi 之后才会按原来的节奏（10 秒一次、每 6 次打一条）重连。
 </details>
 
 <details>

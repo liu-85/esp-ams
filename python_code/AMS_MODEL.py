@@ -383,6 +383,15 @@ class AMS(Bambu_mqtt_cliet):
                 # ---------------- 没连上 MQTT ----------------
                 if not self.check_mqtt_connection():
                     push_count += 1
+                    # ★ WiFi 都没连上时（典型场景：开机联网失败转成了配置热点），
+                    #   去建 MQTT 是纯白费功夫：旧逻辑每 10 秒刷一条"未连接wifi"，
+                    #   串口日志全被噪音淹没，真正有用的报错反而看不清。
+                    #   这里改成先看 WiFi，没连上就退避 30 秒、日志降频。
+                    if not self.wlan_sta.isconnected():
+                        if push_count % 6 == 1:
+                            logout("WiFi 未连接，暂不重连 MQTT（等待配网）")
+                        await asyncio.sleep(30)
+                        continue
                     if push_count % 6 == 1:
                         logout("MQTT 未连接，尝试重连（第 %d 次）" % push_count)
                     self.conent_and_subscribe()

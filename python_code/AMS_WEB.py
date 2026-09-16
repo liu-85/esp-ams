@@ -10,10 +10,18 @@ AMS_WEB.py —— Web 配置页面 + 任务调度
 --------------------------------------------------------------------------
 性能上踩过的坑（这一版重点修的就是这些）
 --------------------------------------------------------------------------
-1. **index.html 以前是一行一行发的**
-   旧代码 `for line in f: client.sendall(line); await asyncio.sleep_ms(10)`。
-   页面有 400 多行 → 光发 HTML 就要 4 秒以上，而且每行一个 TCP 小包。
-   现在：读一次、缓存到内存、带 Content-Length 一次性发出去。
+1. **index.html 不能整份读进内存（这一版最重要的修复）**
+   页面有 40 KB 左右。ESP32-C3 的空闲堆只有几十 KB 且碎片化严重，
+   `f.read()` 要一次性拿到连续的 36~42 KB —— 直接
+   `memory allocation failed, allocating 36096 bytes`。
+   更坑的是：原来第二次请求想复用缓存，但缓存根本没写进去，
+   于是**每个请求都在同一处再失败一次**，页面永远打不开（串口日志疯狂刷错）。
+   现在的做法：`os.stat()` 取文件长度写进 Content-Length，
+   然后每次只读 FILE_CHUNK（1 KB）字节直接 sendall，块间 await 让步。
+   单次最大分配从 40 KB 降到 1 KB，也不再有第二份 `.encode()` 拷贝。
+
+   （历史上还曾经是一行一行发的：`for line in f: sendall(line); sleep_ms(10)`，
+   400 多行光发 HTML 就要 4 秒以上，而且每行一个 TCP 小包。）
 
 2. **accept 循环里 `await asyncio.sleep_ms(500)`**
    每个请求平均要多等 250ms 才能被受理；浏览器一次要发好几个请求，
@@ -52,6 +60,7 @@ AMS_WEB.py —— Web 配置页面 + 任务调度
                           /get_access_info /get_hardware_info
 """
 
+import os
 import socket
 import ure
 import time
@@ -91,7 +100,11 @@ WEB_POLL_MS = 20            # accept 轮询间隔；越小网页响应越快，2
 HEADER_WAIT_MS = 600        # 读请求头的最长等待；浏览器预连接会空等，不能设太长
 SEND_TIMEOUT_S = 3.0        # 发送阶段超时，防止客户端半死不活把服务端拖住
 MAX_REQUEST_BYTES = 4096    # 请求头上限，异常请求直接丢
-SEND_CHUNK = 2048           # 大响应分片发送的块大小
+SEND_CHUNK = 2048           # 内存里已有的小响应（JSON）分片发送的块大小
+# ★ 从 flash 读文件时的单块大小。这个值直接决定了"服务网页时的最大单次内存分配"，
+#   必须远小于空闲堆：1 KB 在任何情况下都能分配出来，而且块间 await 让步，
+#   发 40 KB 页面时其它任务不会饿死。**不要调大！**
+FILE_CHUNK = 1024
 MQTT_PING_INTERVAL_MS = 5000  # MQTT 存活探测节流（keepalive=60s，5 秒一次足够）
 
 _REASON = {
@@ -100,7 +113,51 @@ _REASON = {
     400: "Bad Request",
     404: "Not Found",
     500: "Internal Server Error",
+    503: "Service Unavailable",
 }
+
+# 内存不够时的兜底页面：故意做得极小（几百字节，任何时候都发得出去），
+# 至少让浏览器有内容可显示，而不是一片空白让人摸不着头脑。
+_OOM_PAGE = (
+    "<!DOCTYPE html><html lang='zh-CN'><head><meta charset='utf-8'>"
+    "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+    "<title>内存不足</title></head><body style='font-family:sans-serif;padding:24px'>"
+    "<h2 style='color:#d33'>设备内存不足</h2>"
+    "<p>配置页面无法发送：ESP32-C3 没能分配到足够的连续内存。</p>"
+    "<p>把板子断电重插再试；若反复出现，请把串口日志里带『空闲内存』的那几行发出来。</p>"
+    "</body></html>"
+)
+
+
+# ---------------------------------------------------------------------------
+# 内存 / 文件长度小工具
+# ---------------------------------------------------------------------------
+def file_size(path):
+    """取文件字节数；文件不存在就返回 None。
+
+    ★ MicroPython 的 os.stat() 返回的是元组，**没有 st_size 属性**，
+      只能按下标取第 7 项（size）。
+    """
+    try:
+        return os.stat(path)[6]
+    except OSError:
+        return None
+
+
+def mem_free():
+    """当前空闲堆字节数。
+
+    MicroPython 有 gc.mem_free()，桌面端 CPython 没有 —— 返回 -1 表示"不知道"。
+    """
+    try:
+        return gc.mem_free()
+    except Exception:
+        return -1
+
+
+def mem_note():
+    """给日志用的一小段内存提示，OOM 时就是靠它判断余量"""
+    return "空闲内存 %d 字节" % mem_free()
 
 
 class AMS_WEB(AMS):
@@ -115,7 +172,11 @@ class AMS_WEB(AMS):
             self.LED = PWM(Pin(LED_PIN))
             self.LED.freq(1000)
             self.LED.duty(0)
-        self._index_cache = None      # index.html 的内存缓存
+        # ★ 注意：这里**故意没有** index.html 的内存缓存。
+        #   页面 40 KB，缓存进内存会让每个请求都要连续分配 40 KB → 必然 OOM。
+        #   改成打开文件、分块 sendall（见 send_file）。
+        self._sent = 0                # 本次连接已发出的字节数（OOM 兜底时判断还能不能回包）
+        self._page_logged = False     # 页面首次发送的日志只打一次，别刷屏
 
     # ======================================================================
     # 配置读写
@@ -134,6 +195,15 @@ class AMS_WEB(AMS):
     # ======================================================================
     # HTTP 基础
     # ======================================================================
+    def _raw_send(self, client, data):
+        """唯一的出口：记录已发字节数，供 OOM 兜底判断"还能不能回一段话"。
+
+        响应发到一半再触发内存错误时，绝不能再补一个新的 HTTP 响应头
+        （那会把响应体拼坏），所以必须知道当前连接是不是干净的。
+        """
+        client.sendall(data)
+        self._sent += len(data)
+
     def send_header(self, client, status_code=200, content_length=None,
                     is_json=False, ctype=None, extra=None):
         if ctype is None:
@@ -150,20 +220,73 @@ class AMS_WEB(AMS):
         if extra:
             head += extra
         head += "\r\n"
-        client.sendall(head)
+        self._raw_send(client, head)
 
     def send_response(self, client, payload, status_code=200, is_json=False,
                       ctype=None, extra=None):
-        """发送响应。大响应分片发，避免一次性占满 socket 缓冲区。"""
+        """发送内存里已有的响应。大响应分片发，避免一次性占满 socket 缓冲区。"""
         body = payload.encode() if isinstance(payload, str) else payload
         self.send_header(client, status_code, len(body),
                          is_json=is_json, ctype=ctype, extra=extra)
         total = len(body)
         offset = 0
         while offset < total:
-            client.sendall(body[offset:offset + SEND_CHUNK])
+            self._raw_send(client, body[offset:offset + SEND_CHUNK])
             offset += SEND_CHUNK
         return True
+
+    async def send_file(self, client, path, ctype=None, extra=None):
+        """把磁盘上的文件分块流式发给客户端，返回是否成功。
+
+        ★ 这是"页面打不开"的根治办法，也是本文件最不能改回整份读的地方：
+          ESP32-C3 的空闲堆只有几十 KB 且碎片化，`f.read()` 一次要连续 40 KB
+          → `memory allocation failed`。而且缓存写不进去，每个请求都会
+          在同一个地方再失败一次，表现就是"AP 能连上、管理页永远打不开"。
+
+          现在：文件长度用 os.stat 取（写进 Content-Length，浏览器才知道何时结束），
+          正文每次只读 FILE_CHUNK 字节读一块发一块 —— 单次最大分配 1 KB，
+          也没有第二份 `.encode()` 拷贝；块间 await 让步，发大页面时
+          换料主循环和状态灯不会被饿死。
+
+        ctype：默认 text/html；读出来的是二进制原文，不做任何解码。
+        """
+        size = file_size(path)
+        if size is None:
+            logout("读取 %s 失败：文件不存在或无法访问（%s）" % (path, mem_note()),
+                   is_error=True)
+            self.send_response(client, "文件缺失: %s" % path, status_code=500)
+            return False
+
+        gc.collect()                 # 先把碎片收拢，再开始发
+        self.send_header(client, 200, size, ctype=ctype, extra=extra)
+
+        sent = 0
+        with open(path, "rb") as f:  # 必须 rb：按原始字节发，避免任何解码缓冲
+            while True:
+                chunk = f.read(FILE_CHUNK)
+                if not chunk:
+                    break
+                self._raw_send(client, chunk)
+                sent += len(chunk)
+                await asyncio.sleep_ms(0)   # ★ 让出事件循环，别把其它任务饿死
+
+        if sent != size:
+            logout("%s 实际发出 %d 字节，与 Content-Length %d 不一致" % (path, sent, size),
+                   is_error=True)
+        return True
+
+    def oom_respond(self, client):
+        """内存不足时的兜底：只在"一个字都还没发出去"时才补一个 503。
+
+        否则（响应已发一半）宁可断开，也不能把半个响应拼上去。
+        """
+        if self._sent:
+            return False
+        try:
+            self.send_response(client, _OOM_PAGE, status_code=503)
+            return True
+        except Exception:
+            return False
 
     def process_json(self, request):
         """从原始请求里抠出 JSON 请求体"""
@@ -211,6 +334,8 @@ class AMS_WEB(AMS):
             # 复位诊断：接负载后"一直重启"到底是欠压还是引脚接错，看这两个字段
             "reset": reset_info.summary(),
             "boot_safety": BOOT_SAFETY,
+            # 内存余量：出现「页面打不开 / memory allocation failed」时先看它
+            "mem_free": mem_free(),
         }
 
     async def get_status(self, client):
@@ -274,20 +399,20 @@ class AMS_WEB(AMS):
     # 首页
     # ======================================================================
     async def hanld_rootv2(self, client):
-        """发送配置页面。
+        """发送配置页面（从 flash 分块流式发送）。
 
-        旧实现是逐行 sendall + 每行 sleep 10ms，400 多行的页面要 4 秒以上。
-        现在整份文件读进内存缓存，带 Content-Length 一次发完，几十毫秒搞定。
+        ★ 千万不要改回"整份读进内存"：
+          页面有 40 KB，ESP32-C3 的空闲堆只有几十 KB 且碎片化，`f.read()`
+          必然报 `memory allocation failed, allocating 36096 bytes`；
+          更糟的是缓存写不进去，于是每个请求都在同一处再失败一次，
+          现象就是"AP 能连上、管理页怎么都打不开"。
+          具体取舍见 send_file() 的注释。
         """
-        if self._index_cache is None:
-            try:
-                with open(INDEX_FILE, "r") as f:
-                    self._index_cache = f.read()
-            except OSError as e:
-                logout("读取 %s 失败: %s" % (INDEX_FILE, e), is_error=True)
-                self.send_response(client, "index.html 缺失: %s" % e, status_code=500)
-                return
-        self.send_response(client, self._index_cache, is_json=False)
+        if not self._page_logged:
+            self._page_logged = True
+            logout("配置页面 %s（%d 字节）按 %d 字节分块发送，%s"
+                   % (INDEX_FILE, file_size(INDEX_FILE) or 0, FILE_CHUNK, mem_note()))
+        await self.send_file(client, INDEX_FILE)
 
     # 语义更清楚的新名字
     handle_root = hanld_rootv2
@@ -588,8 +713,16 @@ class AMS_WEB(AMS):
                 else:
                     self.handle_not_found(client, url)
 
+            except MemoryError as e:
+                # ★ 内存不足：先记录现场，再回收碎片，最后尽量给浏览器一句人话，
+                #   并把"还剩多少内存"打进日志 —— 下次再 OOM 才有据可查。
+                before = mem_note()
+                gc.collect()
+                logout("处理请求出错: 内存不足（%s）；%s，回收后 %s"
+                       % (e, before, mem_note()), is_error=True)
+                self.oom_respond(client)
             except Exception as e:
-                logout("处理请求出错: " + str(e), is_error=True)
+                logout("处理请求出错: " + str(e) + "（" + mem_note() + "）", is_error=True)
             finally:
                 try:
                     client.close()
