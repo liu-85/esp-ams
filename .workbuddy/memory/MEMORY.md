@@ -37,6 +37,23 @@ GitHub: https://github.com/liu-85/esp-ams （remote origin，main 分支）
 ```bash
 python tests/run_tests.py      # 桌面自测，无需板子（18 项）
 python tools/build_mpy.py      # mpy-cross 交叉编译 + 打包，产物 dist/ 与 esp32c3-ams-mpy.zip
+python tools/make_firmware_bin.py   # 生成单文件一键烧录固件 dist/esp32c3-ams-firmware.bin
 ```
 
 `mpy-cross` 版本必须与板子固件一致，当前 CI 用 1.23.0（mpy v6.3）。
+
+## 单文件固件（一键烧录）约定【重要】
+
+- 产物 `dist/esp32c3-ams-firmware.bin` = 官方固件(0x0) + littlefs 镜像(0x200000)，
+  共 4MB，`esptool write_flash 0x0` 一把烧完，设备开机即跑。
+- **文件系统必须是 littlefs**：C3 v1.23.0 的 `vfs` 分区 subtype 虽标 0x81，
+  实际由 `flashbdev.py` + `inisetup.py` 走 `VfsLfs2`。镜像 block0/1 的
+  offset 8 必须有 `"littlefs"` 魔数，否则 `_boot.py` 挂载失败 → 死循环报
+  "filesystem appears to be corrupted"。
+- **镜像必须用与设备同源的 littlefs 2.8.0 生成**（`tools/lfs_mkfs.c` 链接
+  上游源码），不要用 pip 的 littlefs-python 直接生成（它带 2.11，有小文件
+  inline 特性，存在兼容风险；只用于反向校验）。
+- 升级 MicroPython 时**五个变量必须同步**：`MICROPYTHON_VERSION`、
+  `LITTLEFS_VERSION`、`MPY_CROSS_VERSION`、固件下载 URL、固件 SHA256。
+- CI：push 任意分支/ tag 即触发；push main 更新滚动 `latest` 预发布，
+  打 `v*` tag 发正式 Release。产物：`.mpy` 压缩包 + 单个固件 BIN。
