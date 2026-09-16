@@ -53,13 +53,33 @@ class Bambu_mqtt_cliet(network_model):
         self.new_message = msg.decode()
         
     def auto_conent_MQTT(self,file_path):
+        """开机自动连打印机：从 config.json 读配置。
+
+        ★ 一律用 .get() 带默认值。老版本的配置模板把访问码存在 "password" 这个
+          键上，而网页一直写的是 "mqtt_password"；直接下标取会 KeyError，
+          被整个 except 吞掉 → 表现就是"配置明明保存了，却永远不自动连接"。
+        """
         try:
-            data = read_json_file(file_path)
-            self.mqtt_update_info(mqtt_server=data["mqtt_server"],DEVICE_SERIAL=data["DEVICE_SERIAL"],password=data["mqtt_password"],username=data["username"],client_id=data["client_id"],mqtt_port=data["mqtt_port"])
-            return self.conent_and_subscribe()
+            data = read_json_file(file_path) or {}
         except Exception as e:
-            logout("error:"+str(e),is_error = True)
+            logout("读取打印机配置失败: " + str(e), is_error=True)
             return False
+
+        server = str(data.get("mqtt_server") or "").strip()
+        serial = str(data.get("DEVICE_SERIAL") or "").strip()
+        password = str(data.get("mqtt_password") or data.get("password") or "").strip()
+        if not (server and serial and password):
+            logout("打印机 MQTT 尚未配置完整（IP / 序列号 / 访问码），跳过自动连接")
+            return False
+
+        self.mqtt_update_info(mqtt_server=server,
+                              DEVICE_SERIAL=serial,
+                              password=password,
+                              username=str(data.get("username") or "bblp").strip() or "bblp",
+                              client_id=str(data.get("client_id") or "mqttx_3c73cd31").strip()
+                                        or "mqttx_3c73cd31",
+                              mqtt_port=str(data.get("mqtt_port") or "8883").strip() or "8883")
+        return self.conent_and_subscribe()
     def update_print_info(self):
         # 处理信息
         data = ujson.loads(self.new_message).get("print",{}) # 加载数据

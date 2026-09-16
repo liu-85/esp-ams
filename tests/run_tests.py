@@ -1108,8 +1108,446 @@ def test_status_exposes_reset_diagnostics():
 
     for key in ("cause", "cause_desc", "boot_count", "uptime_ms", "power_suspect"):
         check(key in info["reset"], "reset 缺少字段 %s" % key)
-    for key in ("ok", "report", "problems"):
+    for key in ("ok", "problems"):
         check(key in info["boot_safety"], "boot_safety 缺少字段 %s" % key)
+
+    # ★ 反向断言：report 是整段中文接线表，dumps 之后体积翻几倍，
+    #   它一进 /status，空闲堆小的板子就会 OOM ——
+    #   现象是"页面能打开，但运行状态全是 -、通道一直加载中"。
+    check("report" not in info["boot_safety"],
+          "boot_safety 不能再带 report：那是整段中文文本，会把 /status 撑到 OOM")
+
+
+def test_status_is_small_enough_for_the_board():
+    """★ /status 的体积必须受控
+
+    它是每 2 秒被打一次的接口，体积一大就变成"内存杀手"。
+    这条守的是本次"页面能开、数据全空"的故障不再复发。
+    """
+    import ujson
+    from AMS_WEB import AMS_WEB
+
+    app = AMS_WEB()
+    app._scan_cache = ["一个挺长的WiFi名字_%02d" % i for i in range(40)]
+
+    raw = ujson.dumps(app._status_dict())
+    check(len(raw) < 2400,
+          "/status 的 JSON 太大了（%d 字符），会把空闲堆吃光；"
+          "只放网页真正用到的字段，长文本要截断" % len(raw))
+    check(app._status_dict()["ssids"] is not None, "ssids 字段永远要有值（可以是空列表）")
+    check(len(app._status_dict()["ssids"]) <= 12,
+          "ssids 要限量，否则附近 WiFi 一多 /status 就爆")
+
+
+def test_status_survives_broken_fields():
+    """★ 单个字段取不到值时，/status 必须整体仍然可用
+
+    任何一个字段抛异常就让整页变空白，现象是"页面能打开、数据全是 -"，
+    排查起来极其痛苦。
+    """
+    import ujson
+    from AMS_WEB import AMS_WEB
+
+    app = AMS_WEB()
+
+    def boom():
+        raise ValueError("模拟某个状态字段炸了")
+
+    app.sta_ip = boom
+    app.status_text = boom
+    app._hardware_dict = boom
+
+    info = app._status_dict()
+    check(info["ip"] == "", "取不到 IP 时要回空字符串，而不是抛出去")
+    check(info["wifi_status_text"] == "", "取不到状态文案时要回空字符串")
+    check_eq(info["hardware"], {}, "取不到硬件状态时要回空字典")
+    check(ujson.dumps(info), "/status 即使有字段失败也要能序列化出去")
+
+
+def test_request_reader_waits_for_post_body():
+    """★ POST 的请求体必须读完
+
+    旧代码读到 `\\r\\n\\r\\n` 就返回，而 JSON 请求体常常在下一个 TCP 段里。
+    于是解析出 None → 路由条件不成立 → 掉进 404，
+    网页上就是"MQTT 设置保存提示 404，而且什么都没存进去"。
+    """
+    import inspect
+    import AMS_WEB as web_module
+
+    src = inspect.getsource(web_module.AMS_WEB._read_request)
+    check("_content_length" in src,
+          "读请求时必须解析 Content-Length，否则请求体永远读不全")
+    check("head_end" in src and "body_len" in src,
+          "必须区分请求头和请求体，按长度把请求体收齐")
+
+    body = b'{"mqtt_server":"192.168.1.9","DEVICE_SERIAL":"SN1","mqtt_password":"1234"}'
+    head = (b"POST /mqtt_connect HTTP/1.1\r\nHost: x\r\n"
+            b"Content-Length: %d\r\n\r\n" % len(body))
+    check(web_module._content_length(head) == len(body),
+          "_content_length 解析结果不对")
+
+
+def test_content_length_parsing_is_robust():
+    """Content-Length 的解析要经得起脏输入（大小写、缺字段、非数字）"""
+    from AMS_WEB import _content_length
+
+    check_eq(_content_length(b"GET / HTTP/1.1\r\n\r\n"), 0, "GET 没有 Content-Length，应该是 0")
+    check_eq(_content_length(b"POST / HTTP/1.1\r\ncontent-length: 42\r\n\r\n"), 42,
+             "请求头字段名大小写不固定")
+    check_eq(_content_length(b"POST / HTTP/1.1\r\nContent-Length: abc\r\n\r\n"), 0,
+             "非数字时要回 0，不能抛异常")
+    check_eq(_content_length(b"POST / HTTP/1.1\r\nContent-Length:  7 \r\n\r\n"), 7,
+             "数字两边可能有空格")
+
+
+class _FakeReadSocket:
+    """按"每次 recv 给一段"来喂数据，模拟 TCP 分段到达"""
+
+    def __init__(self, segments):
+        self.segments = list(segments)
+        self.blocking = True
+
+    def setblocking(self, flag):
+        self.blocking = flag
+
+    def recv(self, size):
+        if not self.segments:
+            return b""              # 对端没有更多数据了
+        return self.segments.pop(0)
+
+
+def test_read_request_collects_body_arriving_in_a_later_segment():
+    """★ 请求体在下一个 TCP 段里时，也必须被读齐
+
+    这是"Mqtt设置保存提示404"的直接复现：旧代码只读到空行为止，
+    请求体留在 socket 里没读，于是解析出 None → 路由不成立 → 404。
+    """
+    import ujson
+    import uasyncio as _asyncio
+    from AMS_WEB import AMS_WEB
+
+    app = AMS_WEB()
+    body = b'{"mqtt_server":"192.168.1.9","DEVICE_SERIAL":"SN1","mqtt_password":"pw"}'
+    head = (b"POST /mqtt_connect HTTP/1.1\r\nHost: ams\r\n"
+            b"Content-Length: %d\r\n\r\n" % len(body))
+
+    raw = _asyncio.run(app._read_request(_FakeReadSocket([head, body])))
+    check(raw is not None, "请求必须能被读到")
+    check(raw.endswith(body), "请求体必须被读完（旧代码就在这里丢掉请求体，然后回 404）")
+    check_eq(app.process_json(raw), ujson.loads(body),
+             "读全之后必须能解析出 JSON，路由条件才成立")
+
+    # 反过来：只给请求头（客户端没发体）时不能卡住，也不能假装读到了体
+    only_head = _asyncio.run(app._read_request(_FakeReadSocket([head])))
+    check(only_head is not None, "只有请求头时也要能返回，不能卡死")
+    check_eq(app.process_json(only_head), None, "没有请求体就应该解析出 None")
+
+
+def test_send_response_handles_non_ascii_content_length():
+    """★ 中文响应的 Content-Length 必须是 UTF-8 字节数
+
+    用 len(字符串) 当长度（字符数）会让浏览器少收或多收字节，
+    页面上就是"JSON 解析失败"或白屏。同时验证单块发送不会太大。
+    """
+    import ujson
+    from AMS_WEB import AMS_WEB, ENC_CHUNK
+
+    app = AMS_WEB()
+    sock = _FakeSocket()
+    payload = ujson.dumps({"cause_desc": "★ 欠压复位：供电电压掉到了阈值以下" * 8})
+    app.send_response(sock, payload, is_json=True)
+
+    raw = sock.content()
+    head, body = _split_head(raw)
+    length = None
+    for line in head.split(b"\r\n"):
+        if line.lower().startswith(b"content-length:"):
+            length = int(line.split(b":")[1].strip())
+    check(length is not None, "响应必须带 Content-Length")
+    check_eq(length, len(body), "Content-Length 必须是正文字节数")
+    check_eq(ujson.loads(body.decode("utf-8"))["cause_desc"],
+             ujson.loads(payload)["cause_desc"], "中文内容必须一字不差地送达")
+
+    check(ENC_CHUNK <= 1024,
+          "字符串响应的单块大小要足够小（当前 %d），否则又会出现一大块连续分配" % ENC_CHUNK)
+    check(max(sock.chunks) <= ENC_CHUNK * 4 + 256,
+          "单次 sendall 不应该出现整份响应那样的大块")
+
+
+def test_write_routes_never_answer_404_for_empty_body():
+    """★ 写接口收到空请求体要回 400，不能回 404
+
+    404 会说成"接口不存在"，把用户带到完全错误的方向；
+    真实原因只是请求体没读全。
+    """
+    import inspect
+    import AMS_WEB as web_module
+
+    for name in ("wifi_connect", "mqtt_connect", "access_set", "hardware_test"):
+        check(name in web_module.WRITE_ROUTES, "%s 应被视为写接口" % name)
+
+    src = inspect.getsource(web_module.AMS_WEB.run_web_loop)
+    check("handle_bad_body" in src,
+          "写接口的请求体为空时必须走 handle_bad_body（回 400），不能落到 404")
+
+    bad = inspect.getsource(web_module.AMS_WEB.handle_bad_body)
+    check("400" in bad, "空请求体要回 400 Bad Request")
+
+
+def test_mqtt_config_is_saved_before_connecting():
+    """★ MQTT 配置必须"先落盘，再连接"
+
+    旧代码只有连上打印机才写 config.json。而 AP 配置模式下根本没联网，
+    MQTT 必然连不上 —— 于是保存永远失败、配置永远存不下来，
+    重启之后还得重填。
+    """
+    import inspect
+    import AMS_WEB as web_module
+
+    check("先落盘" in (web_module.AMS_WEB.handle_mqtt_cennect.__doc__ or ""),
+          "函数注释里要写明「先落盘再连接」这个约定")
+
+    # ★ 用 _code_only：注释和文档字符串里也会出现 conent_and_subscribe 这些
+    #   名字，直接搜源码文本会被"提示性文字"带偏。
+    src = _code_only(web_module.AMS_WEB.handle_mqtt_cennect)
+    check("updata_data" in src, "必须调用 updata_data 真正写 config.json")
+
+    # 写盘必须发生在连接尝试之前
+    idx_save = src.find("updata_data")
+    idx_conn = src.find("conent_and_subscribe")
+    check(idx_save != -1 and idx_conn != -1 and idx_save < idx_conn,
+          "顺序不对：配置要先写盘，再去尝试连接打印机（AP 模式下连不上是必然的）")
+    check('"saved"' in src and '"connected"' in src,
+          "返回里要有 saved / connected，网页才能给出准确提示")
+
+
+def test_mqtt_defaults_fill_blank_fields():
+    """用户名 / 客户端名 / 端口留空时用默认值补齐，不该直接报错"""
+    from AMS_WEB import MQTT_DEFAULTS, MQTT_REQUIRED
+
+    check_eq(MQTT_DEFAULTS.get("username"), "bblp", "默认用户名")
+    check_eq(MQTT_DEFAULTS.get("mqtt_port"), "8883", "默认端口")
+    check("mqtt_server" in MQTT_REQUIRED, "打印机 IP 是必填项")
+    check("mqtt_password" in MQTT_REQUIRED, "访问码是必填项")
+    check("client_id" not in MQTT_REQUIRED, "客户端名有默认值，不该强制填写")
+
+
+def test_wifi_connect_closes_ap_after_success():
+    """★ 配网成功后要关掉配置热点
+
+    这是"WiFi 连上之后就不再显示配网卡片"能成立的前提 ——
+    网页只在 AP 模式下显示 WiFi 配置。
+    """
+    import inspect
+    import AMS_WEB as web_module
+
+    src = inspect.getsource(web_module.AMS_WEB.handle_wifi_cennect)
+    idx_send = src.find("send_response")
+    idx_ap = src.find("swcith_ap(0)")
+    check(idx_ap != -1, "配网成功后必须关闭配置热点")
+    check(idx_send != -1 and idx_send < idx_ap,
+          "必须先回包给浏览器，再关热点；反了客户端会丢掉「连接成功」这句话")
+
+
+def test_ap_can_be_toggled_from_web():
+    """★ 网页上必须能把配置热点再打开
+
+    联网后 WiFi 配置卡片就藏起来了，没有这个入口，想换 WiFi 只能重刷固件。
+    """
+    import inspect
+    import AMS_WEB as web_module
+
+    check(hasattr(web_module.AMS_WEB, "handle_ap_set"), "缺少 /ap_set 处理函数")
+    src = inspect.getsource(web_module.AMS_WEB.handle_ap_set)
+    check("swcith_ap" in src, "/ap_set 要真的去开/关热点")
+
+    routes = inspect.getsource(web_module.AMS_WEB.run_web_loop)
+    check('"ap_set"' in routes, "/ap_set 必须挂进路由")
+    check('"log"' in routes, "/log 必须挂进路由")
+
+
+def test_log_ring_buffer_is_bounded():
+    """★ 日志环形缓冲必须限量
+
+    网页右侧的日志面板靠它拿数据。不限制行数和行长的话，
+    它自己就会变成内存泄漏点。
+    """
+    import logout as log_module
+
+    saved = list(log_module._log_lines) if hasattr(log_module, "_log_lines") else []
+    try:
+        log_module.clear()
+        for i in range(log_module.LOG_MAX_LINES * 3):
+            log_module.logout("测试日志 %d" % i, is_print=False)
+        lines = log_module.recent()
+        check_eq(len(lines), log_module.LOG_MAX_LINES,
+                 "缓冲里只应保留 LOG_MAX_LINES 行")
+        check(len(lines[-1]) <= log_module.LOG_LINE_MAX + 12,
+              "每行都要截断（时间戳另算），否则一条超长日志就能吃掉整块内存")
+
+        long_text = "x" * (log_module.LOG_LINE_MAX * 5)
+        log_module.logout(long_text, is_print=False)
+        check(log_module.recent(1)[0].find("x" * (log_module.LOG_LINE_MAX + 1)) == -1,
+              "超长日志必须被截断")
+
+        check_eq(len(log_module.recent(3)), 3, "recent(n) 要能只取 n 行")
+        check(log_module.recent(3) is not log_module._log_lines,
+              "recent 必须返回副本，不能把内部列表交给调用方")
+    finally:
+        log_module.clear()
+        for line in saved:
+            log_module._log_lines.append(line)
+
+
+def test_log_endpoint_returns_recent_lines():
+    """/log 要能返回日志，并且体积受控"""
+    import inspect
+    import AMS_WEB as web_module
+    from AMS_WEB import LOG_TAIL
+
+    check(0 < LOG_TAIL <= 60, "LOG_TAIL 要在合理范围内，当前 %r" % (LOG_TAIL,))
+    src = inspect.getsource(web_module.AMS_WEB.get_log)
+    check("recent_logs" in src, "/log 要从环形缓冲里取数据")
+    check("LOG_TAIL" in src, "/log 要限量，不能把整个缓冲发出去")
+
+
+# ===========================================================================
+# 网页（index.html）的回归保护
+#
+# 页面里最容易"改着改着就退回去"的是这几件事：
+#   · 通道必须默认就画出 4 个（不能等接口）
+#   · WiFi 配置只在配置热点开启时出现
+#   · 每个目录默认折叠
+#   · 右下角常驻设备日志
+# 这些都是"用户能直接看见"的行为，所以用源码级断言钉住。
+# ===========================================================================
+def _page_source():
+    with open(os.path.join(SRC_DIR, "index.html"), encoding="utf-8") as handle:
+        return handle.read()
+
+
+def test_page_renders_four_channels_without_waiting():
+    """★ 通道必须默认就是 4 个，而且**不能等接口回来才画**
+
+    以前 renderAccess 只在 applyStatus 里被调用，接口一慢/一出错，
+    整页就永远停在"加载中…" —— 用户看到的就是"默认 4 个通道没显示出来"。
+    """
+    page = _page_source()
+    check("DEFAULT_CHANNELS = [1, 2, 3, 4]" in page,
+          "页面里要有 DEFAULT_CHANNELS = [1, 2, 3, 4] 这个默认值")
+    check("renderAccess(DEFAULT_CHANNELS" in page,
+          "boot() 里要先用默认值把通道画出来")
+    check("ensureHwButtons(DEFAULT_CHANNELS)" in page,
+          "硬件调试页也要先用默认通道把点动按钮画出来")
+    # 通道 / 硬件这两块**不能**留"加载中…"占位：接口不通时用户看到的
+    # 应该是一套可用的界面，而不是永远转圈。
+    body = page[page.find("<body>"):page.find("<script>")]
+    for anchor in ('id="access_info"', 'id="hardware_info"', 'id="hardware_test"'):
+        pos = body.find(anchor)
+        check(pos >= 0, "页面缺少结构：%s" % anchor)
+        check("加载中" not in body[pos:pos + 160],
+              "%s 里不该写死「加载中…」占位" % anchor)
+
+
+def test_page_wifi_card_only_in_ap_mode():
+    """★ WiFi 配置只在"配置热点开着"的时候出现
+
+    用户的诉求：连上网之后就别再显示这个卡片了。
+    """
+    page = _page_source()
+    check("apOnly" in page, "WiFi 菜单项要标成 apOnly")
+    check("applyWifiVisibility" in page, "要根据 ap_on 决定 WiFi 菜单项显不显示")
+    check("apOn = !!d.ap_on" in page, "apOn 必须来自 /status 的 ap_on 字段")
+
+    src = page[page.find("function applyWifiVisibility"):]
+    src = src[:src.find("function showPage")]
+    check("'hide'" in src, "热点关掉时要把 WiFi 菜单项藏起来")
+    check("showPage('status')" in src,
+          "正停在 WiFi 页而热点关掉了，要自动挪回运行状态（否则是一页空白）")
+
+    # 藏起来靠的是 CSS 类，不是内联 display —— 内联 display 会被 showPage
+    # 的 classList 操作绕过去，容易出现"藏了又冒出来"。
+    check(".item.hide{display:none}" in page,
+          "要有 .item.hide 这条 CSS 规则，光加类名不生效")
+
+
+def test_page_directories_stay_folded_on_boot():
+    """★ 开机 / 刷新时，一个目录都不许自动展开
+
+    之前 showPage() 会"顺手"展开当前页所在目录，而 boot() 一定会调一次
+    showPage()，结果侧栏一进来就有一个目录是摊开的 —— 跟"每个目录默认折叠"
+    直接矛盾（实测：3 个目录里 1 个 open）。
+    现在展开只发生在"用户自己点菜单"这一条路径上。
+    """
+    page = _page_source()
+
+    # 1) 用户点菜单项 → 显式要求展开所在目录
+    menu = page[page.find("function buildMenu"):]
+    menu = menu[:menu.find("function openKeys")]
+    check("showPage(it.id, true)" in menu,
+          "点菜单项时要传 autoReveal=true 展开所在目录")
+
+    # 2) showPage 必须用这个开关把"自动展开"关在门外
+    fn = page[page.find("function showPage"):]
+    fn = fn[:fn.find("function toggleMenu")]
+    check("function showPage(id, autoReveal)" in fn,
+          "showPage 要接收 autoReveal 参数")
+    guard = fn.find("if(autoReveal){")
+    reveal = fn.find("classList.add('open')")
+    check(guard >= 0, "展开目录的代码要包在 if(autoReveal) 里")
+    check(reveal > guard,
+          "classList.add('open') 必须出现在 if(autoReveal){ 之后，不能无条件执行")
+
+    # 3) 开机那次调用绝不能自动展开
+    boot = page[page.find("function boot"):]
+    boot = boot[:boot.find("if(document.readyState")]
+    check("showPage(store(PAGE_KEY) || 'status')" in boot,
+          "boot() 里初始化页面时不能传 autoReveal，否则默认就有目录是开的")
+
+
+def test_page_menu_starts_folded():
+    """★ 每个目录默认折叠
+
+    展开状态记在 localStorage，默认值必须是"空"（=全部折叠）。
+    """
+    page = _page_source()
+    check("OPEN_KEY" in page, "目录展开状态要持久化，避免每次刷新都变样")
+    check("store(OPEN_KEY) || ''" in page, "没有记录时应该当成「全部折叠」")
+
+    # 菜单是 JS 动态生成的，初始 HTML 里不应有写死的 open
+    nav = page[page.find('<nav id="menu">'):]
+    nav = nav[:nav.find("</nav>")]
+    check("open" not in nav, "初始菜单里不能有写死的展开状态")
+
+
+def test_page_has_left_menu_and_log_panel():
+    """★ 左侧菜单 + 右侧内容 + 右下角常驻设备日志"""
+    page = _page_source()
+    for token in ('class="app"', 'class="side"', 'class="main"',
+                  'id="menu"', 'id="content"', 'id="logbox"', 'id="log_lines"'):
+        check(token in page, "页面缺少结构：%s" % token)
+    check("设备日志" in page, "右下角要是「设备日志」面板")
+    check("pollLog" in page and "/log" in page, "日志面板要真的去拉 /log")
+    check("scrollTop = box.scrollHeight" in page,
+          "新日志到达时要自动滚到底（否则用户永远看到最旧的一行）")
+
+
+def test_page_reports_mqtt_save_result_precisely():
+    """网页要说清楚「保存成功但没连上」和「彻底失败」的区别"""
+    page = _page_source()
+    check("/mqtt_connect" in page, "页面要调用 /mqtt_connect")
+    check("d.connected" in page and "d.saved" in page,
+          "要根据 saved / connected 给不同的提示，不能笼统报成功")
+
+
+def test_page_never_builds_request_body_outside_json():
+    """POST 必须带 JSON 请求体 —— 空体在真机上会被判成 400"""
+    page = _page_source()
+    check("JSON.stringify(data)" in page,
+          "写操作必须把参数 JSON 序列化后放进 body")
+    check("'Content-Type':'application/json'" in page,
+          "必须声明 Content-Type，否则服务端没法识别")
+
 
 
 def test_led_can_be_disabled():

@@ -219,8 +219,8 @@ yaoams/
 │   ├── hardware_config.py        # ★ 唯一的硬件配置入口：引脚、时序、降级参数
 │   ├── network_model.py          # WiFi 连接管理（AP / STA）
 │   ├── info_load.py              # 配置文件读写（wifi.dat / config.json）
-│   ├── logout.py                 # 日志输出
-│   ├── index.html                # Web 配置页面（含硬件调试面板）
+│   ├── logout.py                 # 日志输出（串口 + 内存环形缓冲，供网页日志面板读）
+│   ├── index.html                # Web 配置页面（左侧菜单 + 硬件调试 + 设备日志）
 │   ├── umqtt/                    # MQTT 客户端库（第三方，纳入仓库以保证烧录后自包含）
 │   │   └── simple.py             #   来自 micropython-lib（MIT）
 │   └── bambu/                    # 与拓竹打印机 MQTT 通信相关
@@ -346,18 +346,46 @@ M400 U1
 2. 电脑 / 手机连上该热点，浏览器打开 `192.168.4.1`
 3. **WiFi 配置**：在列表里选你的 WiFi（只能选 **2.4G** 频段的）并填密码 → 点「连接这个 WiFi」
    （必须在和打印机同一个网络下）
-4. 连上后「运行状态」里会显示主板分配到的新 IP，**记下它**，之后都用这个 IP 访问。
-   页面会自动记住账号密码，以后开机会直接连，不再重新扫描
+4. 连上后会显示主板分配到的新 IP，**记下它**，之后都用这个 IP 访问。
+   页面会自动记住账号密码，以后开机会直接连，不再重新扫描；
+   同时会自动关掉配置热点 —— **左侧菜单里的「WiFi 配置」也会跟着消失**（这是故意的）
 5. **打印机 MQTT 配置**：填入打印机的 IP、序列号、访问码（8 位）、MQTT 端口等 →
-   点「保存并连接」
-6. **打印机通道设置**：把「料盘 1~4」映射到打印机要用的通道号，点色块可以给每个
-   料卷设颜色 —— 会弹出一个类似 Windows「颜色」对话框的取色器：左边是基本颜色和
-   自定义颜色，右边是 HSV 渐变区 + 色相条，也可以用 RGB / HSV 数值精确指定 →
-   点「保存通道与颜色」
+   点「保存并连接」。**这一步一定会把配置存进设备**，即使当时连不上打印机也会存，
+   提示里会写清楚是「已保存并连上」还是「已保存但暂时连不上」
+6. **打印机通道设置**：默认就是 **4 个通道**。把「料盘 1~4」映射到打印机要用的通道号，
+   点色块可以给每个料卷设颜色 —— 会弹出一个类似 Windows「颜色」对话框的取色器：
+   左边是基本颜色和自定义颜色，右边是 HSV 渐变区 + 色相条，也可以用 RGB / HSV
+   数值精确指定 → 点「保存通道与颜色」
 
-> 页面会每 2 秒自动刷新状态，不用手动按 F5。
-> WiFi 列表如果显示「正在扫描附近 WiFi…」，等一两秒即可（扫描本身要 1~2 秒）；
-> 想重新扫点右上角「重新扫描」。
+### 页面长什么样
+
+页面分成左右两半：
+
+```
+┌──────────────┬──────────────────────────────────────────────┐
+│ YAO AMS      │  ● WiFi      ● MQTT                          │
+├──────────────┼──────────────────────────────────────────────┤
+│ ▸ 网络       │                                              │
+│ ▸ 打印       │     选中目录里的页面（运行状态 / 上电诊断 /   │
+│ ▾ 系统       │     打印机 MQTT / 通道设置 / 硬件调试）       │
+│    运行状态  │                                              │
+│    上电诊断  ├──────────────────────────────────────────────┤
+│              │  设备日志       空闲内存 18.0 KB  清屏  折叠  │
+│              │  00:00.412 Web 服务已启动，监听 0.0.0.0:80   │
+│              │  00:01.204 WiFi 连接成功: xxx  IP=…          │
+└──────────────┴──────────────────────────────────────────────┘
+```
+
+- **左侧是菜单**，每个目录默认折叠，点标题展开；展开状态记在浏览器里，刷新不会变
+- **右侧上方是内容**，一次只显示一个页面
+- **右侧下方常驻「设备日志」**，每 2 秒刷新一次，不用再插 USB 看串口。
+  带 ★ 的报错行会标红，点「折叠」可以收起来
+- **「WiFi 配置」只在配置热点开启时出现**。连上网之后它就藏起来了。
+  想换 WiFi 就到「运行状态」点「打开配置热点」，手机连上 `AMS_WIFI` 再配一次
+- 手机上左侧菜单收成一个「☰」抽屉按钮，布局不变
+
+> 页面每 2 秒自动刷新状态和日志，不用手动按 F5。
+> WiFi 列表在打开「WiFi 配置」页面时才扫描（扫描本身要 1~2 秒），想重新扫点「重新扫描」。
 
 ![初次配置页面](./assets/image-20250113204216748.png)
 
@@ -491,16 +519,22 @@ M400 U1
 | --- | --- | --- |
 | `GET` | `/` | 配置页面 |
 | `GET` | `/status` | ★ 聚合状态：IP / WiFi / MQTT / 通道 / 颜色 / 硬件 / 复位诊断 / 内存余量，一次拿全 |
+| `GET` | `/log` | ★ 设备日志（最近 24 行），给页面右下角的日志面板用 |
 | `GET` | `/wifi_scan` | 强制重新扫描 WiFi（阻塞约 2 秒，仅用户点击时调用） |
 | `GET` | `/boot_clear` | 把「启动次数」清零（排查复位循环时用） |
 | `POST` | `/wifi_connect` | `{"name":ssid,"password":pwd}` |
-| `POST` | `/mqtt_connect` | 打印机 IP / 序列号 / 访问码 / 端口等 |
+| `POST` | `/mqtt_connect` | 打印机 IP / 序列号 / 访问码 / 端口等，**先落盘再连接** |
 | `POST` | `/access_set` | `{"access_list":[...],"color_list":[...]}` |
 | `POST` | `/hardware_test` | `{"channel":1,"direction":1,"times_ms":1000}` 手动点动 |
+| `POST` | `/ap_set` | `{"on":1}` 开配置热点 / `{"on":0}` 关 |
 
 **为什么要有 `/status`**：页面上有 IP、WiFi、MQTT、通道、硬件五块状态，早期是发 5 个
 请求分别取。单线程服务端只能串行处理，累计延迟很明显。现在合成 1 个请求，
 页面每 2 秒轮询一次就够了。
+
+**为什么日志要单独开 `/log`**：日志的行数随时在变。如果塞进 `/status`，
+这个每 2 秒被打一次的接口就会跟着一起变胖，最后把空闲堆吃光。
+分开之后 `/status` 的体积是恒定的，好控制。
 
 ### 网页性能上的几个坑（都已修掉）
 
@@ -508,6 +542,9 @@ M400 U1
 | --- | --- | --- |
 | 页面极慢 | `index.html` **逐行发送**，每行 `await sleep(10ms)`，400 多行要 4 秒以上 | 整份文件用 `os.stat` 取长度、带 `Content-Length` 分块流式发送 |
 | **页面打不开**<br>`memory allocation failed` | 把 40KB 的页面 `f.read()` **整份读进内存**（还有一份 `.encode()` 拷贝），ESP32-C3 拿不到这么长的连续内存；而且缓存写不进去，**每个请求都在同一处再失败一次** | 每次只读 1KB（`FILE_CHUNK`）读一块发一块，单次最大分配 1KB；发送前 `gc.collect()` 收拢碎片 |
+| **页面能开、但数据全是 `-`**<br>通道和硬件永远「加载中」 | `/status` 里塞了 `boot_safety.report`（一整段中文接线表），`ujson.dumps` 之后体积翻好几倍，`send_response` 再 `.encode()` 复制一份 → 板子 OOM，而这个接口每次轮询都失败 | 只返回网页真正用到的字段（`report` 不进 JSON、`problems` 截断、SSID 限 12 个）；**每个字段单独兜底**；字符串改成「切块 → 逐块 encode → 逐块发」，峰值只有 512 字符 |
+| **保存提示 404 且没存进去** | 读请求时看到 `\r\n\r\n` 就返回，POST 的 JSON 请求体还在下一个 TCP 段里 → 解析出 `None` → 路由条件不成立 → 掉进 404 | 按 `Content-Length` 把请求体读完；写接口收到空请求体时回 **400 并说明原因**，不再谎报 404 |
+| MQTT 配置永远存不下来 | 只有 MQTT 当场连上才写 `config.json`，而 AP 模式下根本没联网 → 必然失败 | **先落盘，再连接**；连不上只作提示，返回 `saved` / `connected` 两个字段 |
 | 每个请求白等 | accept 循环里 `await sleep(500ms)` | 改成 20ms 轮询 |
 | 偶尔打不开 | 读请求头用阻塞 `recv` + 3 秒超时，浏览器的空闲预连接会把服务端卡满 3 秒 | 非阻塞读 + `await` 让步，总上限 0.6 秒，等不到就丢掉连接 |
 | 页面卡死 | 主循环用阻塞的 `wait_msg()` 收 MQTT，把整个事件循环按住 | 改用非阻塞的 `poll_msg()`，没消息立刻返回 |
@@ -694,7 +731,7 @@ python tools/make_firmware_bin.py \
 python tests/run_tests.py
 ```
 
-共 58 项测试，分四块。
+共 78 项测试，分五块。
 
 **① 电磁离合安全约束**（核心，改动硬件层时必看）
 
@@ -731,6 +768,19 @@ python tests/run_tests.py
 | `test_ams_reconnect_is_time_based` | 定期重连要按时间节流（≥1 分钟），不能几秒断一次 |
 | `test_mqtt_ping_throttling_behaviour` | 连续探测时，节流窗口内只应真的 `ping` 一次 |
 | `test_web_status_aggregates_everything` | `/status` 必须把页面需要的字段一次给全（含 `mem_free`） |
+| `test_request_reader_waits_for_post_body` | ★ 必须按 `Content-Length` 把 POST 请求体读完（否则保存提示 404） |
+| `test_read_request_collects_body_arriving_in_a_later_segment` | ★ 假 socket 把请求头和请求体**分成两段**喂进去，必须读全并解析出 JSON |
+| `test_send_response_handles_non_ascii_content_length` | ★ 中文响应的 `Content-Length` 必须是 UTF-8 字节数，单块发送要足够小 |
+| `test_content_length_parsing_is_robust` | 大小写、缺字段、非数字的 `Content-Length` 都要能安全处理 |
+| `test_write_routes_never_answer_404_for_empty_body` | ★ 写接口收到空请求体要回 **400 并说明原因**，不能回 404 误导 |
+| `test_status_is_small_enough_for_the_board` | ★ `/status` 的 JSON 必须 < 2.4KB，SSID 限量 12 个 |
+| `test_status_survives_broken_fields` | ★ 单个字段取值失败时 `/status` 仍要整体可用（不能整页空白） |
+| `test_log_endpoint_returns_recent_lines` | `/log` 要从环形缓冲取值且限量 |
+| `test_log_ring_buffer_is_bounded` | ★ 日志缓冲限量 24 行 × 100 字符，`recent()` 必须返回副本 |
+| `test_mqtt_config_is_saved_before_connecting` | ★ MQTT 配置必须「先落盘，再连接」，并返回 `saved` / `connected` |
+| `test_mqtt_defaults_fill_blank_fields` | 用户名 / 客户端名 / 端口留空时用默认值补齐 |
+| `test_wifi_connect_closes_ap_after_success` | ★ 配网成功后要关热点，且必须先回包再关 |
+| `test_ap_can_be_toggled_from_web` | ★ 网页必须能把配置热点再打开（否则换 WiFi 只能重刷固件） |
 
 **④ 复位诊断与引脚安全**（「接上负载就一直重启」的回归保护）
 
@@ -745,8 +795,20 @@ python tests/run_tests.py
 | `test_boot_py_safe_before_anything_else` | `boot.py` 必须是 `make_safe → capture → record_boot` 的顺序 |
 | `test_reset_cause_is_captured_and_reported` | 复位原因必须能识别，且能序列化给网页 |
 | `test_boot_count_increments_and_clears` | 启动计数能累加、能清零（数字疯涨 = 复位循环） |
-| `test_status_exposes_reset_diagnostics` | ★ `/status` 必须带 `reset` 和 `boot_safety` 字段 |
+| `test_status_exposes_reset_diagnostics` | ★ `/status` 必须带 `reset` 和 `boot_safety` 字段（但不带 `report`，那会把接口撑爆） |
 | `test_led_can_be_disabled` | `LED_PIN = None` 时必须优雅跳过，不能 `AttributeError` |
+
+**⑤ 网页界面行为**（这些是「用户能直接看见」的约定，最容易被改回去）
+
+| 测试 | 验证内容 |
+| --- | --- |
+| `test_page_renders_four_channels_without_waiting` | ★ 默认就要画出 4 个通道和 4 路点动按钮，**不能等接口** |
+| `test_page_wifi_card_only_in_ap_mode` | ★ WiFi 配置只在配置热点开启时出现，热点一关就消失并跳回运行状态（靠 `.item.hide` 这条 CSS 规则） |
+| `test_page_menu_starts_folded` | ★ 每个目录默认折叠，展开状态存 localStorage |
+| `test_page_directories_stay_folded_on_boot` | ★ 开机 / 刷新时**一个目录都不许自动展开**：`showPage` 的自动展开只在用户点菜单时发生 |
+| `test_page_has_left_menu_and_log_panel` | 左侧菜单 + 右侧内容 + 右下角常驻日志，且新日志会自动滚到底 |
+| `test_page_reports_mqtt_save_result_precisely` | 「已保存但连不上」和「彻底失败」要给不同提示 |
+| `test_page_never_builds_request_body_outside_json` | 写操作必须带 JSON 请求体和 `Content-Type` |
 
 改动相应模块后请先跑一遍再上传。
 
@@ -758,10 +820,14 @@ python tests/run_tests.py
 ```bash
 python tools/preview_server.py        # 默认 http://127.0.0.1:8099
 python tools/preview_server.py 9000   # 换端口
+python tools/preview_server.py 9000 ap   # ★ 以「配置热点」模式启动
 ```
 
+`ap` 那个参数会假装设备处于配网模式（热点开着、没联网），用来检查
+左侧菜单里「WiFi 配置」有没有正确出现。不带参数就是普通的「已联网」状态。
+
 它只读 `python_code/index.html`，用假数据补齐接口，不写任何文件、不参与固件构建。
-改页面时建议边改边看，尤其是颜色对话框和手机端的排版。
+改页面时建议边改边看，尤其是颜色对话框、左侧菜单和手机端的排版。
 
 ---
 
@@ -930,6 +996,63 @@ ESP32-C3 的空闲堆只有几十 KB，而且碎片化严重；`index.html` 有 
 
 > 顺带说一句：以后只要在串口看到「…（空闲内存 xxx 字节）」，就先看这个数字 ——
 > 所有请求异常都会带上它，OOM 类问题一眼就能判断余量。
+</details>
+
+<details>
+<summary><b>网页能打开，但「运行状态」全是 <code>-</code>、通道和硬件调试一直「加载中」</b></summary>
+
+**这是 `/status` 接口自己 OOM 了**（已修）。
+
+这个现象很有迷惑性：页面本身是分块流式发的，所以能打开；但页面上的数据全靠
+`/status` 这一个接口，它一失败，所有卡片就只剩下默认的 `-`。
+
+原因是 `/status` 里塞了 `boot_safety.report` —— 一整段中文接线表。
+`ujson.dumps` 之后体积要翻好几倍，`send_response` 再 `.encode()` 复制一份，
+空闲堆只剩 20KB 的板子必然失败，而且**每 2 秒轮询一次就失败一次**。
+
+现在：
+
+- `report` 不再进 JSON，`problems` 每条截断到 120 字，SSID 最多给 12 个
+- 字符串响应改成「切块 → 逐块 encode → 逐块发」，峰值只有 512 字符
+- 每个字段单独兜底，某一个取不到值时它自己变 `-`，不会连累整个接口
+
+如果还遇到，串口/日志面板里会有 `状态字段 xxx 取值失败: ...`，把那一行发出来即可定位。
+</details>
+
+<details>
+<summary><b>点「保存并连接」提示 404，或者提示连不上、配置也没存下来</b></summary>
+
+两个独立的问题，都修了：
+
+**① 提示 404** —— 读请求的函数看到 `\r\n\r\n` 就返回了，而 JSON 请求体往往在
+**下一个** TCP 段里。服务端解析出 `None`，路由条件不成立，就落到了 404 分支。
+所以你看到的「404」其实不是接口不存在，只是请求体没读到。
+现在按 `Content-Length` 把请求体读完；万一还是空的，会回 **400 并写明原因**。
+
+**② 配置存不下来** —— 旧逻辑是「只有 MQTT 当场连上才写 `config.json`」。
+可是在 AP 配置模式下根本没联网，MQTT 必然连不上 → 保存永远失败、
+配置永远存不下来，重启之后还得重填。
+
+现在改成 **先落盘，再连接**：配置一定写进 `config.json`，连不上只作提示。
+页面上「打印机 MQTT 配置」里也能看到「配置是否已保存：已保存 / 尚未保存」。
+
+顺带放宽了校验：只有 **打印机 IP / 序列号 / 访问码** 是必填，
+用户名、客户端名、端口留空会自动填 `bblp` / `mqttx_3c73cd31` / `8883`。
+</details>
+
+<details>
+<summary><b>左侧菜单里的「WiFi 配置」不见了 / 想换 WiFi 怎么办</b></summary>
+
+这是故意的：**WiFi 配置只在配置热点开启时显示**。
+
+- 配网成功之后设备会自动关掉热点，菜单项跟着消失 —— 因为已经连上网了，
+  平时根本用不到这个页面
+- 想换 WiFi：到「运行状态」页面点 **「打开配置热点」**，手机连上 `AMS_WIFI`
+  （密码 `A12345678`）后访问 `http://192.168.4.1`，「WiFi 配置」就会重新出现
+- 换完之后点「连接这个 WiFi」，热点会自动关掉，菜单项又消失
+
+> 手机连着家里的 WiFi 时是访问不到 `192.168.4.1` 的（不同网段），
+> 需要先把手机切到 `AMS_WIFI` 热点。
 </details>
 
 <details>

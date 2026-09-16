@@ -68,7 +68,7 @@ import ujson
 import gc
 import uasyncio as asyncio
 
-from logout import logout
+from logout import logout, recent as recent_logs
 from AMS_MODEL import AMS
 from device_processing import BOOT_SAFETY
 from machine import Pin, PWM
@@ -97,15 +97,22 @@ INDEX_FILE = "index.html"
 # ---------------------------------------------------------------------------
 WEB_PORT = 80
 WEB_POLL_MS = 20            # accept 轮询间隔；越小网页响应越快，20ms 兼顾性能与开销
-HEADER_WAIT_MS = 600        # 读请求头的最长等待；浏览器预连接会空等，不能设太长
+HEADER_WAIT_MS = 600        # 读请求头的**最长等待**；浏览器预连接会空等，不能设太长
+BODY_WAIT_MS = 800          # 读完请求头后，再给请求体这么多时间（POST 才有）
 SEND_TIMEOUT_S = 3.0        # 发送阶段超时，防止客户端半死不活把服务端拖住
-MAX_REQUEST_BYTES = 4096    # 请求头上限，异常请求直接丢
-SEND_CHUNK = 2048           # 内存里已有的小响应（JSON）分片发送的块大小
+# 请求（头 + 体）总量上限。MQTT 配置这份 JSON 约 300 字节，
+# 5120 足够宽裕，异常请求会在这里被截断丢弃。
+MAX_REQUEST_BYTES = 5120
+SEND_CHUNK = 2048           # 内存里已有的二进制响应分片发送的块大小
+# ★ 字符串响应是"切块 → 逐块 encode"发出去的，这是单块字符数。
+#   512 个中文字符最多 1.5 KB，保证不会一次要一大块连续内存。
+ENC_CHUNK = 512
 # ★ 从 flash 读文件时的单块大小。这个值直接决定了"服务网页时的最大单次内存分配"，
 #   必须远小于空闲堆：1 KB 在任何情况下都能分配出来，而且块间 await 让步，
 #   发 40 KB 页面时其它任务不会饿死。**不要调大！**
 FILE_CHUNK = 1024
 MQTT_PING_INTERVAL_MS = 5000  # MQTT 存活探测节流（keepalive=60s，5 秒一次足够）
+LOG_TAIL = 24               # /log 一次给网页多少行（和 logout.LOG_MAX_LINES 对齐）
 
 _REASON = {
     200: "OK",
@@ -115,6 +122,10 @@ _REASON = {
     500: "Internal Server Error",
     503: "Service Unavailable",
 }
+
+# 需要请求体的写接口。这些路径收到空请求体时应该回 400 说明情况，
+# 绝不能掉进 404 —— 那会让用户以为是"接口不存在"，实际上只是请求体没读到。
+WRITE_ROUTES = ("wifi_connect", "mqtt_connect", "access_set", "hardware_test")
 
 # 内存不够时的兜底页面：故意做得极小（几百字节，任何时候都发得出去），
 # 至少让浏览器有内容可显示，而不是一片空白让人摸不着头脑。
@@ -158,6 +169,76 @@ def mem_free():
 def mem_note():
     """给日志用的一小段内存提示，OOM 时就是靠它判断余量"""
     return "空闲内存 %d 字节" % mem_free()
+
+
+# ---------------------------------------------------------------------------
+# 请求解析 / 状态组装的小工具
+# ---------------------------------------------------------------------------
+def _content_length(head):
+    """从请求头里取出 Content-Length（没有就返回 0）。
+
+    ★ 不能用 ure 直接搜 bytes：不同 MicroPython 版本对 bytes + 正则的
+      支持不一致，而且这里只是找一个十进制数，手工扫更稳更省。
+    """
+    try:
+        lower = head.lower()
+        pos = lower.find(b"content-length:")
+        if pos < 0:
+            return 0
+        end = lower.find(b"\r\n", pos)
+        if end < 0:
+            end = len(head)
+        return int(head[pos + 15:end].decode().strip())
+    except Exception:
+        return 0
+
+
+def _safe(getter, default, field):
+    """取状态字段失败时不要连累整个 /status。
+
+    /status 是网页上所有卡片的唯一数据来源，任何一个字段抛异常都会让
+    "运行状态全是 - 、通道一直加载中"。所以逐字段兜底，并在日志里点名是谁。
+    """
+    try:
+        value = getter()
+        return default if value is None else value
+    except Exception as e:
+        logout("状态字段 %s 取值失败: %s" % (field, e), is_error=True)
+        return default
+
+
+def boot_safety_lite():
+    """只把网页真正用到的自检信息取出来。
+
+    ★ 绝对不要把 BOOT_SAFETY["report"] 塞进 /status：那是整段中文接线表，
+      ujson.dumps 之后体积要翻好几倍，空闲堆小的板子上直接
+      `memory allocation failed` —— 现象就是"页面能开、状态接口全挂"。
+    """
+    problems = []
+    try:
+        for line in (BOOT_SAFETY.get("problems") or [])[:4]:
+            problems.append(str(line)[:120])
+    except Exception:
+        pass
+    return {"ok": bool(BOOT_SAFETY.get("ok", True)), "problems": problems}
+
+
+# 写接口字段的中文名，报错时给用户看人话
+MQTT_LABEL = {
+    "mqtt_server": "打印机 IP",
+    "DEVICE_SERIAL": "设备序列号",
+    "mqtt_password": "访问码",
+    "username": "服务端用户名",
+    "client_id": "客户端名称",
+    "mqtt_port": "MQTT 端口",
+}
+MQTT_DEFAULTS = {
+    "username": "bblp",
+    "client_id": "mqttx_3c73cd31",
+    "mqtt_port": "8883",
+}
+# 这几项为空就不让保存（其余用默认值补齐）
+MQTT_REQUIRED = ("mqtt_server", "DEVICE_SERIAL", "mqtt_password")
 
 
 class AMS_WEB(AMS):
@@ -222,16 +303,47 @@ class AMS_WEB(AMS):
         head += "\r\n"
         self._raw_send(client, head)
 
+    @staticmethod
+    def _str_chunks(text, size=ENC_CHUNK):
+        """把长字符串切成小块、逐块 encode。"""
+        for i in range(0, len(text), size):
+            yield text[i:i + size].encode()
+
+    @staticmethod
+    def _str_bytes_len(text, size=ENC_CHUNK):
+        """字符串编码成 UTF-8 之后的字节数。
+
+        ★ 不能用 len(text) 当 Content-Length：中文一个字在 MicroPython 里是
+          1 个字符、3 个字节（有些版本还会转义成 \\uXXXX 的 6 个字节）。
+          这里按同样的切块方式累加，峰值仍然只有一小块。
+        """
+        total = 0
+        for i in range(0, len(text), size):
+            total += len(text[i:i + size].encode())
+        return total
+
     def send_response(self, client, payload, status_code=200, is_json=False,
                       ctype=None, extra=None):
-        """发送内存里已有的响应。大响应分片发，避免一次性占满 socket 缓冲区。"""
-        body = payload.encode() if isinstance(payload, str) else payload
-        self.send_header(client, status_code, len(body),
+        """发送内存里已有的响应。
+
+        ★ 字符串是"切块 → 逐块 encode → 逐块发"的。旧写法先整体
+          `payload.encode()` 再做一份完整拷贝，等于峰值要两份响应体；
+          /status 这种 JSON 一大就会把空闲堆吃光，于是"页面能打开、状态
+          接口却一直失败"。现在峰值固定在一小块。
+        """
+        if isinstance(payload, str):
+            self.send_header(client, status_code, self._str_bytes_len(payload),
+                             is_json=is_json, ctype=ctype, extra=extra)
+            for piece in self._str_chunks(payload):
+                self._raw_send(client, piece)
+            return True
+
+        self.send_header(client, status_code, len(payload),
                          is_json=is_json, ctype=ctype, extra=extra)
-        total = len(body)
+        total = len(payload)
         offset = 0
         while offset < total:
-            self._raw_send(client, body[offset:offset + SEND_CHUNK])
+            self._raw_send(client, payload[offset:offset + SEND_CHUNK])
             offset += SEND_CHUNK
         return True
 
@@ -314,32 +426,66 @@ class AMS_WEB(AMS):
     def _status_dict(self):
         """一次把页面需要的所有状态凑齐，避免前端发 5 个请求。
 
-        注意 ssids 走缓存：真正的扫描只在用户点「重新扫描」时才做，
+        ★ 两条硬规矩，改这个函数前先读一遍接口头的第 8 条坑：
+          1. 每个字段都要用 _safe() 兜住 —— 一个字段抛异常就让整页空白，
+             太不划算（而且现象是"页面能打开、数据全是 -"，极难排查）。
+          2. 只放网页真正要用的东西。中文越长、JSON 越大，板子越吃不消。
+             boot_safety 只给 ok + problems，不给那一整段 report。
+
+        另外 ssids 走缓存：真正的扫描只在用户点「重新扫描」时才做，
         否则每次刷新页面都会因为 scan() 阻塞 2 秒。
         """
         return {
-            "ip": self.sta_ip(),
-            "ap_ip": self.ap_ip(),
-            "ap_on": self.ap_is_on(),
-            "ap_ssid": self.ap_ssid,
-            "wifi_isconnected": self.wlan_sta.isconnected(),
-            "wifi_ssid": self.current_ssid(),
-            "wifi_status_text": self.status_text(),
-            "is_mqtt_con": self.check_mqtt_connection(),
-            "ssids": self._scan_cache,
-            "color_list": self.color_list,
-            "access_list": self.access_list,
-            "current_access": self.filament_current,
-            "hardware": self._hardware_dict(),
+            "ok": True,
+            "ip": _safe(self.sta_ip, "", "ip"),
+            "ap_ip": _safe(self.ap_ip, "", "ap_ip"),
+            "ap_on": _safe(self.ap_is_on, False, "ap_on"),
+            "ap_ssid": _safe(lambda: self.ap_ssid, "AMS_WIFI", "ap_ssid"),
+            "wifi_isconnected": _safe(self.wlan_sta.isconnected, False, "wifi_isconnected"),
+            "wifi_ssid": _safe(self.current_ssid, "", "wifi_ssid"),
+            "wifi_status_text": _safe(self.status_text, "", "wifi_status_text"),
+            "is_mqtt_con": _safe(self.check_mqtt_connection, False, "is_mqtt_con"),
+            # 只给前 12 个：SSID 一多，这段 JSON 就会明显变胖
+            "ssids": _safe(lambda: list(self._scan_cache[:12]), [], "ssids"),
+            "color_list": _safe(lambda: self.color_list, [], "color_list"),
+            "access_list": _safe(lambda: self.access_list, [], "access_list"),
+            "current_access": _safe(lambda: self.filament_current, 0, "current_access"),
+            "hardware": _safe(self._hardware_dict, {}, "hardware"),
             # 复位诊断：接负载后"一直重启"到底是欠压还是引脚接错，看这两个字段
-            "reset": reset_info.summary(),
-            "boot_safety": BOOT_SAFETY,
+            "reset": _safe(reset_info.summary, {}, "reset"),
+            "boot_safety": _safe(boot_safety_lite, {"ok": True, "problems": []},
+                                 "boot_safety"),
             # 内存余量：出现「页面打不开 / memory allocation failed」时先看它
             "mem_free": mem_free(),
         }
 
     async def get_status(self, client):
         self.send_response(client, ujson.dumps(self._status_dict()), is_json=True)
+
+    async def get_log(self, client):
+        """设备日志（网页右侧的「设备日志」面板）。
+
+        ★ 单独开一个接口，不要塞进 /status：
+          日志行数一变，/status 的体积就跟着变，而 /status 是要每 2 秒
+          被打一次的 —— 它一旦变大，板子就会开始 OOM。
+        """
+        lines = recent_logs(LOG_TAIL)
+        data = {"log": lines, "count": len(lines), "mem_free": mem_free()}
+        self.send_response(client, ujson.dumps(data), is_json=True)
+
+    def handle_bad_body(self, client, url):
+        """写接口收到空/坏请求体。
+
+        ★ 这里是"Mqtt设置保存提示404"的正面修法：旧代码请求体没读到时
+          data 是 None，路由条件不成立，就落到 handle_not_found 回了 404。
+          用户看到 404 只会以为接口不存在，其实只是请求体没读全。
+        """
+        logout("写接口 %s 收到空请求体（请求体可能没读全，或前端没带 JSON）" % url,
+               is_error=True)
+        self.send_response(client,
+                           ujson.dumps({"ok": False, "saved": False, "connected": False,
+                                        "info": "请求体为空或格式错误，请重试"}),
+                           status_code=400, is_json=True)
 
     async def handle_boot_clear(self, client):
         """把启动计数清零。
@@ -473,9 +619,10 @@ class AMS_WEB(AMS):
 
         if self.do_connect(ssid, password):
             ip = self.sta_ip()
-            dict_info["info"] = "%s 连接成功" % ssid
+            dict_info["info"] = "%s 连接成功，IP = %s" % (ssid, ip or "(等待分配)")
             dict_info["ip"] = ip
             dict_info["wifi_ssid"] = ssid
+            dict_info["ap_on"] = self.ap_is_on()
             self.send_response(client, ujson.dumps(dict_info), is_json=True)
 
             # 把成功的账号密码记下来，下次开机直接连
@@ -488,11 +635,64 @@ class AMS_WEB(AMS):
             # 顺手同步进 config.json，方便一眼看到当前用的 WiFi
             self.updata_data({"wifi_username": ssid, "wifi_password": password})
             logout("配网成功，已保存到 wifi.dat: %s" % ssid)
+
+            # ★ 配网成功后关掉配置热点。
+            #   这是"WiFi 连上之后就不再显示配网页面"能成立的前提：
+            #   网页只在 AP 模式下显示 WiFi 配置卡片，热点一关它就消失了。
+            #   先等一下再关，否则这句响应还压在缓冲里，客户端会直接断掉。
+            if self.ap_is_on():
+                self._sleep_ms(800)
+                self.swcith_ap(0)
+                logout("已关闭配置热点，请改用 http://%s 访问" % (ip or "新的 IP"))
+                dict_info["ap_on"] = False
             return True
 
         dict_info["info"] = "连接失败（%s），请检查密码或确认路由器 2.4G 频段已开启" % self.status_text()
         self.send_response(client, ujson.dumps(dict_info), status_code=400, is_json=True)
         return False
+
+    @staticmethod
+    def _sleep_ms(ms):
+        """阻塞一小会儿（只在"已经回完包"的收尾动作里用，比如关热点前等发包）。
+
+        MicroPython 有 time.sleep_ms；桌面自测的桩里不一定有，所以兜一下。
+        """
+        try:
+            time.sleep_ms(ms)
+        except AttributeError:
+            try:
+                time.sleep(ms / 1000.0)
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+    # ======================================================================
+    # 配置热点开关（网页「运行状态」上的按钮）
+    # ======================================================================
+    def handle_ap_set(self, client, data):
+        """打开 / 关闭配置热点。
+
+        联网之后网页上的 WiFi 配置卡片就藏起来了，所以必须留一个
+        "把热点再打开"的入口，否则想换 WiFi 就只能重新刷机。
+        """
+        want = 1
+        try:
+            if isinstance(data, dict) and "on" in data:
+                want = 1 if int(data["on"]) else 0
+        except Exception:
+            want = 1
+
+        self.swcith_ap(want)
+        on = self.ap_is_on()
+        info = {
+            "info": "配置热点已%s%s" % ("打开" if on else "关闭",
+                                      ("，手机连上 %s 后访问 http://%s"
+                                       % (self.ap_ssid, self.ap_ip())) if on else ""),
+            "ap_on": on,
+        }
+        self.send_response(client, ujson.dumps(info), is_json=True)
+        return on
 
     # ======================================================================
     # 改变映射通道 / 颜色
@@ -534,43 +734,81 @@ class AMS_WEB(AMS):
     # 连接 MQTT
     # ======================================================================
     def handle_mqtt_cennect(self, client, data):
+        """保存打印机 MQTT 配置。
+
+        ★ 和旧版最大的区别：**先落盘，再连接**。
+          旧代码是 `if self.conent_and_subscribe(): ... write_json_file(...)`，
+          也就是说只有 MQTT 当场连上才会写配置。可是在 AP 配置模式下根本
+          没联网，MQTT 必然连不上 —— 于是"保存"永远失败，config.json 里
+          永远空空如也，重启之后还得重填。现在：
+            1. 参数校验 → 写进 config.json（这一步一定做）
+            2. 再尝试连接；连不上只作为提示返回，配置已经存好了
+            3. 返回 saved / connected 两个字段，让网页能给出准确的说法
+        """
         logout("配置 MQTT")
-        dict_info = {"info": None}
+        info = {"info": None, "saved": False, "connected": False}
         if not isinstance(data, dict):
-            dict_info["info"] = "参数缺失"
-            self.send_response(client, ujson.dumps(dict_info), status_code=400, is_json=True)
+            info["info"] = "请求体格式不正确"
+            self.send_response(client, ujson.dumps(info), status_code=400, is_json=True)
             return False
 
-        for key in data:
-            if len(str(data[key])) == 0:
-                dict_info["info"] = key + " 参数不能为空"
-                self.send_response(client, ujson.dumps(dict_info), status_code=400, is_json=True)
+        # 必填项：缺一个就没法连打印机。其余（用户名/客户端名/端口）用默认值补齐，
+        # 旧代码要求 6 项全部非空，随手留空一个就报错，太苛刻。
+        for key in MQTT_REQUIRED:
+            if not str(data.get(key) or "").strip():
+                info["info"] = MQTT_LABEL.get(key, key) + " 不能为空"
+                self.send_response(client, ujson.dumps(info), status_code=400, is_json=True)
                 return False
 
-        if self.check_mqtt_connection(force=True):
+        clean = {}
+        for key in MQTT_LABEL:
+            text = str(data.get(key) or "").strip()
+            clean[key] = text or MQTT_DEFAULTS.get(key, "")
+        clean["DEVICE_SERIAL"] = clean["DEVICE_SERIAL"].upper()
+
+        # ---- 1) 先保存，保证"点一下就有记录" ----
+        try:
+            self.updata_data(clean)
+            info["saved"] = True
+            logout("MQTT 配置已写入 %s（IP=%s 序列号=%s）"
+                   % (json_file, clean["mqtt_server"], clean["DEVICE_SERIAL"]))
+        except Exception as e:
+            info["info"] = "配置写入失败: %s" % e
+            logout("MQTT 配置写入失败: %s" % e, is_error=True)
+            self.send_response(client, ujson.dumps(info), status_code=500, is_json=True)
+            return False
+
+        # ---- 2) 再尝试连接 ----
+        self.mqtt_update_info(mqtt_server=clean["mqtt_server"],
+                              DEVICE_SERIAL=clean["DEVICE_SERIAL"],
+                              password=clean["mqtt_password"],
+                              username=clean["username"],
+                              client_id=clean["client_id"],
+                              mqtt_port=clean["mqtt_port"])
+
+        # 先把旧连接拆掉。这里**故意不用 check_mqtt_connection(force=True) 去探测**：
+        # 旧连接如果是坏的，SSL 上的 ping 会阻塞很久，把整个事件循环按住。
+        if self.client is not None:
             try:
                 self.client.disconnect()
             except Exception:
                 pass
-        self.mqtt_update_info(mqtt_server=data["mqtt_server"],
-                              DEVICE_SERIAL=data["DEVICE_SERIAL"],
-                              password=data["mqtt_password"],
-                              username=data["username"],
-                              client_id=data["client_id"],
-                              mqtt_port=data["mqtt_port"])
+            self.client = None
+            self._mqtt_alive = False
 
         if self.conent_and_subscribe():
-            dict_info["info"] = "MQTT连接成功"
-            self.send_response(client, ujson.dumps(dict_info), is_json=True)
-            # 同样要兜底：没有 config.json 时先建一个，并且写回合并后的完整数据
-            json_data = read_json_file(json_file) or {}
-            json_data.update(data)
-            write_json_file(json_file, json_data)
-            return True
+            info["connected"] = True
+            info["info"] = "配置已保存，MQTT 连接成功"
+            logout("MQTT 连接成功: %s" % clean["mqtt_server"])
         else:
-            dict_info["info"] = "MQTT 连接失败，请检查打印机 IP、序列号和访问码"
-            self.send_response(client, ujson.dumps(dict_info), status_code=400, is_json=True)
-            return False
+            if self.wlan_sta.isconnected():
+                info["info"] = "配置已保存；MQTT 暂时连不上，请核对打印机 IP / 序列号 / 访问码"
+            else:
+                info["info"] = "配置已保存；设备当前没联网，联网后会自动连接打印机"
+            logout("MQTT 暂未连接（%s）" % info["info"])
+
+        self.send_response(client, ujson.dumps(info), is_json=True)
+        return True
 
     # ======================================================================
     # 状态灯
@@ -595,33 +833,54 @@ class AMS_WEB(AMS):
     # 读请求头（非阻塞 + 让步，避免被浏览器的空闲连接拖死）
     # ======================================================================
     async def _read_request(self, client):
-        """读取 HTTP 请求头。
+        """读一整个 HTTP 请求（请求头 + 请求体）。
 
-        旧实现用阻塞 recv + 3 秒超时：浏览器开一个"预连接"套接字不发数据，
-        服务端就在这里卡满 3 秒，期间所有任务全部停摆 —— 这就是
-        "网页偶尔打不开" 的直接原因。
+        ★ 旧实现只读到 `\\r\\n\\r\\n` 就收手，而 POST 的 JSON 请求体往往在
+          **下一个** TCP 段里。于是 process_json 找不到 `{`，返回 None，
+          路由条件 `data is not None` 不成立 → 掉进 404 —— 网页上就是
+          "保存提示 404，而且什么都没存进去"。
+          现在按 Content-Length 把请求体也读完。
 
-        现在改成非阻塞读，没数据就 await 让出 CPU，总等待上限 HEADER_WAIT_MS。
+        整个过程都是非阻塞读 + await 让步：浏览器会开一个"预连接"套接字却
+        什么都不发，阻塞等它会把整个事件循环按住（"网页偶尔打不开"的元凶）。
         """
         client.setblocking(False)
         deadline = time.ticks_add(time.ticks_ms(), HEADER_WAIT_MS)
         buf = b""
+        head_end = -1
+        body_len = 0
+        body_deadline = None
 
-        while b"\r\n\r\n" not in buf:
-            if time.ticks_diff(deadline, time.ticks_ms()) <= 0:
+        while True:
+            if head_end < 0:
+                pos = buf.find(b"\r\n\r\n")
+                if pos >= 0:
+                    head_end = pos + 4
+                    body_len = _content_length(buf[:head_end])
+                    if body_len > 0:
+                        # 请求体已经属于"下一个阶段"，给它一份独立的超时预算
+                        body_deadline = time.ticks_add(time.ticks_ms(), BODY_WAIT_MS)
+                elif time.ticks_diff(deadline, time.ticks_ms()) <= 0:
+                    break                       # 请求头都没收全，放弃
+            else:
+                if len(buf) >= head_end + body_len:
+                    break                       # ★ 请求体读齐了，收工
+                if body_deadline is not None and \
+                        time.ticks_diff(body_deadline, time.ticks_ms()) <= 0:
+                    break
+            if len(buf) > MAX_REQUEST_BYTES:
                 break
+
             try:
                 chunk = client.recv(512)
             except OSError:
-                chunk = None
+                chunk = None                    # 没数据可读，正常
             if chunk is None:
-                await asyncio.sleep_ms(10)
+                await asyncio.sleep_ms(10)      # ★ 让出 CPU，别把循环堵住
                 continue
             if not chunk:
-                break                     # 对端已关闭
+                break                           # 对端已关闭
             buf += chunk
-            if len(buf) > MAX_REQUEST_BYTES:
-                break
 
         client.setblocking(True)
         return buf if buf else None
@@ -678,23 +937,33 @@ class AMS_WEB(AMS):
                 if url == "":
                     await self.hanld_rootv2(client)
 
-                # ---- 新增：聚合状态 / 强制扫描 ----
+                # ---- 聚合状态 / 日志 / 强制扫描 ----
                 elif url == "status":
                     await self.get_status(client)
+                elif url == "log":
+                    await self.get_log(client)
                 elif url == "wifi_scan":
                     await self.handle_wifi_scan(client)
                 elif url == "boot_clear":
                     await self.handle_boot_clear(client)
+                elif url == "ap_set":
+                    self.handle_ap_set(client, data)
 
                 # ---- 写操作 ----
-                elif url == "wifi_connect" and data is not None:
-                    self.handle_wifi_cennect(client, data)
-                elif url == "mqtt_connect" and data is not None:
-                    self.handle_mqtt_cennect(client, data)
-                elif url == "access_set" and data is not None:
-                    self.handle_access_cenect(client, data)
-                elif url == "hardware_test" and data is not None:
-                    self.handle_hardware_test(client, data)
+                # ★ 统一的空请求体处理：旧代码是 `elif url == "xxx" and data is not None`，
+                #   请求体没读到时条件不成立就落到 handle_not_found 回了 404，
+                #   用户看到"保存提示404"却完全不知道是请求体的问题。
+                elif url in WRITE_ROUTES:
+                    if data is None:
+                        self.handle_bad_body(client, url)
+                    elif url == "wifi_connect":
+                        self.handle_wifi_cennect(client, data)
+                    elif url == "mqtt_connect":
+                        self.handle_mqtt_cennect(client, data)
+                    elif url == "access_set":
+                        self.handle_access_cenect(client, data)
+                    else:
+                        self.handle_hardware_test(client, data)
 
                 # ---- 兼容老接口 ----
                 elif url == "get_wifi_info":
