@@ -1,0 +1,17 @@
+# 统一换行符，避免 Windows 下 CRLF 造成 diff 噪音
+# MicroPython 也能读 CRLF，但统一成 LF 更干净
+* text=auto eol=lf
+
+# 二进制文件不要做换行转换
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.stl binary
+*.STL binary
+*.3mf binary
+*.rar binary
+*.zip binary
+*.mpy binary
+*.bin binary

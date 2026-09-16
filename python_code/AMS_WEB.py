@@ -10,18 +10,20 @@ from AMS_MODEL import AMS
 from machine import Pin,PWM
 import uasyncio as asyncio
 from info_load import read_profiles,write_profiles,read_json_file,write_json_file
+from hardware_config import LED_PIN, CONFIG_FILE
+from motor_clutch import MotorBusError, ClutchConflictError
 # 启用垃圾收集器
 gc.enable()
 # 设置触发垃圾收集的内存阈值为1字节
 # 这意味着每次内存分配后都会立即进行垃圾收集
 gc.threshold(1024)
-json_file = "config.json"
+json_file = CONFIG_FILE
 
 class AMS_WEB(AMS):
     def __init__(self):
         super().__init__()
         self.server_socket = None
-        self.LED = PWM(Pin(2))
+        self.LED = PWM(Pin(LED_PIN))
         self.LED.freq(1000)
         self.LED.duty(0)
     
@@ -103,6 +105,43 @@ class AMS_WEB(AMS):
             "current_access":self.filament_current
             }
         self.send_response(client,ujson.dumps(data),is_json=True)
+
+    # 获取硬件状态：共享电机 + 4 路电磁离合
+    async def get_hardware_info(self,client):
+        data = self.motor_bus.status()          # active_channel / engaged / conflicts / motor_direction
+        data["limits"] = [mat.has_limit for mat in self.meterial_list]
+        data["channels_pin"] = list(self.motor_bus.clutches.keys())
+        self.send_response(client,ujson.dumps(data),is_json=True)
+
+    # 手动点动调试（网页"硬件调试"用）
+    # 请求体示例：{"channel":2,"direction":1,"times_ms":1000}
+    # 该接口同样受"同一时刻只能 1 路离合吸合"的约束保护
+    def handle_hardware_test(self,client,data):
+        dict_info = {"info":None}
+        try:
+            if not isinstance(data, dict):
+                raise ValueError("请求体格式不正确")
+            channel = int(data.get("channel",1))
+            direction = int(data.get("direction",1))
+            times_ms = int(data.get("times_ms",1000))
+            if direction not in (1,-1):
+                raise ValueError("direction 只能是 1(进料) 或 -1(退料)")
+            if times_ms <= 0:
+                raise ValueError("times_ms 必须大于 0")
+            if times_ms > 5000:
+                times_ms = 5000          # 安全上限，防止网页误操作把料顶坏
+            logout("网页手动点动: 通道%s 方向%s %sms" % (channel,direction,times_ms))
+            self.motor_bus.run(channel, direction, times_ms,
+                               release=True, owner="web-test")
+            self.motor_bus.assert_single()   # 动作结束后复核一次
+            dict_info["info"] = "通道%d 动作完成，离合已全部断开" % channel
+            self.send_response(client,ujson.dumps(dict_info),is_json=True)
+        except MotorBusError as e:
+            dict_info["info"] = "总线拒绝执行: " + str(e)
+            self.send_response(client,ujson.dumps(dict_info),status_code=400,is_json=True)
+        except Exception as e:
+            dict_info["info"] = "执行失败: " + str(e)
+            self.send_response(client,ujson.dumps(dict_info),status_code=400,is_json=True)
     
     async def hanld_rootv2(self,client):
         with open("index.html","r") as f:
@@ -268,6 +307,10 @@ class AMS_WEB(AMS):
                     await self.get_mqtt_info(client)
                 elif url == "get_access_info":
                     await self.get_access_info(client)
+                elif url == "get_hardware_info":
+                    await self.get_hardware_info(client)
+                elif url == "hardware_test" and data is not None:   # 手动点动调试
+                    self.handle_hardware_test(client, data)
                 elif url == "get_ip_info":
                     await self.get_ip_info(client)
                 else:
@@ -281,10 +324,13 @@ class AMS_WEB(AMS):
 async def main_task():
     task = []
     AMS_WEB_MODEL = AMS_WEB()
-    #AMS_WEB_MODEL.swcith_ap(1)      # 打开热点
-    AMS_WEB_MODEL.auto_connection() # 自动连接wifi
-    AMS_WEB_MODEL.auto_update_access(json_file)  # 历史通道
-    AMS_WEB_MODEL.auto_conent_MQTT(json_file)
+    wlan = AMS_WEB_MODEL.auto_connection()  # 自动连接wifi（用 config 里存的密码）
+    if not wlan:
+        # 连不上历史 WiFi（首次使用 / 改过密码 / 换了路由）→ 打开热点，让用户做初始配置
+        logout("未能连接历史 WiFi，打开配置热点")
+        AMS_WEB_MODEL.swcith_ap(1)          # 打开热点 AMS_WIFI
+    AMS_WEB_MODEL.auto_update_access(AMS_WEB_MODEL.config_file)  # 历史通道 / 当前料盘
+    AMS_WEB_MODEL.auto_conent_MQTT(AMS_WEB_MODEL.config_file)
     task.append(asyncio.create_task(AMS_WEB_MODEL.status_lED()))
     task.append(asyncio.create_task(AMS_WEB_MODEL.run_web_loop()))
     task.append(asyncio.create_task(AMS_WEB_MODEL.run_ams_loop()))

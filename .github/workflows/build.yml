@@ -1,0 +1,118 @@
+name: 构建与自测
+
+# 触发条件
+on:
+  push:
+    branches: [main]
+    paths:
+      - "python_code/**"
+      - "tests/**"
+      - "tools/**"
+      - ".github/workflows/**"
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+# 同一个分支上的新提交会取消上一次还在跑的构建
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# 发布 Release 需要写权限
+permissions:
+  contents: write
+
+env:
+  # ⚠️ 必须和板子上 MicroPython 固件的版本一致，否则设备会报
+  #    ValueError: incompatible .mpy file
+  #    查看固件版本：连上串口后在 REPL 里执行  import sys; print(sys.implementation)
+  #    或者用 pip install mpy-cross==<你的固件版本>
+  MPY_CROSS_VERSION: "1.23.0"
+  PYTHON_VERSION: "3.12"
+
+jobs:
+  # =========================================================================
+  # 第一关：语法检查 + 逻辑自测
+  # =========================================================================
+  check:
+    name: 语法检查与逻辑自测
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 拉取代码
+        uses: actions/checkout@v4
+
+      - name: 准备 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: 检查所有 Python 文件的语法
+        run: |
+          python -m compileall -q python_code tools tests
+          echo "语法检查通过"
+
+      - name: 运行逻辑自测（含电磁离合互斥约束测试）
+        run: python tests/run_tests.py
+
+  # =========================================================================
+  # 第二关：交叉编译成 .mpy 部署包
+  # =========================================================================
+  build:
+    name: 交叉编译 .mpy 部署包
+    needs: check
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 拉取代码
+        uses: actions/checkout@v4
+
+      - name: 准备 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: 安装 mpy-cross（MicroPython 交叉编译器）
+        run: |
+          pip install "mpy-cross==${MPY_CROSS_VERSION}"
+          mpy-cross --version
+
+      - name: 交叉编译并打包
+        run: python tools/build_mpy.py
+
+      - name: 列出产物
+        run: |
+          echo "---- dist/ ----"
+          find dist -type f | sort
+          echo "---- 顶层 zip ----"
+          ls -lh esp32c3-ams-mpy.zip
+
+      - name: 上传构建产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: esp32c3-ams-mpy-v${{ env.MPY_CROSS_VERSION }}
+          path: |
+            dist/
+            esp32c3-ams-mpy.zip
+          retention-days: 30
+
+      - name: 打 tag 时自动发布 Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cat > /tmp/release-notes.md <<'EOF'
+          由 GitHub Actions 自动构建。
+
+          - `esp32c3-ams-mpy.zip`：全部 .mpy 模块 + boot.py / main.py / index.html，
+            可直接用 mpremote 或 Thonny 上传到 ESP32-C3 根目录。
+
+          注意：mpy-cross 版本必须与板子上的 MicroPython 固件版本一致，
+          否则设备会报 ValueError: incompatible .mpy file。
+          查看固件版本：连上串口后在 REPL 执行 import sys; print(sys.implementation)
+          EOF
+          gh release create "${GITHUB_REF_NAME}" \
+            esp32c3-ams-mpy.zip \
+            --title "${GITHUB_REF_NAME}" \
+            --notes-file /tmp/release-notes.md

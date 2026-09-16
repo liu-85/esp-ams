@@ -104,6 +104,22 @@
             width: 50px;
             color: white;
         }
+        .tip{
+            font-size: 13px;
+            color: #888;
+        }
+        .hw_row{
+            margin: 4px 0;
+        }
+        .hw_badge{
+            display: inline-block;
+            padding: 1px 8px;
+            border-radius: 10px;
+            font-size: 13px;
+            color: #fff;
+            background-color: #9e9e9e;
+        }
+        .hw_badge.on{ background-color: #e53935; }
     </style>
 </head>
 
@@ -143,6 +159,13 @@
 
        </div>
        <button class="myButton" onclick="access_set()" >确定修改</button>
+
+       <h1>硬件调试</h1>
+       <h3>共享电机 + 4 路电磁离合</h3>
+       <p class="tip">同一时刻只会吸合 1 路离合，动作完成后自动全部断开</p>
+       <div id="hardware_info">加载中...</div>
+       <div id="hardware_test"></div>
+       <p>当前料盘：<span id="current_filament">-</span></p>
            </div>
 </div>
     </div>
@@ -301,6 +324,8 @@
                 // 获取通道信息
                 function get_access_data(data){
                     const access_info_div = document.getElementById("access_info");
+                    const cur = document.getElementById("current_filament");
+                    if(cur){ cur.innerText = data["current_access"] ? ("通道 " + data["current_access"]) : "未知（未安装到位开关时为 0）"; }
                     for(let n = 0; n<data["access_list"].length; n++){
                         const item_div = document.createElement("div")
 
@@ -322,11 +347,55 @@
                     console.log(data["ip"])
                     ip_p.innerText = "当前ip地址："+ data["ip"]
                 }
+                // ===== 硬件状态（共享电机 + 4 路电磁离合）=====
+                function get_hardware_data(data){
+                    const box = document.getElementById("hardware_info");
+                    const test_box = document.getElementById("hardware_test");
+                    const engaged = data["engaged"] || [];
+                    const channels = data["channels"] || [];
+                    const limits = data["limits"] || [];
+
+                    let html = '';
+                    html += '<div class="hw_row">电机方向：'+data["motor_direction"]+'（1=进料　-1=退料　0=停止）</div>';
+                    html += '<div class="hw_row">冲突次数：'+data["conflicts"]+'（正常应始终为 0）</div>';
+                    html += '<div class="hw_row">离合状态：';
+                    for(let i = 0; i < channels.length; i++){
+                        const ch = channels[i];
+                        const on = engaged.indexOf(ch) >= 0;
+                        html += '<span class="hw_badge'+(on?' on':'')+'">离合'+ch+
+                                (on?' 吸合':' 断开')+(limits[i]?' · 有到位开关':'')+'</span> ';
+                    }
+                    html += '</div>';
+                    if(engaged.length > 1){
+                        html += '<div class="hw_row warring">⚠️ 检测到多路离合同时吸合，请立即断电检查驱动电路！</div>';
+                    }
+                    box.innerHTML = html;
+
+                    if(test_box.innerHTML === ''){
+                        for(let i = 0; i < channels.length; i++){
+                            const ch = channels[i];
+                            const row = document.createElement('div');
+                            row.innerHTML = '通道'+ch+'：'+
+                                '<button class="myButton" onclick="hardware_test('+ch+',1)">进料 1s</button>'+
+                                '<button class="myButton" onclick="hardware_test('+ch+',-1)">退料 1s</button>';
+                            test_box.append(row);
+                        }
+                    }
+                }
+                // 手动点动：同一时刻只会吸合 1 路离合
+                function hardware_test(channel, direction){
+                    const jsonData = {channel:channel, direction:direction, times_ms:1000};
+                    send_data("/hardware_test", jsonData, function(data){
+                        alert(data["info"]);
+                        send_data("/get_hardware_info",{},get_hardware_data);
+                    });
+                }
 
                 send_data("/get_ip_info",{},get_ip_data)
                 send_data("/get_wifi_info",{},get_wifi_info)
                 send_data("/get_mqtt_info",{},get_mqtt_data)
                 send_data("/get_access_info",{},get_access_data)
+                send_data("/get_hardware_info",{},get_hardware_data)
                 function opthon_color(event){
                     // 创建一个颜色输入框，type="color" 会弹出颜色选择器
                     const colorInput = document.createElement('input');
