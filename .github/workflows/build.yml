@@ -1,20 +1,21 @@
-name: 构建与自测
+name: 构建与发布
 
-# 触发条件
+# =============================================================================
+# 触发方式：每次提交都会自动编译
+#   · push 到任意分支       → 编译，并把「单文件固件」发布到滚动预发布版 latest
+#   · push 形如 v1.0 的 tag → 编译，并发布正式 Release
+#   · Pull Request          → 只编译校验，不发布
+#   · 也可以在网页上手动点运行
+# =============================================================================
 on:
   push:
-    branches: [main]
-    paths:
-      - "python_code/**"
-      - "tests/**"
-      - "tools/**"
-      - ".github/workflows/**"
+    branches: ["**"]
     tags: ["v*"]
   pull_request:
     branches: [main]
   workflow_dispatch:
 
-# 同一个分支上的新提交会取消上一次还在跑的构建
+# 同一分支上的新提交会取消上一次还在跑的构建
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -23,18 +24,34 @@ concurrency:
 permissions:
   contents: write
 
+# =============================================================================
+# ⚠️ 想升级 MicroPython 版本时，下面几项要一起改（脚本会自动检查 1、2 项是否配套）：
+#
+#   1. MICROPYTHON_VERSION      —— 目标版本
+#   2. LITTLEFS_VERSION         —— 必须是该版本 MicroPython 内置的 littlefs 版本，
+#                                  否则生成的文件系统设备挂不上，会反复提示文件系统损坏。
+#                                  查法：打开
+#                                  https://github.com/micropython/micropython/blob/v<版本>/lib/littlefs/lfs2.h
+#                                  看 LFS2_VERSION：0x00020008 对应的就是 2.8
+#   3. MPY_CROSS_VERSION        —— 与 MICROPYTHON_VERSION 保持一致，否则设备报
+#                                  ValueError: incompatible .mpy file
+#   4. MICROPYTHON_FIRMWARE_URL —— 到 https://micropython.org/download/ESP32_GENERIC_C3/
+#                                  复制「含构建日期」的那个 .bin 链接
+#   5. MICROPYTHON_FIRMWARE_SHA256 —— 固件校验值；留空则只下载不做强校验
+# =============================================================================
 env:
-  # ⚠️ 必须和板子上 MicroPython 固件的版本一致，否则设备会报
-  #    ValueError: incompatible .mpy file
-  #    查看固件版本：连上串口后在 REPL 里执行  import sys; print(sys.implementation)
-  #    或者用 pip install mpy-cross==<你的固件版本>
+  MICROPYTHON_VERSION: "1.23.0"
+  LITTLEFS_VERSION: "2.8.0"
   MPY_CROSS_VERSION: "1.23.0"
+  MICROPYTHON_FIRMWARE_URL: "https://micropython.org/resources/firmware/ESP32_GENERIC_C3-20240602-v1.23.0.bin"
+  MICROPYTHON_FIRMWARE_SHA256: "8058b7d6eb55f8124fbdcc797e2e8b39ae947a18df635567e02c8786874c04fd"
   PYTHON_VERSION: "3.12"
+  FIRMWARE_BIN: "dist/esp32c3-ams-firmware.bin"
 
 jobs:
-  # =========================================================================
+  # ===========================================================================
   # 第一关：语法检查 + 逻辑自测
-  # =========================================================================
+  # ===========================================================================
   check:
     name: 语法检查与逻辑自测
     runs-on: ubuntu-latest
@@ -56,10 +73,10 @@ jobs:
       - name: 运行逻辑自测（含电磁离合互斥约束测试）
         run: python tests/run_tests.py
 
-  # =========================================================================
-  # 第二关：交叉编译成 .mpy 部署包
-  # =========================================================================
-  build:
+  # ===========================================================================
+  # 第二关：交叉编译成 .mpy 部署包（给习惯用 mpremote / Thonny 的场景）
+  # ===========================================================================
+  package:
     name: 交叉编译 .mpy 部署包
     needs: check
     runs-on: ubuntu-latest
@@ -97,22 +114,154 @@ jobs:
             esp32c3-ams-mpy.zip
           retention-days: 30
 
-      - name: 打 tag 时自动发布 Release
+  # ===========================================================================
+  # 第三关：构建「单文件可烧录固件」
+  #   官方 MicroPython 固件 + 本项目文件系统 → 一个从 0x0 覆盖整片 Flash 的 BIN
+  # ===========================================================================
+  firmware:
+    name: 构建单文件固件 BIN
+    needs: check
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 拉取代码
+        uses: actions/checkout@v4
+
+      - name: 准备 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: 安装独立实现的 littlefs（用于交叉验证产物）
+        # 装不上也没关系，脚本会自动跳过交叉验证并给出提示，主校验不受影响
+        continue-on-error: true
+        run: pip install littlefs-python
+
+      - name: 编译 littlefs 镜像工具（与 MicroPython 内置版本同源）
+        run: |
+          set -e
+          mkdir -p tools/build
+          curl -sSL --fail -o /tmp/littlefs.tar.gz \
+            "https://github.com/littlefs-project/littlefs/archive/refs/tags/v${LITTLEFS_VERSION}.tar.gz"
+          tar xzf /tmp/littlefs.tar.gz -C /tmp
+          LFS_DIR="/tmp/littlefs-${LITTLEFS_VERSION}"
+          gcc -O2 -o tools/build/lfs_mkfs \
+            tools/lfs_mkfs.c "${LFS_DIR}/lfs.c" "${LFS_DIR}/lfs_util.c" -I"${LFS_DIR}"
+          echo "镜像工具版本:"
+          tools/build/lfs_mkfs version
+
+      - name: 生成单文件固件（含全套校验）
+        run: |
+          python tools/make_firmware_bin.py \
+            --firmware-url "${MICROPYTHON_FIRMWARE_URL}" \
+            --firmware-sha256 "${MICROPYTHON_FIRMWARE_SHA256}" \
+            --micropython-version "${MICROPYTHON_VERSION}" \
+            --strict-version-check \
+            --source python_code \
+            --out "${FIRMWARE_BIN}"
+
+      - name: 产物信息
+        run: |
+          ls -lh "${FIRMWARE_BIN}" "${FIRMWARE_BIN}.sha256"
+          {
+            echo "### 单文件固件"
+            echo ""
+            echo '```'
+            ls -l "${FIRMWARE_BIN}"
+            cat "${FIRMWARE_BIN}.sha256"
+            echo '```'
+            echo ""
+            echo "烧录: \`esptool.py --chip esp32c3 --port COM3 write_flash -z 0x0 $(basename "${FIRMWARE_BIN}")\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: 上传构建产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: esp32c3-ams-firmware-v${{ env.MICROPYTHON_VERSION }}
+          path: |
+            ${{ env.FIRMWARE_BIN }}
+            ${{ env.FIRMWARE_BIN }}.sha256
+          retention-days: 30
+
+  # ===========================================================================
+  # 第四关：发布
+  #   · 打 v* tag    → 正式 Release
+  #   · push 到 main → 滚动预发布版 latest（每次提交自动覆盖，下载地址固定不变）
+  # ===========================================================================
+  publish:
+    name: 发布固件
+    needs: [package, firmware]
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 拉取代码
+        uses: actions/checkout@v4
+
+      - name: 取回全部构建产物
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: 整理要发布的文件
+        run: |
+          set -e
+          mkdir -p release
+          find artifacts -type f \( -name "*.bin" -o -name "*.sha256" -o -name "*.zip" \) \
+            -exec cp {} release/ \;
+          ls -lh release/
+
+      - name: 生成发布说明
+        run: |
+          cat > /tmp/release-notes.md <<EOF
+          由 GitHub Actions 自动构建，对应提交 \`${GITHUB_SHA:0:7}\`。
+
+          ## 烧录
+
+          \`\`\`bash
+          pip install esptool
+          # 端口按实际情况改：Windows 形如 COM3，Linux/macOS 形如 /dev/ttyACM0
+          esptool.py --chip esp32c3 --port COM3 write_flash -z 0x0 esp32c3-ams-firmware.bin
+          \`\`\`
+
+          \`esp32c3-ams-firmware.bin\` 从地址 0x0 覆盖整片 4MB Flash，里面已经包含
+          引导程序 + 分区表 + MicroPython v${MICROPYTHON_VERSION} + 本项目全部代码 + umqtt 库。
+          **烧完直接上电就能跑，不需要再单独烧固件或上传 .py 文件。**
+
+          正常情况不需要先擦除（这个文件会覆盖整片 Flash，旧文件系统会被一并清掉）；
+          若想彻底清空，先执行 \`esptool.py --chip esp32c3 --port COM3 erase_flash\`。
+
+          首次上电若连不上已知 WiFi，板子会自己开一个名为 \`AMS_WIFI\` 的热点，
+          手机连上后打开浏览器进配置页面填 WiFi 与打印机信息即可。
+
+          ---
+
+          \`esp32c3-ams-mpy.zip\` 是 .mpy 版本，体积更小，适合用 mpremote / Thonny 手动上传的场景。
+          两种部署方式二选一即可。
+          EOF
+          cat /tmp/release-notes.md
+
+      - name: 打 tag → 发布正式 Release
         if: startsWith(github.ref, 'refs/tags/v')
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          cat > /tmp/release-notes.md <<'EOF'
-          由 GitHub Actions 自动构建。
-
-          - `esp32c3-ams-mpy.zip`：全部 .mpy 模块 + boot.py / main.py / index.html，
-            可直接用 mpremote 或 Thonny 上传到 ESP32-C3 根目录。
-
-          注意：mpy-cross 版本必须与板子上的 MicroPython 固件版本一致，
-          否则设备会报 ValueError: incompatible .mpy file。
-          查看固件版本：连上串口后在 REPL 执行 import sys; print(sys.implementation)
-          EOF
           gh release create "${GITHUB_REF_NAME}" \
-            esp32c3-ams-mpy.zip \
             --title "${GITHUB_REF_NAME}" \
+            --notes-file /tmp/release-notes.md \
+            release/*
+
+      - name: 主分支提交 → 更新滚动预发布版 latest
+        if: github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # 先删掉旧的（连 tag 一起），保证 latest 始终指向最新构建
+          gh release delete latest --yes --cleanup-tag || true
+          gh release create latest \
+            --target "${GITHUB_SHA}" \
+            --title "最新构建（每次提交自动更新）" \
+            --prerelease \
             --notes-file /tmp/release-notes.md
+          gh release upload latest release/* --clobber
+          echo "已更新预发布版: https://github.com/${GITHUB_REPOSITORY}/releases/tag/latest"

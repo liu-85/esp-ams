@@ -29,7 +29,9 @@ class AMS_WEB(AMS):
     
     def updata_data(self,updata_data):
         # 更新json中的数据
-        json_data=read_json_file(json_file)
+        # 注意：全新烧录的板子上还没有 config.json，read_json_file 会返回 None，
+        #       这里必须兜底成空字典，否则首次配置会抛 AttributeError。
+        json_data=read_json_file(json_file) or {}
         json_data.update(updata_data)
         write_json_file(json_file,json_data)
         return json_data   
@@ -229,9 +231,10 @@ class AMS_WEB(AMS):
         if self.conent_and_subscribe():
             dict_info["info"] = "MQTT连接成功"
             self.send_response(client,ujson.dumps(dict_info),is_json=True)
-            json_data=read_json_file(json_file)
+            # 同样要兜底：没有 config.json 时先建一个，并且写回合并后的完整数据
+            json_data=read_json_file(json_file) or {}
             json_data.update(data)
-            write_json_file(json_file,data)
+            write_json_file(json_file,json_data)
             return True
         else:
             dict_info["info"] = "MQTT连接失败"

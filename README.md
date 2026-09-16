@@ -61,7 +61,8 @@
 | 网页配置 | 连不上 WiFi 时自动开热点供初次配置；之后通过页面 IP 访问 |
 | 硬件调试 | 网页上实时显示 4 路离合状态，并可手动点动任意通道 |
 | 电磁离合互斥 | 软件层强制同一时刻最多 1 路吸合，含启动检查 / 吸合前复核 / 运行期体检 |
-| CI 自动构建 | GitHub Actions 自动语法检查、跑自测、交叉编译 `.mpy`、打 tag 自动发 Release |
+| 一键烧录 | 一个 `.bin` 覆盖整片 Flash（引导程序 + 分区表 + MicroPython + 全部代码 + umqtt 库），烧完直接上电即用 |
+| CI 自动构建 | 每次提交自动编译：语法检查 + 自测 + 单文件固件 + `.mpy` 包；主分支更新 `latest` 预发布版，打 tag 发正式 Release |
 
 ---
 
@@ -184,6 +185,8 @@ yaoams/
 │   ├── info_load.py              # 配置文件读写（wifi.dat / config.json）
 │   ├── logout.py                 # 日志输出
 │   ├── index.html                # Web 配置页面（含硬件调试面板）
+│   ├── umqtt/                    # MQTT 客户端库（第三方，纳入仓库以保证烧录后自包含）
+│   │   └── simple.py             #   来自 micropython-lib（MIT）
 │   └── bambu/                    # 与拓竹打印机 MQTT 通信相关
 │       ├── bambu_mqtt.py         # MQTT 客户端封装（连接、订阅、发布）
 │       ├── bambu_commands.py     # 常用 MQTT 命令（resume / pushall ...）
@@ -194,11 +197,14 @@ yaoams/
 │   ├── run_tests.py              # 测试入口：python tests/run_tests.py
 │   └── mpy_stubs/                # machine / network / ujson / uasyncio / umqtt 桩模块
 ├── tools/
-│   └── build_mpy.py              # ★ 交叉编译 .mpy 并打包部署 zip
-├── .github/workflows/build.yml   # ★ GitHub Actions：检查 + 自测 + 编译 + 发 Release
+│   ├── make_firmware_bin.py      # ★ 合成「单文件可烧录固件」（官方固件 + 本项目代码）
+│   ├── lfs_mkfs.c                # ★ 生成 / 校验文件系统镜像（littlefs 2.8，与固件内置同源）
+│   └── build_mpy.py              # 交叉编译 .mpy 并打包部署 zip
+├── .github/workflows/build.yml   # ★ GitHub Actions：检查 + 自测 + 固件 + .mpy + 发布
 ├── g_code/                       # Bambu Studio 换料 G-code（要粘贴到切片软件）
 ├── 打印件/                        # 结构件 STL / 3MF
 ├── assets/                       # 文档图片
+├── dist/                         # 构建产物（已忽略，不进版本库）
 ├── .gitignore
 ├── LICENSE
 └── README.md
@@ -208,21 +214,47 @@ yaoams/
 
 ## 快速开始
 
-### 第 1 步：烧录 MicroPython 固件
+### 第 1 步：烧录（推荐：一个文件搞定）
 
-到 [micropython.org/download/ESP32_GENERIC_C3](https://micropython.org/download/ESP32_GENERIC_C3/)
-下载 ESP32-C3 固件，用 esptool 烧录：
+到本仓库的 **Releases** 页面下载 `esp32c3-ams-firmware.bin`
+（每次提交都会自动重新构建，标题为「最新构建」的那份永远是最新的），然后：
+
+```bash
+pip install esptool
+esptool.py --chip esp32c3 --port COM5 write_flash -z 0x0 esp32c3-ams-firmware.bin
+```
+
+就这一条命令。该文件从地址 `0x0` 开始覆盖**整片 4MB Flash**：
+
+| 地址 | 内容 |
+| --- | --- |
+| `0x000000` | ESP32-C3 引导程序 |
+| `0x008000` | 分区表（nvs / phy_init / app / vfs） |
+| `0x010000` | MicroPython v1.23.0（官方发布的固件，未做修改） |
+| `0x200000` | 文件系统（littlefs），放着 `python_code/` 的全部代码 + `umqtt` 库 |
+
+也就是说：**不用先烧固件、也不用再上传任何 .py**，烧完直接上电就能跑，
+下面第 2 步可以跳过，直接看第 3 步。
+
+> 正常情况下不需要先 `erase_flash` —— 这个文件覆盖整片 Flash，旧文件系统区域会被
+> 整体重写。只有在出现异常（之前烧过别的固件、或想彻底清空）时才先补一条
+> `esptool.py --chip esp32c3 --port COM5 erase_flash`，然后再烧。
+
+### 第 2 步（备选）：自己烧固件 + 上传代码
+
+需要频繁改代码调试、或者不想整片重烧时，用这种方式。
+
+先烧官方 MicroPython 固件：
 
 ```bash
 esptool.py --chip esp32c3 --port COM5 erase_flash
 esptool.py --chip esp32c3 --port COM5 write_flash -z 0x0 ESP32_GENERIC_C3-xxxx.bin
 ```
 
-> 记住固件版本号（例如 `v1.23.0`），第 3 步和 CI 里都要用。
+固件到 [micropython.org/download/ESP32_GENERIC_C3](https://micropython.org/download/ESP32_GENERIC_C3/)
+下载。记住版本号（例如 `v1.23.0`），CI 与 `.mpy` 都要和它对齐。
 
-### 第 2 步：上传代码
-
-推荐用 `mpremote`：
+然后用 `mpremote` 上传代码：
 
 ```bash
 pip install mpremote
@@ -234,7 +266,7 @@ mpremote connect /dev/ttyACM0 fs cp -r ./python_code/ :
 ```
 
 也可以直接用 Thonny 把 `python_code/` 里的文件拖到设备根目录（注意 `bambu/`
-要建成同名子目录）。
+和 `umqtt/` 要建成同名子目录）。
 
 或者用 CI 编译好的 `.mpy` 包（体积更小、启动更快）：
 
@@ -249,6 +281,9 @@ mpremote connect COM5 fs cp -r ./dist/ :
 
 > ⚠️ `mpy-cross` 的版本必须和板子上的固件版本一致，否则设备会报
 > `ValueError: incompatible .mpy file`。
+>
+> 注意 `boot.py` / `main.py` 必须是源码 `.py`（MicroPython 是直接执行这两个文件，
+> 它们被编译成 `.mpy` 后不会被执行）。
 
 ### 第 3 步：修改 Bambu Studio 的换料 G-code
 
@@ -427,40 +462,69 @@ import device_processing
 
 ---
 
-## GitHub Actions 自动编译
+## GitHub Actions 自动编译与发布
 
-`.github/workflows/build.yml` 提供两条流水线，推送到 `main` 或提 PR 时自动触发：
+`.github/workflows/build.yml` 分四个环节，**每次提交都会自动跑**（push 到任意分支、
+提 PR、或在网页上手动点运行）：
 
 | Job | 做什么 |
 | --- | --- |
 | **语法检查与逻辑自测** | `compileall` 检查全部 Python 文件；运行 `tests/run_tests.py` 验证离合互斥等硬件约束 |
-| **交叉编译 .mpy 部署包** | 用 `mpy-cross` 把 `python_code/` 编译成 `.mpy`，打成一个 zip 上传为构建产物 |
+| **交叉编译 .mpy 部署包** | 用 `mpy-cross` 把 `python_code/` 编译成 `.mpy`，打成一个 zip |
+| **构建单文件固件 BIN** | 官方固件 + littlefs 文件系统镜像 → 合成可整片烧录的 BIN，并做四道校验 |
+| **发布固件** | 主分支提交 → 更新滚动预发布版 `latest`；打 `v*` tag → 发正式 Release |
 
-打 tag（如 `v1.0.0`）时会自动创建 GitHub Release 并附上 zip。
+所有产物同时挂在 Actions 的 Artifacts 下（保留 30 天）和 Releases 页面。
+
+**发布规则**
+
+| 触发方式 | 结果 |
+| --- | --- |
+| push 到 `main` | 自动覆盖 Releases 里的 `latest`（预发布），下载地址固定不变 |
+| push tag `v1.0.0` | 创建正式 Release `v1.0.0` |
+| Pull Request | 只编译校验，不发布 |
+
+```bash
+git tag v1.0.0
+git push origin v1.0.0
+```
+
+**单文件固件是怎么做出来的**
+
+`tools/make_firmware_bin.py` 负责整个流程，核心是「文件系统必须与设备端同源」：
+
+1. 从官方固件里**解析分区表**（不写死偏移），找到 `vfs` 分区（本板 `0x200000` 起，2MB）；
+2. 用 `tools/lfs_mkfs.c` 生成 littlefs 镜像 —— 它链接的是**上游 littlefs 2.8**，
+   与 MicroPython v1.23 内置的 `lib/littlefs` 完全一致，参数也照抄设备端
+   `VfsLfs2.mkfs`（`block_size=4096`、`block_cycles=100`、`name_max=255` …）；
+3. 与官方固件拼成从 `0x0` 覆盖整片 Flash 的 BIN；
+4. 四道校验：用同一份 littlefs 代码回读并逐字节比对 → 产物重新解析镜像头与分区表 →
+   校验块 0/1 偏移 8 处的 `littlefs` 魔数 → 再用另一套独立实现（littlefs-python）
+   把 BIN 里的文件系统读一遍。
+
+> ⚠️ 这些校验不是摆设。ESP32 端 `_boot.py` 挂载失败会走
+> `inisetup.check_bootsec()`，只要首扇区不是 `0xFF` 就判定「文件系统损坏」并进入
+> **死循环**，所以必须一次做对。脚本还会联网核对 littlefs 版本号，不一致直接报错停止。
+
+**升级 MicroPython 版本**：改 `.github/workflows/build.yml` 顶部那 5 个变量即可，
+文件里对每一项都有说明，其中 `MICROPYTHON_VERSION` 与 `LITTLEFS_VERSION` 的配套关系
+由脚本自动检查。
 
 **本地等价操作**：
 
 ```bash
-pip install mpy-cross==1.23.0
-python tests/run_tests.py     # 自测
-python tools/build_mpy.py     # 编译打包，产物在 dist/ 和 esp32c3-ams-mpy.zip
+python tests/run_tests.py                 # 自测
+python tools/build_mpy.py                 # 交叉编译 .mpy 包
+
+# 单文件固件（需要先编译那个小工具，CI 里是自动完成的）
+gcc -O2 -o tools/build/lfs_mkfs tools/lfs_mkfs.c \
+    <littlefs源码>/lfs.c <littlefs源码>/lfs_util.c -I<littlefs源码>
+python tools/make_firmware_bin.py \
+  --firmware-url "https://micropython.org/resources/firmware/ESP32_GENERIC_C3-20240602-v1.23.0.bin" \
+  --out dist/esp32c3-ams-firmware.bin
 ```
 
-> ⚠️ **版本必须对齐**：`.github/workflows/build.yml` 顶部的
-> `MPY_CROSS_VERSION` 要改成和你板子上固件一致的版本。
-> 查看固件版本：连上串口后在 REPL 执行 `import sys; print(sys.implementation)`。
-
-**发布**：
-
-```bash
-git tag v1.0.0
-git push origin v1.0.0        # 推送后 Actions 会自动构建并创建 Release
-```
-
-**进阶**：如果你想得到一个把全部模块都「冻结」进 Flash 的单一 `.bin` 固件
-（启动更快、RAM 占用更低），可以在 CI 里用 espressif 官方 IDF 容器编译
-MicroPython 源码，通过 `FROZEN_MANIFEST` 指向本项目。这一步对版本比较敏感，
-建议本地先跑通再搬进 CI。
+> 本地生成固件需要 gcc；不想装就直接用 CI 产物（每次提交都会自动构建）。
 
 ---
 
@@ -495,10 +559,31 @@ python tests/run_tests.py
 <summary><b>板子上电后没有反应 / 找不到 AMS_WIFI 热点</b></summary>
 
 1. 确认 `main.py` 已经上传到设备**根目录**（不是子目录）。
+   （用单文件固件整片烧录时，文件已经在文件系统里，这条基本不会踩到。）
 2. 用串口工具（Thonny / `mpremote`）连上后看有没有报错，特别是
    `.mpy` 版本不匹配的 `ValueError: incompatible .mpy file`。
 3. 确认 `boot.py` 和 `main.py` 是 `.py` 而不是 `.mpy` —— 这两个文件
    MicroPython 是直接 `exec` 文件内容的，不能编译成字节码。
+</details>
+
+<details>
+<summary><b>串口反复打印 The filesystem appears to be corrupted / 一直重启</b></summary>
+
+这是 MicroPython 挂载文件系统失败后的保护逻辑（`inisetup.check_bootsec()`）：
+只要分区首扇区不是 `0xFF`，它就认定文件系统损坏，并进入死循环，不执行任何用户代码。
+
+**正常烧录本仓库的单文件固件不会出现这个问题** —— 构建流程里有四道校验专门防它
+（见 [GitHub Actions 自动编译与发布](#github-actions-自动编译与发布)）。一旦遇到，这样救回来：
+
+```bash
+# 1) 彻底擦除整片 Flash（关键，必须做）
+esptool.py --chip esp32c3 --port COM5 erase_flash
+# 2) 重新烧录
+esptool.py --chip esp32c3 --port COM5 write_flash -z 0x0 esp32c3-ams-firmware.bin
+```
+
+反复出现的话，通常是固件版本与文件系统格式不配套（例如固件换了版本、但文件系统镜像
+还是按旧版 littlefs 生成的），或者自己改过分区表。用本仓库 CI 产出的固件可避免。
 </details>
 
 <details>
@@ -663,6 +748,14 @@ M73 P101 R[next_extruder]
 - 上游项目：[YBA-AMS](https://github.com/yuanbao-yu/YBA-AMS)
 - MQTT 命令参考：[greghesp/ha-bambulab](https://github.com/greghesp/ha-bambulab)
 - 许可证：[MIT](./LICENSE)
+
+第三方组件：
+
+| 组件 | 用途 | 许可证 |
+| --- | --- | --- |
+| [MicroPython](https://micropython.org/) 官方固件 | ESP32-C3 运行时（构建时下载，未修改） | MIT |
+| [littlefs](https://github.com/littlefs-project/littlefs) 2.8.0 | 生成设备文件系统镜像（构建时下载使用） | BSD-3-Clause |
+| [umqtt.simple](https://github.com/micropython/micropython-lib) | MQTT 客户端，已纳入 `python_code/umqtt/` | MIT |
 
 > 本项目为个人 DIY 项目，涉及对打印机的远程控制与自研送料机构。使用前请确认
 > 你了解相关风险，尤其是电磁离合的驱动电路与供电设计。因硬件设计不当导致
