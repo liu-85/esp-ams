@@ -358,9 +358,47 @@ button.mini{padding:5px 11px;font-size:12.5px}
         <div class="card">
           <h2>硬件调试 <span class="sub">共享电机 + 4 路电磁离合</span></h2>
           <div id="hardware_info"></div>
+
+          <div class="hw-grp">
+            <div class="t">进退响应时间（4 个通道统一用这一个值）</div>
+            <div class="row">
+              <label>每次点动转多少秒</label>
+              <input type="number" id="jog_seconds" min="0.2" max="60" step="0.5" value="1">
+            </div>
+            <div class="row">
+              <button class="primary" style="flex:1" id="btn_jog_save">保存响应时间</button>
+            </div>
+            <p class="tip">只影响下面这些手动点动按钮，<b>不会改变自动换料</b>时的转动时长。
+              可填 0.2 ~ 60 秒。存进设备，重启也记得。</p>
+          </div>
+
           <div id="hardware_test"></div>
           <p class="tip">同一时刻只会吸合 1 路离合，动作完成后自动全部断开。
-            点动仅在调试时使用，正常打印请勿操作。</p>
+            按下后立刻开始动作、到点自动停止；动作期间其它点动会被拒绝（不会排队）。</p>
+        </div>
+      </section>
+
+      <!-- ============ 系统升级（应用层 OTA） ============ -->
+      <section class="page" id="page_ota">
+        <div class="card">
+          <h2>系统升级 <span class="sub">网页上传更新包，不用插 USB</span></h2>
+          <p class="tip">
+            用 <code>python tools/make_update_pack.py</code> 生成 <b>.ams</b>
+            更新包，在这里上传；设备会把里面的文件写进自己的文件系统，然后自动重启。
+            全部程序逻辑和这个页面都能更新，不需要插 USB、也不用重新配网。<br>
+            <b>整机固件 BIN（esp32c3-ams-firmware.bin）不能走这里</b> ——
+            板子只有单个应用分区，没有备用分区可以切换，整机升级仍然要 USB 刷写。
+          </p>
+          <div class="row">
+            <label>选择更新包</label>
+            <input type="file" id="ota_file" accept=".ams,.bin">
+          </div>
+          <div class="row">
+            <button class="primary" style="flex:1" id="btn_ota_upload">上传并升级</button>
+          </div>
+          <div id="ota_box"></div>
+          <p class="tip">升级过程中不要断电。写完之后设备会自动重启，页面会失联十几秒，
+            重启完成后刷新即可。</p>
         </div>
       </section>
 
@@ -772,7 +810,8 @@ var MENU = [
   ]},
   { key:'sys', name:'系统', items:[
       { id:'status', label:'运行状态' },
-      { id:'diag',   label:'上电诊断' }
+      { id:'diag',   label:'上电诊断' },
+      { id:'ota',    label:'系统升级 (OTA)' }
   ]}
 ];
 var OPEN_KEY = 'ams_menu_open';
@@ -892,6 +931,13 @@ var wifiSig = null;
 var mqttFormLoaded = false;
 var hwChannelsKey = '';
 
+/* ★ 手工点动的「进退响应时间」，单位毫秒。真值来自设备 /status 的 jog_ms，
+   这里只是接口没回来之前先用的默认值。4 个通道统一用这一个数。 */
+var jogMs = 1000;
+var hwBusy = false;
+function jogSecs(){ return Math.round(jogMs / 100) / 10; }
+function jogLabel(){ return jogSecs() + ' 秒'; }
+
 function dot(el, on){ el.className = 'dot' + (on ? ' on' : ''); }
 function setAlert(msg){
   var el = $('alertbar');
@@ -915,8 +961,15 @@ function applyStatus(d){
   $('s_wifi').innerHTML = wifiOn
       ? '<span class="ok">已连接 ' + esc(d.wifi_ssid || '') + '</span>'
       : '<span class="warn">未连接' + (d.wifi_status_text ? '（' + esc(d.wifi_status_text) + '）' : '') + '</span>';
-  $('s_mqtt').innerHTML = mqttOn
-      ? '<span class="ok">已连接</span>' : '<span class="warn">未连接</span>';
+  // MQTT 未连上时要说清"配置在、后台一直在重试"，而不是干巴巴一句"未连接"。
+  // 旧版配合"保存提示失败"，会让人以为配置压根没存进去 —— 其实存进去了。
+  if(mqttOn){
+    $('s_mqtt').innerHTML = '<span class="ok">已连接</span>';
+  } else if(d.mqtt_configured){
+    $('s_mqtt').innerHTML = '<span class="warn">未连接（配置已保存，正在后台重试）</span>';
+  } else {
+    $('s_mqtt').innerHTML = '<span class="warn">未连接（还没配置打印机参数）</span>';
+  }
   $('s_ap').textContent = apOn ? ('已打开 ' + esc(d.ap_ssid || 'AMS_WIFI')) : '已关闭';
   $('s_cur').textContent = d.current_access ? ('通道 ' + d.current_access) : '未知（未装到位开关）';
   $('st_head').textContent = d.ip ? d.ip : (apOn ? d.ap_ip : '');
@@ -944,6 +997,9 @@ function applyStatus(d){
   } else if(!accessFromDevice){
     renderAccess(DEFAULT_CHANNELS, DEFAULT_COLORS, d.current_access);
   }
+
+  // 手动点动的「进退响应时间」：以设备为准（换设备/换浏览器都一样）
+  if(typeof d.jog_ms === 'number' && d.jog_ms > 0){ syncJogInput(d.jog_ms); }
 
   updateHardware(d.hardware);
   updateDiagnostics(d);
@@ -1048,8 +1104,12 @@ function save_mqtt(){
   if(missing.length){ toast('请填写：' + missing.join('、'), 'err'); return; }
 
   send('/mqtt_connect', data, function(d){
-    if(d.connected) toast(d.info || '配置已保存，连接成功', 'ok');
-    else toast(d.info || '配置已保存', d.saved ? 'warnk' : 'err');
+    // ★ 新语义：saved = 一定已经落盘；connecting = 后台正在连。
+    //   只有"连配置都没存下来"才算失败 —— 旧版把"暂时连不上"也报成失败，
+    //   用户以为白填了，重启之后它却自己连上了，非常费解。
+    if(d.connected)   toast(d.info || '配置已保存，打印机已连接', 'ok');
+    else if(d.saved)  toast(d.info || '配置已保存，正在后台连接打印机…', 'warnk');
+    else              toast(d.info || '配置保存失败', 'err');
     refresh();
   });
 }
@@ -1119,7 +1179,9 @@ function save_access(){
 
 /* ---------- 硬件 ---------- */
 function ensureHwButtons(channels){
-  var key = channels.join(',');
+  // ★ key 里带上 jogMs：设置一改就要重画，否则按钮还写着旧的秒数，
+  //   用户会以为设置没生效。
+  var key = channels.join(',') + '@' + jogMs;
   if(key === hwChannelsKey) return;
   hwChannelsKey = key;
   var box = $('hardware_test');
@@ -1136,11 +1198,11 @@ function ensureHwButtons(channels){
     var btns = document.createElement('div');
     btns.className = 'hw-btns';
     var b1 = document.createElement('button');
-    b1.textContent = '进料 1 秒';
+    b1.textContent = '进料 ' + jogLabel();
     b1.onclick = (function(ch){ return function(){ hardware_test(ch, 1); }; })(c);
     var b2 = document.createElement('button');
     b2.className = 'ghost';
-    b2.textContent = '退料 1 秒';
+    b2.textContent = '退料 ' + jogLabel();
     b2.onclick = (function(ch){ return function(){ hardware_test(ch, -1); }; })(c);
     btns.appendChild(b1); btns.appendChild(b2);
     grp.appendChild(btns);
@@ -1152,8 +1214,16 @@ function updateHardware(hw){
   var channels = (hw.channels && hw.channels.length) ? hw.channels : DEFAULT_CHANNELS;
   var eng = hw.engaged || [];
   var limits = hw.limits || [];
+  hwBusy = !!hw.busy;
 
   var html = '';
+  if(hwBusy){
+    html += '<div class="kv"><span>总线状态</span><b class="ok">正在动作（通道' +
+            esc(hw.active_channel === undefined ? '?' : hw.active_channel) +
+            '）· 结束后自动断开</b></div>';
+  }
+  html += '<div class="kv"><span>进退响应时间</span><b>' + esc(jogLabel()) +
+          '（4 个通道统一）</b></div>';
   html += '<div class="kv"><span>电机方向</span><b>' + esc(hw.motor_direction === undefined ? 0 : hw.motor_direction) +
           '（1=进料　-1=退料　0=停止）</b></div>';
   html += '<div class="kv"><span>离合冲突次数</span><b' + (hw.conflicts ? ' class="warn"' : '') +
@@ -1174,9 +1244,86 @@ function updateHardware(hw){
   ensureHwButtons(channels);
 }
 function hardware_test(channel, direction){
-  send('/hardware_test', { channel:channel, direction:direction, times_ms:1000 }, function(d){
-    toast(d.info || '动作完成', 'ok');
+  // ★ times_ms 故意不传：时长以设备上的「进退响应时间」为准。
+  //   这样"统一设置 4 个通道"只要改设备一处，前端改不改都不会不一致。
+  //
+  // ★ 设备现在**立刻回包**（动作在后台计时），所以不会再有转圈等待；
+  //   返回 ok:false 表示总线正忙，直接说清楚，而不是排队干等。
+  send('/hardware_test', { channel:channel, direction:direction }, function(d){
+    if(d && d.ok === false){
+      toast(d.info || '总线正忙，请稍后再试', 'warnk');
+    } else {
+      toast((d && d.info) || '已开始动作', 'ok');
+    }
+    refresh();                       // 马上刷一次，离合状态立刻反映出来
+  });
+}
+
+/* ---------- 进退响应时间 ---------- */
+function syncJogInput(ms){
+  var changed = (ms !== jogMs);
+  jogMs = ms;
+  var el = $('jog_seconds');
+  // ★ 正在输入时不覆盖：/status 每 2 秒回来一次，无脑写 value 会把用户
+  //   刚敲进去的数字冲掉（"我还没点保存它就自己变回去了"）。
+  if(el && document.activeElement !== el) el.value = jogSecs();
+  // ★ 只有真的变了才让按钮重画 —— 否则每 2 秒一次的轮询都会重建一遍
+  //   按钮，白白折腾 DOM。
+  if(changed) hwChannelsKey = '';
+}
+function save_jog(){
+  var el = $('jog_seconds');
+  var v = parseFloat(el ? el.value : '');
+  if(isNaN(v) || v <= 0){ toast('请填写大于 0 的秒数', 'err'); return; }
+  send('/jog_set', { seconds:v }, function(d){
+    if(d && d.jog_ms){ syncJogInput(d.jog_ms); }
+    toast((d && d.info) || '已保存', d && d.ok === false ? 'err' : 'ok');
     refresh();
+  });
+}
+
+/* ---------- 系统升级（应用层 OTA） ---------- */
+function otaStatus(html, kind){
+  var box = $('ota_box');
+  if(!box) return;
+  box.innerHTML = '<div class="' + (kind || 'kv') + '">' + html + '</div>';
+}
+function ota_upload(){
+  var input = $('ota_file');
+  var f = input && input.files && input.files[0];
+  if(!f){ toast('请先选择更新包（.ams）', 'err'); return; }
+
+  otaStatus('正在上传 <b>' + esc(f.name) + '</b>（' +
+            (Math.round(f.size / 1024)) + ' KB）… 请不要断电。');
+
+  // ★ 直接把文件原始字节当请求体发出去（application/octet-stream），
+  //   不用 multipart —— 设备端是极小型的 HTTP 服务，解析 multipart
+  //   又慢又容易出错，而 Content-Length 本来就是最可靠的边界。
+  busy(true);
+  fetch('/ota_upload', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/octet-stream' },
+    body: f
+  }).then(function(res){
+    return res.json().catch(function(){ return {}; }).then(function(body){
+      if(!res.ok) throw new Error(body && body.info ? body.info : ('HTTP ' + res.status));
+      return body;
+    });
+  }).then(function(d){
+    busy(false);
+    otaStatus('<span class="ok">' + esc(d.info || '升级完成') + '</span>', 'kv');
+    toast('升级包已写入，设备即将重启…', 'ok');
+    // 设备马上会重启，页面必然失联 —— 主动提示用户怎么继续，
+    // 而不是让他对着一个转圈的界面发愁。
+    setTimeout(function(){
+      setAlert('设备正在重启，约 15 秒后刷新本页即可');
+      otaStatus('<span class="ok">升级已写入。</span>设备正在重启，' +
+                '请等约 15 秒后刷新页面。若长时间打不开，断电重插一次。', 'kv');
+    }, 2500);
+  }).catch(function(err){
+    busy(false);
+    otaStatus('<span class="warn">' + esc(err.message || '上传失败') + '</span>', 'kv');
+    toast(err.message || '上传失败', 'err');
   });
 }
 
@@ -1315,6 +1462,8 @@ function boot(){
   $('btn_wifi_scan').onclick = rescan_wifi;
   $('btn_mqtt_save').onclick = save_mqtt;
   $('btn_access_save').onclick = save_access;
+  $('btn_jog_save').onclick = save_jog;
+  $('btn_ota_upload').onclick = ota_upload;
   $('btn_bootclear').onclick = reset_boot_count;
   $('btn_log_toggle').onclick = toggleLog;
   $('btn_log_clear').onclick = clearLogView;

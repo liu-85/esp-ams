@@ -737,8 +737,8 @@ def test_web_memory_error_sends_tiny_page_not_blank():
     import inspect
     import AMS_WEB as web_module
 
-    src = _code_only(web_module.AMS_WEB.run_web_loop)
-    check("MemoryError" in src, "请求循环必须单独接住 MemoryError")
+    src = _code_only(web_module.AMS_WEB._web_worker)
+    check("MemoryError" in src, "服务循环必须单独接住 MemoryError")
     check("oom_respond" in src, "内存不足时要走 oom_respond 兜底")
     check("mem_note" in src, "异常日志里要带空闲内存，否则下次 OOM 还是只能猜")
 
@@ -781,14 +781,25 @@ def test_web_accept_loop_is_responsive():
 
 
 def test_web_header_read_is_not_blocking():
-    """请求头必须用非阻塞方式读，并且要有 await 让步"""
+    """请求头必须用非阻塞方式读，并且要有 await 让步
+
+    历史：读请求头用阻塞 recv + 3 秒超时，浏览器开的"预连接"套接字什么都不发，
+    服务端就傻等满 3 秒，期间整个事件循环停摆 → "网页偶尔打不开"。
+    现在这一职责拆在 _read_headers（头）和 _read_body（体）里。
+    """
     import inspect
     from AMS_WEB import AMS_WEB
-    src = inspect.getsource(AMS_WEB._read_request)
+
+    src = inspect.getsource(AMS_WEB._read_headers)
     check("setblocking(False)" in src, "读请求头前应把 socket 设为非阻塞")
     check("setblocking(True)" in src, "读完后要恢复阻塞模式，便于后续发送")
     check("await asyncio.sleep_ms" in src, "没数据时必须 await 让出 CPU，否则会卡住其它任务")
     check("HEADER_WAIT_MS" in src, "必须有总等待上限，不能被空闲连接拖死")
+
+    body = inspect.getsource(AMS_WEB._read_body)
+    check("setblocking(False)" in body, "读请求体前也应设为非阻塞")
+    check("await asyncio.sleep_ms" in body, "等请求体时同样要 await 让步")
+    check("BODY_WAIT_MS" in body, "请求体等待也要有上限")
 
 
 def test_web_gc_threshold_is_relaxed():
@@ -839,7 +850,9 @@ def test_ams_loop_waits_for_wifi_before_mqtt():
     check("wlan_sta.isconnected()" in src, "重连 MQTT 之前必须先确认 WiFi 已连接")
 
     idx_wifi = src.find("wlan_sta.isconnected()")
-    idx_conn = src.find("conent_and_subscribe()")
+    # 注意：这里的实参是 preflight=True（先花最多 1 秒探一下打印机通不通），
+    # 所以不能用 "conent_and_subscribe()" 这种带空括号的字面量去搜。
+    idx_conn = src.find("conent_and_subscribe(")
     check(idx_wifi != -1 and idx_conn != -1 and idx_wifi < idx_conn,
           "判断顺序不对：应该先看 WiFi，再决定要不要真的去连 MQTT")
 
@@ -1174,11 +1187,11 @@ def test_request_reader_waits_for_post_body():
     import inspect
     import AMS_WEB as web_module
 
-    src = inspect.getsource(web_module.AMS_WEB._read_request)
+    src = inspect.getsource(web_module.AMS_WEB._read_body)
     check("_content_length" in src,
-          "读请求时必须解析 Content-Length，否则请求体永远读不全")
-    check("head_end" in src and "body_len" in src,
-          "必须区分请求头和请求体，按长度把请求体收齐")
+          "读请求体时必须按 Content-Length 判断该收多少，否则请求体永远读不全")
+    check("body_len" in src,
+          "必须按长度把请求体收齐")
 
     body = b'{"mqtt_server":"192.168.1.9","DEVICE_SERIAL":"SN1","mqtt_password":"1234"}'
     head = (b"POST /mqtt_connect HTTP/1.1\r\nHost: x\r\n"
@@ -1216,11 +1229,29 @@ class _FakeReadSocket:
         return self.segments.pop(0)
 
 
+async def _read_whole_request(app, sock):
+    """按 _serve_client 的真实顺序读一次请求（头 → 体），返回原始字节。
+
+    读请求的职责被拆成 _read_headers / _read_body 两个函数之后，
+    测试里需要一个等价的小工具把它们串起来，否则测试只能去啃内部实现细节。
+    """
+    head, extra = await app._read_headers(sock)
+    if not head:
+        return None
+    body = await app._read_body(sock, head, extra)
+    if not body:
+        return head
+    return head + body
+
+
 def test_read_request_collects_body_arriving_in_a_later_segment():
     """★ 请求体在下一个 TCP 段里时，也必须被读齐
 
     这是"Mqtt设置保存提示404"的直接复现：旧代码只读到空行为止，
     请求体留在 socket 里没读，于是解析出 None → 路由不成立 → 404。
+
+    现在读请求分两步（_read_headers → _read_body），这里按 _serve_client
+    的真实顺序把两步串起来，验证分段到达也能读全。
     """
     import ujson
     import uasyncio as _asyncio
@@ -1231,16 +1262,20 @@ def test_read_request_collects_body_arriving_in_a_later_segment():
     head = (b"POST /mqtt_connect HTTP/1.1\r\nHost: ams\r\n"
             b"Content-Length: %d\r\n\r\n" % len(body))
 
-    raw = _asyncio.run(app._read_request(_FakeReadSocket([head, body])))
+    raw = _asyncio.run(_read_whole_request(app, _FakeReadSocket([head, body])))
     check(raw is not None, "请求必须能被读到")
     check(raw.endswith(body), "请求体必须被读完（旧代码就在这里丢掉请求体，然后回 404）")
     check_eq(app.process_json(raw), ujson.loads(body),
              "读全之后必须能解析出 JSON，路由条件才成立")
 
     # 反过来：只给请求头（客户端没发体）时不能卡住，也不能假装读到了体
-    only_head = _asyncio.run(app._read_request(_FakeReadSocket([head])))
+    only_head = _asyncio.run(_read_whole_request(app, _FakeReadSocket([head])))
     check(only_head is not None, "只有请求头时也要能返回，不能卡死")
     check_eq(app.process_json(only_head), None, "没有请求体就应该解析出 None")
+
+    # 头 + 体挤在同一个 TCP 段里，也必须工作（真实网络里很常见）
+    joined = _asyncio.run(_read_whole_request(app, _FakeReadSocket([head + body])))
+    check(joined.endswith(body), "头和体在同一段里时也要能读齐")
 
 
 def test_send_response_handles_non_ascii_content_length():
@@ -1283,10 +1318,12 @@ def test_write_routes_never_answer_404_for_empty_body():
     import inspect
     import AMS_WEB as web_module
 
-    for name in ("wifi_connect", "mqtt_connect", "access_set", "hardware_test"):
+    for name in ("wifi_connect", "mqtt_connect", "access_set", "hardware_test",
+                 "jog_set"):
         check(name in web_module.WRITE_ROUTES, "%s 应被视为写接口" % name)
 
-    src = inspect.getsource(web_module.AMS_WEB.run_web_loop)
+    # 路由现在在 _serve_client 里（run_web_loop 只负责起监听 + 拉 worker）
+    src = inspect.getsource(web_module.AMS_WEB._serve_client)
     check("handle_bad_body" in src,
           "写接口的请求体为空时必须走 handle_bad_body（回 400），不能落到 404")
 
@@ -1295,11 +1332,16 @@ def test_write_routes_never_answer_404_for_empty_body():
 
 
 def test_mqtt_config_is_saved_before_connecting():
-    """★ MQTT 配置必须"先落盘，再连接"
+    """★ MQTT 配置必须"先落盘，再交给后台连接"
 
     旧代码只有连上打印机才写 config.json。而 AP 配置模式下根本没联网，
     MQTT 必然连不上 —— 于是保存永远失败、配置永远存不下来，
     重启之后还得重填。
+
+    这一版更进一步：**请求里根本不做 TLS 连接**。
+    TLS 握手是阻塞的，打印机没开机时会卡好几秒甚至几十秒 ——
+    那正是"点保存时网页像卡死"的来源。现在只更新参数 + 置脏标志，
+    由 run_ams_loop 去连，回包如实说明"saved / connecting"。
     """
     import inspect
     import AMS_WEB as web_module
@@ -1311,14 +1353,119 @@ def test_mqtt_config_is_saved_before_connecting():
     #   名字，直接搜源码文本会被"提示性文字"带偏。
     src = _code_only(web_module.AMS_WEB.handle_mqtt_cennect)
     check("updata_data" in src, "必须调用 updata_data 真正写 config.json")
-
-    # 写盘必须发生在连接尝试之前
-    idx_save = src.find("updata_data")
-    idx_conn = src.find("conent_and_subscribe")
-    check(idx_save != -1 and idx_conn != -1 and idx_save < idx_conn,
-          "顺序不对：配置要先写盘，再去尝试连接打印机（AP 模式下连不上是必然的）")
+    check("conent_and_subscribe" not in src,
+          "请求处理里不能现场做 TLS 连接 —— 那会把事件循环按住好几秒")
+    check("_mqtt_dirty" in src,
+          "应该置脏标志，让主循环用新参数重连")
+    check("mqtt_update_info" in src, "应该把新参数同步给 MQTT 客户端")
     check('"saved"' in src and '"connected"' in src,
           "返回里要有 saved / connected，网页才能给出准确提示")
+
+    # 参数校验必须发生在落盘之前（缺必填项就别写文件）
+    idx_req = src.find("MQTT_REQUIRED")
+    idx_save = src.find("updata_data")
+    check(idx_req != -1 and idx_save != -1 and idx_req < idx_save,
+          "顺序不对：应该先校验必填项，再写盘")
+
+
+def test_mqtt_save_reports_honest_status():
+    """★ MQTT 保存必须如实回答，不能动不动就报"失败"
+
+    旧行为：打印机没开机（或 AP 模式下没联网）→ 现场连接失败 → 回"失败"，
+    可是配置其实已经存好了，重启几次主循环一连就上 ——
+    用户看到的就是"提示失败，但重启几次它自己又连上了"这种自相矛盾的现象。
+    """
+    from AMS_WEB import AMS_WEB
+
+    app = AMS_WEB()
+    app.updata_data = lambda d: dict(d)          # 别真的写 config.json
+    conn = _FakeConn()
+
+    ok = app.handle_mqtt_cennect(conn, {
+        "mqtt_server": "192.168.1.9",
+        "DEVICE_SERIAL": "sn001",
+        "mqtt_password": "12345678",
+    })
+
+    check_eq(ok, True, "参数齐全时保存必须成功")
+    data = _json_of(conn)
+    check_eq(data.get("saved"), True, "必须如实说明「配置已保存」")
+    check_eq(data.get("connected"), False, "没连上就如实说没连上（不能谎报成功）")
+    check_eq(data.get("connecting"), True, "要说明「正在后台连接」")
+    check("已保存" in (data.get("info") or ""),
+          "提示语里要明确写出「配置已保存」——这才能解释"
+          "「重启几次就自己连上了」的现象")
+    check(("没联网" in (data.get("info") or "")) or ("后台连接" in (data.get("info") or "")),
+          "要区分「设备当前没联网」和「联网了、后台正在连」两种情况")
+    check_eq(app._mqtt_dirty, True,
+             "必须置脏标志，主循环看到就用新参数立刻重连")
+    check_eq(app.mqtt_server, "192.168.1.9", "新参数要同步进 MQTT 客户端")
+    check_eq(app.DEVICE_SERIAL, "SN001", "序列号应统一成大写")
+
+
+def test_mqtt_save_rejects_blank_required_fields():
+    """必填项留空要回 400 并点名是哪一项，而不是默默吞掉"""
+    from AMS_WEB import AMS_WEB
+
+    app = AMS_WEB()
+    saved = []
+    app.updata_data = lambda d: saved.append(d) or dict(d)
+    conn = _FakeConn()
+
+    ok = app.handle_mqtt_cennect(conn, {"mqtt_server": "192.168.1.9"})
+    check_eq(ok, False, "缺序列号和访问码时必须拒绝")
+    check_eq(_status_of(conn), 400, "参数缺失要回 400")
+    check_eq(saved, [], "校验没过就绝不能写盘")
+    check("访问码" in (_json_of(conn).get("info") or "") or
+          "设备序列号" in (_json_of(conn).get("info") or ""),
+          "提示里要点名缺失的中文字段，而不是糊一句「参数缺失」")
+
+
+def test_ams_loop_reconnects_when_mqtt_config_is_dirty():
+    """★ 主循环必须响应"配置刚改过"，立刻用新参数重连一次"""
+    import inspect
+    from AMS_MODEL import AMS
+
+    src = inspect.getsource(AMS.run_ams_loop)
+    check("_mqtt_dirty" in src, "run_ams_loop 要看脏标志")
+    idx = src.find("_mqtt_dirty")
+    idx_close = src.find("close_client()")
+    check(idx != -1 and idx_close != -1,
+          "配置变脏时必须先 close_client()（放掉旧 socket），再用新参数重连")
+    check("close_client()" in src,
+          "重连前必须关闭旧 socket —— 旧代码直接覆盖 self.client，每重连一次漏一个 socket")
+
+
+def test_close_client_releases_old_socket():
+    """close_client() 必须真的断开旧连接，否则 socket 会一个接一个漏掉"""
+    from bambu.bambu_mqtt import Bambu_mqtt_cliet
+
+    class FakeSock:
+        def __init__(self):
+            self.closed = False
+
+        def close(self):
+            self.closed = True
+
+    class FakeClient:
+        def __init__(self):
+            self.sock = FakeSock()
+            self.disconnected = False
+
+        def disconnect(self):
+            self.disconnected = True
+
+    m = Bambu_mqtt_cliet("127.0.0.1", "S", "P")
+    fake = FakeClient()
+    m.client = fake
+    m._mqtt_alive = True
+
+    check_eq(m.close_client(), True, "有旧连接时 close_client 应返回 True")
+    check_eq(fake.disconnected, True, "应该调用 disconnect()")
+    check_eq(m.client, None, "client 必须置空")
+    check_eq(m._mqtt_alive, False, "存活缓存必须一起清掉")
+    check_eq(m.close_client(), False, "已经没有连接时再调用应安全返回 False")
+    check_eq(m.mqtt_alive_cached(), False, "没有连接时缓存状态必须为 False")
 
 
 def test_mqtt_defaults_fill_blank_fields():
@@ -1361,7 +1508,7 @@ def test_ap_can_be_toggled_from_web():
     src = inspect.getsource(web_module.AMS_WEB.handle_ap_set)
     check("swcith_ap" in src, "/ap_set 要真的去开/关热点")
 
-    routes = inspect.getsource(web_module.AMS_WEB.run_web_loop)
+    routes = inspect.getsource(web_module.AMS_WEB._serve_client)
     check('"ap_set"' in routes, "/ap_set 必须挂进路由")
     check('"log"' in routes, "/log 必须挂进路由")
 
@@ -1577,6 +1724,1058 @@ def test_web_status_stays_serialisable_with_diagnostics():
     text = ujson.dumps(app._status_dict())
     check("boot_safety" in text and "reset" in text,
           "序列化结果里应该能看到诊断字段")
+
+
+# ===========================================================================
+# 这一版新增：把「响应太慢 / 像崩溃 / 刷新好几次才出页面 / 点动转圈」
+# 的根因逐条钉死
+#
+# 用户原话：
+#   · "系统响应太慢，而且会崩溃一样，刷新也没会打不开，多次刷新才会出来页面"
+#   · "网页调试按下通道一直在转圈，几十秒后才有动作，响应延迟"
+#   · "MQTT设置提示失败，重启几次又自动连接上了"
+#   · "在硬件调试中添加一个设置进退响应多少秒的选项，统一设置 4 个通道"
+#   · "在系统中添加OTA菜单，可以上传BIN文件在线更新"
+#
+# 根因是四处阻塞 / 排队（都已修掉，下面每条都对应一个测试）：
+#   1) /status 里调 check_mqtt_connection()，真的在 SSL 上发 PINGREQ ——
+#      打印机连接半死时会卡到 TCP 超时（几十秒），而 /status 每 2 秒被轮询一次；
+#   2) accept → 处理 → accept 串行，且 listen(2) 太小，浏览器多开的连接被丢 SYN；
+#   3) 读请求头时给浏览器的"预连接"套接字白等 600ms；
+#   4) 手动点动走同步的 bus.run()，用 time.sleep_ms 度过整个时长，按住事件循环。
+# ===========================================================================
+
+class _FakeConn(_FakeSocket):
+    """既能"分段收"又能"记录发"的假连接，用来跑完整的请求路径。
+
+    （_FakeSocket 只管发、_FakeReadSocket 只管收；路由测试需要两者兼顾，
+      所以单独做一个子类，避免动到既有用例的行为。）
+    """
+
+    def __init__(self, segments=()):
+        _FakeSocket.__init__(self)
+        self.segments = list(segments)
+        self.blocking = True
+        self.timeout = None
+        self.closed = False
+
+    def setblocking(self, flag):
+        self.blocking = flag
+
+    def settimeout(self, seconds):
+        self.timeout = seconds
+
+    def recv(self, size):
+        if not self.segments:
+            return b""
+        return self.segments.pop(0)
+
+    def close(self):
+        self.closed = True
+
+
+def _status_of(conn):
+    """从响应里取出状态码；没有响应就返回 0"""
+    raw = conn.content()
+    if not raw.startswith(b"HTTP/1.1 "):
+        return 0
+    try:
+        return int(raw.split(b" ", 2)[1])
+    except Exception:
+        return 0
+
+
+def _body_of(conn):
+    return _split_head(conn.content())[1]
+
+
+def _json_of(conn):
+    import ujson
+    try:
+        return ujson.loads(_body_of(conn))
+    except Exception:
+        return {}
+
+
+def _raw_request(method, url, body=None):
+    """拼一个最简 HTTP 请求，返回 (请求头, 请求体) 两段。
+
+    头体分开是为了贴近真实 TCP：请求体常常在下一个段里到达。
+    """
+    body = body or b""
+    head = "%s /%s HTTP/1.1\r\nHost: ams\r\n" % (method, url)
+    if body:
+        head += "Content-Length: %d\r\n" % len(body)
+    head += "\r\n"
+    return head.encode(), body
+
+
+def _serve(app, method, url, body=None):
+    """跑一次 _serve_client（= 真实的路由 + 处理路径），返回假连接"""
+    import asyncio
+    head, payload = _raw_request(method, url, body)
+    conn = _FakeConn([head, payload] if payload else [head])
+    asyncio.run(app._serve_client(conn))
+    return conn
+
+
+# ---------------------------------------------------------------------------
+# ① 阻塞 I/O 必须全部移出请求路径（"一卡几十秒"的根因）
+# ---------------------------------------------------------------------------
+
+def test_status_never_touches_network():
+    """★ /status 里绝不能出现任何网络 I/O
+
+    旧代码在 _status_dict 里调 check_mqtt_connection()，它会真的在 SSL 上发
+    PINGREQ。打印机连接一旦半死，这个阻塞写会卡到 TCP 自己超时（**几十秒**），
+    而 /status 是每 2 秒被轮询一次的 → 网页周期性假死，
+    表现就是"系统响应太慢、像崩溃、刷新也打不开"。
+    """
+    import ujson
+    import AMS_WEB as web_module
+    from AMS_WEB import AMS_WEB
+
+    src = _code_only(web_module.AMS_WEB._status_dict)
+    check("check_mqtt_connection" not in src,
+          "/status 里不能再出现 check_mqtt_connection —— 那是真正的网络 I/O")
+    check("mqtt_alive_cached" in src, "只能读主循环留下的缓存标志")
+
+    mqtt_info = _code_only(web_module.AMS_WEB.get_mqtt_info)
+    check("check_mqtt_connection" not in mqtt_info,
+          "/get_mqtt_info 也不能真发 ping（老页面会调它）")
+
+    # 行为验证：把所有网络入口都换成"一碰就炸"，/status 依然必须可用
+    app = AMS_WEB()
+
+    def boom(*_args, **_kwargs):
+        raise AssertionError("这条路径不允许走网络")
+
+    app.check_mqtt_connection = boom
+    app.conent_and_subscribe = boom
+    app.tcp_reachable = boom
+
+    info = app._status_dict()
+    check("is_mqtt_con" in info, "/status 仍然要给 is_mqtt_con")
+    check_eq(info["is_mqtt_con"], False, "没连过 MQTT 时应为 False")
+    ujson.dumps(info)                 # 序列化失败会让 /status 直接 500
+
+
+def test_mqtt_alive_cached_does_no_io():
+    """★ mqtt_alive_cached 一次网络 I/O 都不能做（网页每 2 秒就读它一次）"""
+    from bambu.bambu_mqtt import Bambu_mqtt_cliet
+
+    class PingBomb:
+        def ping(self):
+            raise AssertionError("读状态时绝不允许真的发 PINGREQ")
+
+    m = Bambu_mqtt_cliet("127.0.0.1", "S", "P")
+    m.client = PingBomb()
+    m._mqtt_alive = True
+    check_eq(m.mqtt_alive_cached(), True, "应该直接返回缓存值，不碰网络")
+
+    m.client = None
+    check_eq(m.mqtt_alive_cached(), False, "没连接时必须返回 False，且不抛异常")
+
+
+def test_mqtt_ping_has_hard_timeout():
+    """★ 存活探测必须带硬超时：连接半死时不能让调用方卡几十秒"""
+    import inspect
+    from bambu.bambu_mqtt import Bambu_mqtt_cliet, MQTT_PING_TIMEOUT_S
+
+    check(MQTT_PING_TIMEOUT_S <= 1.5,
+          "ping 超时必须很小（当前 %r 秒），否则半死连接会冻住整个事件循环"
+          % (MQTT_PING_TIMEOUT_S,))
+    src = inspect.getsource(Bambu_mqtt_cliet._ping_guarded)
+    check("settimeout" in src, "必须给 socket 设超时")
+    check("MQTT_PING_TIMEOUT_S" in src, "超时值要用常量，别散落魔数")
+
+    class FakeSock:
+        def __init__(self):
+            self.timeouts = []
+
+        def settimeout(self, value):
+            self.timeouts.append(value)
+
+        def close(self):
+            pass
+
+    class DeadClient:
+        def __init__(self):
+            self.sock = FakeSock()
+            self.pings = 0
+
+        def ping(self):
+            self.pings += 1
+            raise OSError("连接半死")
+
+    m = Bambu_mqtt_cliet("127.0.0.1", "S", "P")
+    dead = DeadClient()
+    m.client = dead
+
+    check_eq(m.check_mqtt_connection(force=True), False,
+             "ping 抛异常时要判为不存活，而不是把异常抛出去")
+    check_eq(dead.pings, 1, "应该真的 ping 一次")
+    check_eq(dead.sock.timeouts[0], MQTT_PING_TIMEOUT_S, "ping 前要设成硬超时")
+    check_eq(dead.sock.timeouts[-1], None,
+             "ping 后要把超时还原成不限制（后续 publish 需要阻塞写）")
+    check_eq(m.mqtt_alive_cached(), False, "缓存状态要跟着更新")
+
+
+def test_mqtt_preflight_skips_unreachable_printer():
+    """★ 打印机没开机时，别让 SSL 连接一直卡到系统超时
+
+    preflight=True 先用普通 socket 花最多 1 秒探一下 IP:端口能不能握手，
+    探不通就直接放弃这一轮 —— 把"每 10 秒冻一次、每次好几秒"
+    变成"每 10 秒探 1 秒就放弃"。探测失败也绝不能去建 SSL 连接。
+    """
+    import bambu.bambu_mqtt as mqtt_module
+    from bambu.bambu_mqtt import Bambu_mqtt_cliet, MQTT_PREFLIGHT_TIMEOUT_S
+
+    check(MQTT_PREFLIGHT_TIMEOUT_S <= 2.0, "预探测超时要短，否则等于没优化")
+
+    m = Bambu_mqtt_cliet("127.0.0.1", "S", "P")
+    m.mqtt_port = 1                       # 这个端口不会有服务在听
+    m.wlan_sta.isconnected = lambda: True
+
+    check_eq(m.tcp_reachable(), False, "连不上的地址必须返回 False（且要很快返回）")
+
+    # 探不通时不许构造 MQTTClient
+    original = mqtt_module.MQTTClient
+
+    class Bomb:
+        def __init__(self, *args, **kwargs):
+            raise AssertionError("预探测没过就不该去建 SSL 连接")
+
+    mqtt_module.MQTTClient = Bomb
+    try:
+        check_eq(m.conent_and_subscribe(preflight=True), False,
+                 "预探测没通过时应安全返回 False")
+    finally:
+        mqtt_module.MQTTClient = original
+
+    check_eq(m.client, None, "连不上时不能留下半成品连接")
+    check_eq(m.mqtt_alive_cached(), False, "存活状态应置 False")
+
+
+# ---------------------------------------------------------------------------
+# ② 监听队列 + 并发 worker（"刷新好几次才出来页面"的根因）
+# ---------------------------------------------------------------------------
+
+def test_web_uses_worker_pool_and_big_backlog():
+    """★ 必须多 worker 并发 + 足够大的 listen 队列
+
+    旧实现是"accept 一个、处理完再 accept 下一个"的串行循环，
+    而且 listen(2) 太小：浏览器一次开 6 个连接，多出来的 SYN 被内核直接丢掉，
+    由浏览器按 TCP 退避（1s→2s→4s…）重试 —— 用户看到的就是
+    "刷新也不打不开、要刷好几次"。
+    """
+    import inspect
+    from AMS_WEB import WEB_WORKERS, LISTEN_BACKLOG
+    import AMS_WEB as web_module
+
+    check(WEB_WORKERS >= 2,
+          "至少要 2 个 worker，否则一个慢连接就把后面全都堵住（当前 %d）" % WEB_WORKERS)
+    check(LISTEN_BACKLOG >= 8,
+          "listen 队列要够大，否则多开的连接会被丢 SYN（当前 %d）" % LISTEN_BACKLOG)
+
+    src = _code_only(web_module.AMS_WEB.run_web_loop)
+    check("LISTEN_BACKLOG" in src, "listen() 要用这个常量")
+    check("_web_worker" in src, "要拉起 worker 服务循环")
+    check("gather" in src, "多个 worker 要并发跑")
+    check("_serve_client" not in src,
+          "run_web_loop 本身不能再直接处理请求（那就退回成串行了）")
+
+    worker = _code_only(web_module.AMS_WEB._web_worker)
+    check("accept()" in worker, "worker 要自己抢连接")
+    check("_serve_client" in worker, "抢到之后交给 _serve_client 处理")
+    check("await asyncio.sleep_ms" in worker, "抢不到连接时要用 await 轮询，不能空转")
+
+    # 反例：连 *所有* worker 的 accept 都失败时不能把异常抛出去炸掉任务
+    check("except" in worker, "accept 失败必须兜住（非阻塞 accept 没连接就抛 OSError）")
+
+
+def test_web_first_byte_window_is_short():
+    """★ 浏览器的"预连接"套接字一个字都不发，必须很快丢掉
+
+    旧代码给每个这样的连接白等 HEADER_WAIT_MS（600ms），一次页面加载开 6 个
+    连接就是 3.6 秒 —— 这就是"刷新好几次才出来页面"的直接原因。
+    现在只给一个很短的"首字节窗口"。
+    """
+    import asyncio
+    from AMS_WEB import AMS_WEB, HEAD_FIRST_BYTE_MS, HEADER_WAIT_MS
+
+    check(HEAD_FIRST_BYTE_MS <= 250,
+          "首字节窗口要很短（当前 %d ms），否则预连接会白占时间" % HEAD_FIRST_BYTE_MS)
+    check(HEAD_FIRST_BYTE_MS < HEADER_WAIT_MS,
+          "首字节窗口必须明显小于整体上限，否则等于没优化")
+
+    app = AMS_WEB()
+
+    # 一个字节都不发的连接 → 立刻丢掉，不能返回半个请求
+    sock = _FakeReadSocket([])
+    head, extra = asyncio.run(app._read_headers(sock))
+    check_eq(head, None, "空连接必须被丢掉，不能返回半个请求")
+    check_eq(extra, b"", "丢掉时不能附带任何残留数据")
+    check_eq(sock.blocking, True, "不管走哪条路径，都要把 socket 恢复成阻塞模式")
+
+
+# ---------------------------------------------------------------------------
+# ③ 手动点动：立刻回包 + 后台计时（"按一下转圈几十秒"的根因）
+# ---------------------------------------------------------------------------
+
+def test_bus_two_phase_api_is_non_blocking():
+    """★ begin() 必须立刻返回并让电机转起来；finish() 再收尾
+
+    这是网页点动能"立刻回包"的底层保证：时长由调用方用 await 度过，
+    不再由 bus.run() 用 time.sleep_ms 死死按住事件循环。
+    """
+    import inspect
+    from motor_clutch import FilamentMotorBus
+
+    src = inspect.getsource(FilamentMotorBus.begin)
+    check("time.sleep_ms" not in src, "begin() 里不能有阻塞延时")
+    check("self.motor.set_direction" in src, "begin() 要让电机立刻转起来")
+    check("release_all()" in src, "电机没转起来时要立刻回到安全状态")
+
+    fin = inspect.getsource(FilamentMotorBus.finish)
+    check("self.motor.stop()" in fin, "finish() 要停电机")
+    check("finally" in fin, "finish() 必须用 finally 兜底")
+    check("release_all()" in fin, "finish() 必须断开全部离合")
+
+    bus = new_bus()
+    check_eq(bus.busy, False, "初始应空闲")
+    bus.begin(3, -1, owner="t")
+    check_eq(bus.busy, True, "begin 之后应标记忙")
+    check_eq(engaged_count(), 1, "begin 之后应恰好 1 路吸合")
+    check_eq(bus.motor.direction, -1, "begin 应该让电机按指定方向转起来")
+
+    # 忙的时候绝不允许再吸合另一路（否则就是两路咬合）
+    raised = False
+    try:
+        bus.engage(1, owner="other")
+    except Exception:
+        raised = True
+    check(raised, "总线忙时不允许切换到别的通道")
+    check_eq(engaged_count(), 1, "被拒绝之后仍然只有 1 路吸合")
+
+    bus.finish()
+    check_eq(bus.busy, False, "finish 之后应回到空闲")
+    check_eq(bus.motor.direction, 0, "finish 之后电机必须停")
+    check_eq(engaged_count(), 0, "finish 之后离合必须全断开")
+    check_eq(bus.active_channel, None, "finish 之后 active_channel 应为 None")
+
+    # 引脚被外部改坏时也要能兜住：finish 里 stop 抛异常也必须断开离合
+    bus.begin(2, 1, owner="t")
+    original_stop = bus.motor.stop
+
+    def boom():
+        raise RuntimeError("模拟 stop 失败")
+
+    bus.motor.stop = boom
+    try:
+        try:
+            bus.finish()
+        except Exception:
+            pass
+    finally:
+        bus.motor.stop = original_stop
+        bus.release_all()
+    check_eq(bus.busy, False, "stop 抛异常时总线也不能卡在忙状态")
+
+
+def test_jog_does_not_block_event_loop():
+    """★ 点动不能再走同步的 bus.run()（它用 time.sleep_ms 按住事件循环）"""
+    import AMS_WEB as web_module
+
+    src = _code_only(web_module.AMS_WEB.handle_hardware_test)
+    check("motor_bus.begin(" in src, "上半场要调非阻塞的 begin()")
+    check("create_task" in src, "下半场要交给后台任务")
+    check(".run(" not in src,
+          "点动不能再调同步的 bus.run() —— 那会把整个事件循环按住好几秒")
+
+    fin = _code_only(web_module.AMS_WEB._finish_jog)
+    check("await asyncio.sleep_ms" in fin,
+          "计时必须用 await asyncio.sleep_ms（让出 CPU），不是 time.sleep_ms")
+    check("time.sleep_ms" not in fin, "这里绝不能出现阻塞的 time.sleep_ms")
+    check("motor_bus.finish(" in fin, "到点要调 finish() 收尾")
+    check("release_all()" in fin, "收尾失败时还要兜一层 release_all()")
+
+
+def test_hardware_test_replies_before_the_action_finishes():
+    """★ 点动必须"立刻回包 + 后台计时"，不能等动作做完才回
+
+    旧实现按一下按钮要等整个 times_ms 走完才回包，期间其它请求全排队 ——
+    网页上就是"一直在转圈，几十秒后才有动作"。
+    """
+    import asyncio
+    import AMS_WEB as web_module
+    from AMS_WEB import AMS_WEB
+
+    async def scenario():
+        app = AMS_WEB()
+        app.jog_ms = 200                  # 直接给合法值，不去动 config.json
+        created = []
+        real_create = web_module.asyncio.create_task
+
+        def spy(coro, *args, **kwargs):
+            task = real_create(coro, *args, **kwargs)
+            created.append(task)
+            return task
+
+        web_module.asyncio.create_task = spy
+        conn = _FakeConn()
+        try:
+            ok = await app.handle_hardware_test(conn, {"channel": 2, "direction": 1})
+        finally:
+            web_module.asyncio.create_task = real_create
+
+        snap = {
+            "ok": ok,
+            "code": _status_of(conn),
+            "data": _json_of(conn),
+            "direction": app.motor_bus.motor.direction,
+            "engaged": len(app.motor_bus.engaged_channels()),
+            "busy": app.motor_bus.busy,
+            "pending": (len(created) == 1 and not created[0].done()),
+        }
+        if created:
+            await created[0]              # 跑完下半场：到点自动停 + 断开
+        snap["direction_after"] = app.motor_bus.motor.direction
+        snap["engaged_after"] = len(app.motor_bus.engaged_channels())
+        snap["busy_after"] = app.motor_bus.busy
+        return snap
+
+    snap = asyncio.run(scenario())
+
+    check_eq(snap["ok"], True, "点动应该被受理")
+    check_eq(snap["code"], 200, "点动接口要立刻回 200")
+    check_eq(snap["data"].get("ok"), True, "回包里要报告已开始")
+    check("已开始" in (snap["data"].get("info") or ""),
+          "提示语要说清楚已经开始、多久后自动停，实际: %r" % snap["data"].get("info"))
+    check_eq(snap["direction"], 1, "回包时电机应该已经在转（不是等动作做完才回）")
+    check_eq(snap["engaged"], 1, "回包时应该恰好 1 路离合吸合")
+    check_eq(snap["busy"], True, "回包时总线应该标记为忙")
+    check(snap["pending"], "动作必须还在后台进行 —— 证明没有同步跑完")
+
+    check_eq(snap["direction_after"], 0, "到点后电机必须停")
+    check_eq(snap["engaged_after"], 0, "到点后必须断开全部离合")
+    check_eq(snap["busy_after"], False, "总线要回到空闲")
+
+
+def test_jog_rejects_when_bus_is_busy():
+    """★ 总线忙时立刻拒绝并说清楚，绝不排队（排队就是"按一下转圈半天"）"""
+    import asyncio
+    from AMS_WEB import AMS_WEB
+
+    async def scenario():
+        app = AMS_WEB()
+        app.jog_ms = 200
+        app.motor_bus.begin(1, 1, owner="test")
+        app._jog_channel = 1
+        conn = _FakeConn()
+        ok = await app.handle_hardware_test(conn, {"channel": 3, "direction": 1})
+        data = _json_of(conn)
+        code = _status_of(conn)
+        app.motor_bus.finish()
+        app._jog_channel = None
+        return ok, data, code
+
+    ok, data, code = asyncio.run(scenario())
+    check_eq(ok, False, "忙的时候必须拒绝，不能排队")
+    check_eq(data.get("ok"), False, "回包里要如实说没执行")
+    check_eq(data.get("running"), True, "要告诉前端当前有动作在跑")
+    check_eq(code, 200, "忙是正常业务状态，回 200 即可")
+    check("正在动作" in (data.get("info") or ""), "提示要说人话")
+
+
+def test_hardware_test_validates_input():
+    """非法通道 / 方向必须回 400 并说明，绝不能默默乱动电机"""
+    import asyncio
+    from AMS_WEB import AMS_WEB
+
+    async def scenario():
+        app = AMS_WEB()
+        out = []
+        for body in ({"channel": 99, "direction": 1},
+                     {"channel": 1, "direction": 7},
+                     "不是字典"):
+            conn = _FakeConn()
+            ok = await app.handle_hardware_test(conn, body)
+            out.append((ok, _status_of(conn), _json_of(conn)))
+        return out, app
+
+    out, app = asyncio.run(scenario())
+    for ok, code, data in out:
+        check_eq(ok, False, "非法参数必须拒绝")
+        check_eq(code, 400, "非法参数要回 400")
+        check(data.get("info"), "必须给出中文原因")
+    check_eq(app.motor_bus.motor.direction, 0, "拒绝之后电机必须是停的")
+    check_eq(app.motor_bus.engaged_channels(), [], "拒绝之后离合必须全断开")
+
+
+# ---------------------------------------------------------------------------
+# ④ 进退响应时间：4 个通道统一，只作用于手动点动
+# ---------------------------------------------------------------------------
+
+def test_jog_time_clamped_to_safe_range():
+    """★ 进退响应时间必须夹在安全区间里
+
+    0 秒没有意义（离合还没咬合就停了）；几百秒会把机构里关着的料顶坏。
+    """
+    from AMS_MODEL import AMS
+    from hardware_config import JOG_TIME_MS, JOG_MIN_MS, JOG_MAX_MS
+
+    check(JOG_MIN_MS >= 100, "下限不能太小，否则离合还没咬合就停了")
+    check(JOG_MAX_MS <= 120000, "上限不能太大，否则容易顶坏料")
+    check(JOG_MIN_MS <= JOG_TIME_MS <= JOG_MAX_MS, "出厂默认值要落在区间内")
+
+    check_eq(AMS.clamp_jog_ms("3000"), 3000, "要支持字符串形式的毫秒数")
+    check_eq(AMS.clamp_jog_ms(2500), 2500, "区间内原样返回")
+    check_eq(AMS.clamp_jog_ms(0), JOG_MIN_MS, "0 要夹到下限")
+    check_eq(AMS.clamp_jog_ms(-5), JOG_MIN_MS, "负数要夹到下限")
+    check_eq(AMS.clamp_jog_ms(999999), JOG_MAX_MS, "超大值要夹到上限")
+    check_eq(AMS.clamp_jog_ms("3"), JOG_MIN_MS,
+             "clamp_jog_ms 的单位是毫秒，3 毫秒当然要夹到下限")
+    check_eq(AMS.clamp_jog_ms("abc"), JOG_TIME_MS, "非数字要退回默认值")
+    check_eq(AMS.clamp_jog_ms(None), JOG_TIME_MS, "None 要退回默认值")
+    check_eq(AMS.clamp_jog_ms(1500.9), 1500, "小数要取整")
+
+
+def test_jog_time_is_uniform_for_four_channels():
+    """★ 一个值管 4 个通道，并且要落盘（重启也记得）"""
+    import AMS_WEB as web_module
+    from AMS_WEB import AMS_WEB
+
+    app = AMS_WEB()
+    saved = []
+    app.updata_data = lambda d: (saved.append(dict(d)), dict(d))[1]
+
+    check_eq(app.set_jog_ms(3000), 3000, "设置的值要原样生效")
+    check_eq(app.jog_ms, 3000, "实例上的值要更新")
+    check_eq(saved, [{"jog_ms": 3000}], "必须把 jog_ms 写进 config.json")
+
+    src = _code_only(web_module.AMS_WEB.handle_hardware_test)
+    check("self.jog_ms" in src,
+          "点动时长必须来自 self.jog_ms —— 这就是「4 个通道统一」的实现方式")
+    check("times_ms" in src, "仍允许请求里显式指定 times_ms（内部/兼容用）")
+
+    # 4 个通道都走同一个值
+    for channel in (1, 2, 3, 4):
+        check_eq(app.clamp_jog_ms(app.jog_ms), 3000,
+                 "通道%d 用的也必须是同一个值" % channel)
+
+
+def test_jog_time_survives_restart():
+    """★ 重启后要从 config.json 恢复进退响应时间"""
+    import AMS_MODEL
+    from AMS_MODEL import AMS
+    from hardware_config import JOG_TIME_MS
+
+    original = AMS_MODEL.read_json_file
+    try:
+        AMS_MODEL.read_json_file = lambda path: {"jog_ms": 7000}
+        app = AMS()
+        app.auto_update_access("whatever.json")
+        check_eq(app.jog_ms, 7000, "应该从配置里恢复 jog_ms")
+
+        # 配置里是坏值时要安全退回默认，不能抛异常
+        AMS_MODEL.read_json_file = lambda path: {"jog_ms": "坏值", "access": None}
+        app = AMS()
+        app.auto_update_access("whatever.json")
+        check_eq(app.jog_ms, JOG_TIME_MS, "配置里的坏值要退回默认值")
+
+        # 配置里超范围时也要夹住
+        AMS_MODEL.read_json_file = lambda path: {"jog_ms": 99999999, "access": None}
+        app = AMS()
+        app.auto_update_access("whatever.json")
+        from hardware_config import JOG_MAX_MS
+        check_eq(app.jog_ms, JOG_MAX_MS, "配置里超范围的值也要夹住")
+    finally:
+        AMS_MODEL.read_json_file = original
+
+
+def test_jog_set_endpoint_clamps_and_reports():
+    """★ /jog_set 要如实报告"实际生效"的秒数（被夹过必须说明）"""
+    from AMS_WEB import AMS_WEB
+    from hardware_config import JOG_MIN_MS
+
+    app = AMS_WEB()
+    app.updata_data = lambda d: dict(d)
+
+    conn = _FakeConn()
+    check_eq(app.handle_jog_set(conn, {"seconds": 2.5}), True, "正常设置应成功")
+    data = _json_of(conn)
+    check_eq(data.get("ok"), True, "应报告成功")
+    check_eq(data.get("jog_ms"), 2500, "应该回实际生效的毫秒数")
+    check_eq(app.jog_ms, 2500, "实例值要更新")
+
+    conn2 = _FakeConn()
+    app.handle_jog_set(conn2, {"seconds": 0.05})       # 小于下限
+    d2 = _json_of(conn2)
+    check_eq(d2.get("jog_ms"), JOG_MIN_MS, "超范围要夹到下限")
+    check("调整" in (d2.get("info") or ""),
+          "被夹过要在提示里说明，不能显示用户填的数、实际跑另一个数")
+
+    conn3 = _FakeConn()
+    check_eq(app.handle_jog_set(conn3, {"ms": "abc"}), False, "非数字要拒绝")
+    check_eq(_status_of(conn3), 400, "参数不对要回 400")
+
+    conn4 = _FakeConn()
+    check_eq(app.handle_jog_set(conn4, {}), False, "既没 seconds 也没 ms 要拒绝")
+    check_eq(_status_of(conn4), 400, "缺参数要回 400")
+
+
+def test_jog_time_only_affects_manual_jog():
+    """★ 进退响应时间只管手动点动，绝不能改变自动换料的时长
+
+    自动换料走的是 NO_LIMIT_LOAD_MS / NO_LIMIT_RETRACT_MS / FILAMENT_STEP_MS
+    那一套，跟 jog_ms 完全无关 —— 用户明确要求"只管手动点动按钮"。
+    """
+    import inspect
+    import AMS_WEB as web_module
+    import device_processing
+    from AMS_MODEL import AMS
+
+    check("jog_ms" not in inspect.getsource(AMS.exchange_fileament),
+          "自动换料流程不能读 jog_ms（那会把手动设置的秒数带进换料）")
+    check("jog_ms" not in inspect.getsource(device_processing),
+          "硬件驱动层不应该知道 jog_ms")
+    check("self.jog_ms" in _code_only(web_module.AMS_WEB.handle_hardware_test),
+          "真正用 jog_ms 的应该只有手动点动这条路径")
+
+
+def test_status_exposes_jog_ms_and_mqtt_configured():
+    """★ /status 要带 jog_ms（按钮文案）和 mqtt_configured（区分未配 / 重试中）"""
+    from AMS_WEB import AMS_WEB
+
+    app = AMS_WEB()
+    app.jog_ms = 4000
+    info = app._status_dict()
+    check_eq(info.get("jog_ms"), 4000, "要把设备上生效的时长告诉页面")
+
+    check("mqtt_configured" in info, "/status 必须带 mqtt_configured")
+    check_eq(info["mqtt_configured"], False, "参数没配全时应该是 False")
+
+    app.mqtt_server = "192.168.1.9"
+    app.DEVICE_SERIAL = "SN1"
+    app.password = "12345678"
+    check_eq(app._status_dict()["mqtt_configured"], True,
+             "三项都齐了才算是「已配置」")
+
+
+def test_hardware_status_reports_busy():
+    """★ 硬件状态要带 busy，页面才能显示「正在动作」"""
+    from AMS_WEB import AMS_WEB
+
+    app = AMS_WEB()
+    hw = app._hardware_dict()
+    check("busy" in hw, "hardware 里要带 busy")
+    check_eq(hw["busy"], False, "初始应空闲")
+
+    app.motor_bus.begin(1, 1, owner="t")
+    try:
+        check_eq(app._hardware_dict()["busy"], True, "begin 之后要显示忙")
+    finally:
+        app.motor_bus.finish()
+    check_eq(app._hardware_dict()["busy"], False, "finish 之后要恢复空闲")
+
+
+# ---------------------------------------------------------------------------
+# ⑤ 应用层 OTA：网页上传更新包 → 写文件系统 → 重启
+# ---------------------------------------------------------------------------
+
+def _in_temp_dir(prefix):
+    """进到临时目录，返回 (临时目录, 还原函数)"""
+    import tempfile
+    cwd = os.getcwd()
+    tmp = tempfile.mkdtemp(prefix=prefix)
+    os.chdir(tmp)
+    return tmp, (lambda: os.chdir(cwd))
+
+
+def test_ota_crc32_matches_zlib():
+    """★ 纯 Python 的 CRC32 必须和 zlib.crc32 完全一致
+
+    否则 PC 上用 zlib 造的包，到了板子上会被判成"校验失败"。
+    """
+    import zlib
+    from ota_update import crc32
+
+    samples = (b"", b"a", b"hello world", bytes(range(256)),
+               "中文与 ASCII 混合内容".encode("utf-8"), b"\x00" * 1000)
+    for data in samples:
+        check_eq(crc32(data), zlib.crc32(data) & 0xFFFFFFFF,
+                 "CRC32 与 zlib 不一致（%d 字节的样本）" % len(data))
+
+    # 增量调用（分块喂入）也要和一次性算出来的一致
+    blob = bytes(range(256)) * 7
+    inc = 0
+    for i in range(0, len(blob), 37):
+        inc = crc32(blob[i:i + 37], inc)
+    check_eq(inc, zlib.crc32(blob) & 0xFFFFFFFF, "必须支持分块增量计算 CRC32")
+
+
+def test_ota_pack_roundtrips_byte_for_byte():
+    """★ 更新包解析后必须逐字节还原，子目录要自动创建"""
+    import shutil
+    from ota_update import OtaUpdate, build_pack
+
+    files = [
+        ("AMS_WEB.py", b"print('web')\n" * 40),
+        ("index.html", "页面内容·中文·".encode("utf-8") * 30),
+        ("bambu/bambu_mqtt.py", b"x = 1\n" * 10),
+    ]
+    pack = build_pack(files)
+
+    tmp, restore = _in_temp_dir("ams_ota_ok_")
+    try:
+        upd = OtaUpdate(len(pack))
+        # 故意用不规则的块大小喂进去，模拟 TCP 分段
+        for i in range(0, len(pack), 7):
+            upd.feed(pack[i:i + 7])
+        names = upd.finish()
+
+        check_eq(sorted(names), sorted(n for n, _ in files), "应该写入全部文件")
+        for name, data in files:
+            with open(name, "rb") as handle:
+                check_eq(handle.read(), data, "%s 的内容必须逐字节一致" % name)
+        check_eq([n for n in os.listdir(".") if n.endswith(".new")], [],
+                 "成功路径也不能留下 .new 临时文件")
+        check_eq(os.path.isdir("bambu"), True, "子目录要自动创建")
+        check_eq(upd.state, "done", "状态应是 done")
+        check_eq(upd.received, len(pack), "接收字节数要等于包长")
+    finally:
+        restore()
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_ota_pack_rejects_corrupt_payload():
+    """★ 载荷被改动一个字节 → CRC 必须发现，且不留半截文件"""
+    import shutil
+    from ota_update import OtaUpdate, OtaError, build_pack
+
+    pack = bytearray(build_pack([("AMS_WEB.py", b"abcdef" * 60)]))
+    pack[-1] ^= 0xFF                      # 破坏最后一个字节
+
+    tmp, restore = _in_temp_dir("ams_ota_corrupt_")
+    try:
+        upd = OtaUpdate(len(pack))
+        raised = False
+        try:
+            upd.feed(bytes(pack))
+            upd.finish()
+        except OtaError:
+            raised = True
+        check(raised, "CRC 不匹配时必须抛 OtaError")
+        check_eq(os.path.exists("AMS_WEB.py"), False, "校验失败时绝不能写出正式文件")
+        check_eq([n for n in os.listdir(".") if n.endswith(".new")], [],
+                 "feed 出错要自己清干净，不能留下 .new 残file")
+        check_eq(upd.error is not None, True, "要记录错误原因，供上层打日志")
+    finally:
+        restore()
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_ota_pack_rejects_truncated_upload():
+    """★ 上传中途断线：finish() 必须拒绝，且不留半截文件、不重启"""
+    import shutil
+    from ota_update import OtaUpdate, OtaError, build_pack
+
+    pack = build_pack([("AMS_WEB.py", b"hello" * 100)])
+
+    tmp, restore = _in_temp_dir("ams_ota_half_")
+    try:
+        upd = OtaUpdate(len(pack))
+        upd.feed(pack[:len(pack) // 2])        # 只喂一半
+        raised = False
+        try:
+            upd.finish()
+        except OtaError:
+            raised = True
+        check(raised, "包不完整时 finish() 必须抛 OtaError")
+        check_eq([n for n in os.listdir(".") if n.endswith(".new")], [],
+                 "中止后不能留下 .new 残file")
+        check_eq(os.path.exists("AMS_WEB.py"), False, "不完整的包绝不能生成正式文件")
+    finally:
+        restore()
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_ota_rejects_firmware_bin_with_helpful_message():
+    """★ 用户很容易把整机固件 BIN 拖进来 —— 必须提示改走 USB"""
+    from ota_update import (OtaUpdate, OtaError, ESP_IMAGE_MAGIC,
+                            build_pack, looks_like_firmware_bin)
+
+    bin_like = bytes([ESP_IMAGE_MAGIC]) + b"\x00" * 64
+    check(looks_like_firmware_bin(bin_like), "0xE9 开头的应该被识别为整机固件 BIN")
+    check(not looks_like_firmware_bin(build_pack([("a.py", b"1")])),
+          "正常的 .ams 更新包不能被误判成固件")
+
+    raised = None
+    upd = OtaUpdate(len(bin_like))
+    try:
+        upd.feed(bin_like)
+    except OtaError as e:
+        raised = str(e)
+    check(raised is not None, "整机固件 BIN 必须被拒绝")
+    check("USB" in raised and ".ams" in raised,
+          "提示要说清楚这是整机固件、应用更新包是 .ams、整机升级走 USB，"
+          "实际: %r" % raised)
+
+
+def test_ota_rejects_unsafe_names():
+    """★ 更新包来自网络，必须当不可信输入：拒绝越权路径 / 覆盖设备配置"""
+    import shutil
+    from ota_update import OtaUpdate, OtaError, build_pack
+
+    tmp, restore = _in_temp_dir("ams_ota_evil_")
+    try:
+        for bad in ("../evil.py", "/etc/passwd", "bambu/../../evil.py",
+                    "config.json", "wifi.dat", "boot_stat.json"):
+            pack = build_pack([(bad, b"payload")])
+            upd = OtaUpdate(len(pack))
+            raised = False
+            try:
+                upd.feed(pack)
+            except OtaError:
+                raised = True
+            check(raised, "危险文件名 %r 必须被拒绝" % bad)
+        check_eq([n for n in os.listdir(".") if n.endswith(".new")], [],
+                 "拒绝之后不能留下任何临时文件")
+        check_eq(os.listdir("."), [], "被拒绝的包绝不能写出任何文件")
+    finally:
+        restore()
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_ota_route_is_streamed():
+    """★ 升级包几百 KB，绝不能先整份读进内存"""
+    import inspect
+    import AMS_WEB as web_module
+    from AMS_WEB import OTA_MAX_BYTES, OTA_RECV_CHUNK, STREAM_ROUTES
+
+    check("ota_upload" in STREAM_ROUTES, "ota_upload 必须走流式路径")
+    check(OTA_RECV_CHUNK <= 4096,
+          "接收块要小，单次分配不能大（当前 %d）" % OTA_RECV_CHUNK)
+    check(OTA_MAX_BYTES <= 4 * 1024 * 1024, "上限别放太大，避免把文件系统写满")
+
+    src = _code_only(web_module.AMS_WEB.handle_ota_upload)
+    check("OtaUpdate" in src, "必须交给 OtaUpdate 边收边写")
+    check("upd.feed(" in src, "收到一块就喂一块，不能攒在内存里")
+    check("upd.received < total" in src, "循环条件必须盯住已接收字节数")
+    check("await asyncio.sleep_ms" in src, "等待数据时要 await 让步，否则网页会卡住")
+    check("abort()" in src, "任何失败路径都要 abort()，绝不留半截文件")
+    check("OTA_IDLE_TIMEOUT_MS" in src, "要有「中间没数据」的超时判定")
+    check("OTA_TOTAL_TIMEOUT_MS" in src, "要有总时长上限")
+
+    routes = inspect.getsource(web_module.AMS_WEB._serve_client)
+    check("STREAM_ROUTES" in routes,
+          "路由必须在读请求体之前就分流，否则几百 KB 会先被整份读进内存")
+    idx_stream = routes.find("STREAM_ROUTES")
+    idx_body = routes.find("_read_body")
+    check(idx_stream != -1 and idx_body != -1 and idx_stream < idx_body,
+          "顺序不对：流式接口必须排在通用「读请求体」之前")
+
+
+def test_ota_upload_endpoint_writes_files_then_asks_for_reboot():
+    """★ 端到端：POST /ota_upload 把文件写进文件系统，并告诉前端会重启"""
+    import asyncio
+    import shutil
+    import AMS_WEB as web_module
+    from AMS_WEB import AMS_WEB
+    from ota_update import build_pack
+
+    files = [("AMS_WEB.py", b"# new web\n" * 20),
+             ("umqtt/simple.py", b"# new mqtt\n" * 5)]
+    pack = build_pack(files)
+
+    tmp, restore = _in_temp_dir("ams_ota_http_")
+    saved_delay = web_module.REBOOT_DELAY_MS
+    try:
+        web_module.REBOOT_DELAY_MS = 1        # 别在生产值上白等
+        app = AMS_WEB()
+        app.allow_reboot = False              # 自测里不真重启
+
+        head, payload = _raw_request("POST", "ota_upload", pack)
+        conn = _FakeConn([head, payload])
+        asyncio.run(app._serve_client(conn))
+
+        check_eq(_status_of(conn), 200, "上传成功应回 200")
+        data = _json_of(conn)
+        check_eq(data.get("ok"), True, "应该报告成功")
+        check_eq(data.get("files"), len(files), "要报告写入了几个文件")
+        check_eq(data.get("reboot"), True, "要告诉前端设备会重启")
+        check("重启" in (data.get("info") or ""), "提示语要写明会自动重启")
+
+        for name, content in files:
+            with open(name, "rb") as handle:
+                check_eq(handle.read(), content, "%s 必须被写进文件系统" % name)
+        check_eq([n for n in os.listdir(".") if n.endswith(".new")], [],
+                 "成功路径不能留 .new 临时文件")
+    finally:
+        web_module.REBOOT_DELAY_MS = saved_delay
+        restore()
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_ota_upload_endpoint_rejects_bad_pack():
+    """★ 坏的升级包要回 400 并说明原因，且绝不写文件、绝不重启"""
+    import asyncio
+    import shutil
+    import AMS_WEB as web_module
+    from AMS_WEB import AMS_WEB
+
+    tmp, restore = _in_temp_dir("ams_ota_bad_http_")
+    saved_delay = web_module.REBOOT_DELAY_MS
+    try:
+        web_module.REBOOT_DELAY_MS = 1
+        app = AMS_WEB()
+        app.allow_reboot = False
+
+        head, payload = _raw_request("POST", "ota_upload", b"definitely not a pack")
+        conn = _FakeConn([head, payload])
+        asyncio.run(app._serve_client(conn))
+
+        check_eq(_status_of(conn), 400, "坏包要回 400")
+        data = _json_of(conn)
+        check_eq(data.get("ok"), False, "要如实说没成功")
+        check(data.get("info"), "要给出中文原因")
+        check_eq(os.listdir("."), [], "坏包绝不能写出任何文件")
+
+        # Content-Length 为 0（前端没带文件）也要被挡住
+        head2, _ = _raw_request("POST", "ota_upload", None)
+        conn2 = _FakeConn([head2])
+        asyncio.run(app._serve_client(conn2))
+        check_eq(_status_of(conn2), 400, "没带文件要回 400")
+    finally:
+        web_module.REBOOT_DELAY_MS = saved_delay
+        restore()
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_reboot_is_skipped_in_selftest_mode():
+    """★ allow_reboot=False 时只记日志、不真重启（桌面自测用）"""
+    import AMS_WEB as web_module
+    from AMS_WEB import AMS_WEB
+
+    app = AMS_WEB()
+    app.allow_reboot = False
+    check_eq(app._reboot(), False, "自测模式下不应该真的重启")
+
+    app.allow_reboot = True
+    original = web_module._machine_reset
+    called = []
+    web_module._machine_reset = lambda: called.append(True)
+    try:
+        check_eq(app._reboot(), True, "允许重启时应该真的调用 reset()")
+        check_eq(called, [True], "reset() 必须被调用一次")
+    finally:
+        web_module._machine_reset = original
+
+
+# ---------------------------------------------------------------------------
+# ⑥ 页面：OTA 菜单 / 进退响应时间 / MQTT 状态文案
+# ---------------------------------------------------------------------------
+
+def test_page_has_ota_menu_and_upload():
+    """★ 系统菜单里要有 OTA 页，能选更新包并上传"""
+    page = _page_source()
+    check("id:'ota'" in page, "系统菜单里要有 OTA 项")
+    check("系统升级" in page, "菜单/标题要能看出是系统升级")
+    check('id="page_ota"' in page, "要有 OTA 页面容器")
+    check('id="ota_file"' in page, "要有选择更新包的文件框")
+    check('id="btn_ota_upload"' in page, "要有上传按钮")
+    check("'/ota_upload'" in page, "页面要真的把文件 POST 到 /ota_upload")
+    check(".ams" in page, "文件框要限定 .ams 更新包")
+    check("body: f" in page,
+          "要把 File 对象直接当请求体发出去（设备端按 Content-Length 流式接收）")
+    check("application/octet-stream" in page, "要声明 Content-Type")
+
+
+def test_web_routing_works_on_raw_bytes_headers():
+    """★ 路由必须能解析"从 socket 读来的原始字节"请求行
+
+    请求头是 bytes。如果正则用 str 模式去匹配 bytes，MicroPython 和 CPython
+    都会直接抛 TypeError（can't use a string pattern on a bytes-like object）
+    —— 后果是**每个请求都 500**，整个网页全废。
+    这条就是拿真实字节请求把 _serve_client 走一遍，防止改回去。
+    """
+    import asyncio
+    from AMS_WEB import AMS_WEB
+
+    app = AMS_WEB()
+
+    # 正常 GET /status
+    conn = _FakeConn([b"GET /status HTTP/1.1\r\nHost: ams\r\n\r\n"])
+    asyncio.run(app._serve_client(conn))
+    check_eq(_status_of(conn), 200, "GET /status 应该正常回 200")
+    check("access_list" in _body_of(conn).decode("utf-8"), "正文应该是状态 JSON")
+
+    # 带查询串的 URL 也要能解析出路径
+    conn2 = _FakeConn([b"GET /status?t=1 HTTP/1.1\r\nHost: ams\r\n\r\n"])
+    asyncio.run(app._serve_client(conn2))
+    check_eq(_status_of(conn2), 200, "带 ? 查询串时也要能认出 /status")
+
+    # 未知路径 → 404（能走到 404 就说明路由解析本身没炸）
+    conn3 = _FakeConn([b"GET /no_such_thing HTTP/1.1\r\nHost: ams\r\n\r\n"])
+    asyncio.run(app._serve_client(conn3))
+    check_eq(_status_of(conn3), 404, "未知路径要回 404 而不是 500")
+
+    # POST 写接口收到空请求体 → 400（不是 404、更不是 500）
+    conn4 = _FakeConn([b"POST /mqtt_connect HTTP/1.1\r\nHost: ams\r\n\r\n"])
+    asyncio.run(app._serve_client(conn4))
+    check_eq(_status_of(conn4), 400, "写接口空请求体要回 400")
+
+
+def test_page_ota_hints_usb_for_firmware_bin():
+    """★ 页面上要说清楚"整机 BIN 不能走这里"，否则用户白折腾"""
+    page = _page_source()
+    check("整机固件 BIN" in page, "要提示整机固件 BIN 不能走网页 OTA")
+    check("esp32c3-ams-firmware.bin" in page, "要点名那个文件名")
+    check("USB" in page, "要告诉用户整机升级还得插 USB")
+
+
+def test_page_hardware_has_jog_time_setting():
+    """★ 硬件调试页要有「进退响应时间」入口（4 个通道统一）"""
+    page = _page_source()
+    check('id="jog_seconds"' in page, "要有秒数输入框")
+    check('id="btn_jog_save"' in page, "要有保存按钮")
+    check("进退响应时间" in page, "文案要说清楚这是进退响应时间")
+    check("4 个通道统一" in page, "要写明对 4 个通道统一生效")
+    check("不会改变自动换料" in page,
+          "必须写明「只影响手动点动」，否则用户会以为改了自动换料时长")
+    check('min="0.2"' in page and 'max="60"' in page,
+          "输入范围要和设备端的安全区间一致")
+
+
+def test_page_jog_buttons_follow_the_device_setting():
+    """★ 点动按钮上的秒数必须跟着设备设置走，不能写死
+
+    设备端现在自己决定时长（前端不传 times_ms），所以：
+      · 按钮文案要用 jogLabel() 拼出来；
+      · 设置一改就要重画按钮（重画的 key 里带上 jogMs）；
+      · /status 回来的 jog_ms 要用 syncJogInput 同步进输入框和按钮。
+    """
+    page = _page_source()
+    check("function jogLabel()" in page, "要有根据 jogMs 生成文案的函数")
+    check("'进料 ' + jogLabel()" in page, "进料按钮文案要跟着设置走")
+    check("'退料 ' + jogLabel()" in page, "退料按钮文案要跟着设置走")
+    check("+ '@' + jogMs" in page, "按钮重画的 key 里要带上 jogMs")
+    check("syncJogInput(d.jog_ms)" in page, "/status 里的 jog_ms 要同步进页面")
+    check("send('/jog_set'" in page, "保存要走 /jog_set")
+    check("channel:channel, direction:direction }" in page,
+          "点动请求只带通道和方向，时长交给设备端决定")
+    check("document.activeElement !== el" in page,
+          "正在输入时不能被每 2 秒一次的 /status 覆盖掉")
+
+
+def test_page_mqtt_status_distinguishes_configured_but_retrying():
+    """★ 页面要能区分「还没配」和「配好了、后台正在重试」"""
+    page = _page_source()
+    check("d.mqtt_configured" in page, "要根据 mqtt_configured 给不同提示")
+    check("已保存" in page, "配好了要显示「已保存」")
+    check("d.saved" in page and "d.connected" in page,
+          "仍然要按 saved / connected 分别给提示")
 
 
 # ===========================================================================

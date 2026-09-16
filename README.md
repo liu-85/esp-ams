@@ -22,6 +22,7 @@
 - [联网与配网](#联网与配网)
 - [硬件配置项](#硬件配置项)
 - [调试](#调试)
+- [应用层 OTA（网页升级，不用插 USB）](#应用层-ota网页升级不用插-usb)
 - [GitHub Actions 自动编译与发布](#github-actions-自动编译与发布)
 - [本地开发与自测](#本地开发与自测)
 - [常见问题](#常见问题)
@@ -63,7 +64,10 @@
 | 热点兜底 | 自动连接最多试 3 次，全部失败就打开热点 `AMS_WIFI`，用手机连上去重新配网 |
 | 网页配置 | 响应式页面，手机 / 电脑都能用；一个 `/status` 接口拿全状态并每 2 秒自动刷新 |
 | 取色器 | 通道颜色用 Windows 风格的调色板对话框：基本颜色 + HSV 渐变 + RGB/HSV 数值 + 自定义颜色 |
-| 硬件调试 | 网页上实时显示 4 路离合状态，并可手动点动任意通道 |
+| 硬件调试 | 网页上实时显示 4 路离合状态与总线忙闲，并可手动点动任意通道 |
+| 点动时长可调 | 硬件调试页统一设置 4 个通道的「进退响应时间」（0.2 ~ 60 秒），按一下转多久就转多久，存进设备重启不丢；**只影响手动点动，不碰自动换料** |
+| 点动不卡页面 | 手动点动是「**立刻回包 + 后台计时**」：按下瞬间就开始动作并回响应，网页不转圈；动作期间再按会被明确拒绝（不排队） |
+| 应用层 OTA | 网页上传 `.ams` 更新包，设备把程序与页面写进自己的文件系统后自动重启，**不用插 USB、不用重新配网**；整机固件 BIN 会被识别出来并提示改走 USB |
 | 电磁离合互斥 | 软件层强制同一时刻最多 1 路吸合，含启动检查 / 吸合前复核 / 运行期体检 |
 | 一键烧录 | 一个 `.bin` 覆盖整片 Flash（引导程序 + 分区表 + MicroPython + 全部代码 + umqtt 库），烧完直接上电即用 |
 | CI 自动构建 | 每次提交自动编译：语法检查 + 自测 + 单文件固件 + `.mpy` 包；主分支更新 `latest` 预发布版，打 tag 发正式 Release |
@@ -212,6 +216,7 @@ yaoams/
 │   ├── main.py                   # 上电自动启动入口（保持 .py，不能编译成 .mpy）
 │   ├── boot.py                   # 上电最先跑：置安全电平 + 记复位原因 + 累加启动计数
 │   ├── reset_info.py             # ★ 复位诊断：欠压 / 看门狗 / 冷启动，网页可见
+│   ├── ota_update.py             # ★ 应用层 OTA 核心：流式解析 .ams 更新包 + CRC32 校验 + 原子改名
 │   ├── AMS_WEB.py                # Web 配置服务 + 任务调度入口（继承 AMS）
 │   ├── AMS_MODEL.py              # ★ 换料业务逻辑：探测料盘 / 退料 / 进料 / MQTT 调度
 │   ├── device_processing.py      # ★ 硬件驱动：料盘位对象(material)、电机/离合总线工厂
@@ -234,6 +239,7 @@ yaoams/
 │   └── mpy_stubs/                # machine / network / ujson / uasyncio / umqtt 桩模块
 ├── tools/
 │   ├── make_firmware_bin.py      # ★ 合成「单文件可烧录固件」（官方固件 + 本项目代码）
+│   ├── make_update_pack.py       # ★ 把 python_code/ 打成 .ams 应用更新包（网页 OTA 用）
 │   ├── lfs_mkfs.c                # ★ 生成 / 校验文件系统镜像（littlefs 2.8，与固件内置同源）
 │   ├── build_mpy.py              # 交叉编译 .mpy 并打包部署 zip
 │   └── preview_server.py         # 网页本地预览服务（假数据补全接口，PC 上调页面用）
@@ -367,9 +373,10 @@ M400 U1
 ├──────────────┼──────────────────────────────────────────────┤
 │ ▸ 网络       │                                              │
 │ ▸ 打印       │     选中目录里的页面（运行状态 / 上电诊断 /   │
-│ ▾ 系统       │     打印机 MQTT / 通道设置 / 硬件调试）       │
-│    运行状态  │                                              │
-│    上电诊断  ├──────────────────────────────────────────────┤
+│ ▾ 系统       │     打印机 MQTT / 通道设置 / 硬件调试 /       │
+│    运行状态  │     系统升级 OTA）                            │
+│    上电诊断  │                                              │
+│    系统升级  ├──────────────────────────────────────────────┤
 │              │  设备日志       空闲内存 18.0 KB  清屏  折叠  │
 │              │  00:00.412 Web 服务已启动，监听 0.0.0.0:80   │
 │              │  00:01.204 WiFi 连接成功: xxx  IP=…          │
@@ -382,6 +389,7 @@ M400 U1
   带 ★ 的报错行会标红，点「折叠」可以收起来
 - **「WiFi 配置」只在配置热点开启时出现**。连上网之后它就藏起来了。
   想换 WiFi 就到「运行状态」点「打开配置热点」，手机连上 `AMS_WIFI` 再配一次
+- **「系统 → 系统升级 (OTA)」** 用来上传 `.ams` 更新包（见 [应用层 OTA](#应用层-ota网页升级不用插-usb)）
 - 手机上左侧菜单收成一个「☰」抽屉按钮，布局不变
 
 > 页面每 2 秒自动刷新状态和日志，不用手动按 F5。
@@ -525,7 +533,9 @@ M400 U1
 | `POST` | `/wifi_connect` | `{"name":ssid,"password":pwd}` |
 | `POST` | `/mqtt_connect` | 打印机 IP / 序列号 / 访问码 / 端口等，**先落盘再连接** |
 | `POST` | `/access_set` | `{"access_list":[...],"color_list":[...]}` |
-| `POST` | `/hardware_test` | `{"channel":1,"direction":1,"times_ms":1000}` 手动点动 |
+| `POST` | `/hardware_test` | `{"channel":1,"direction":1}` 手动点动。**立刻回包**，动作在后台计时；`times_ms` 可选，不传就用设备上设的「进退响应时间」 |
+| `POST` | `/jog_set` | `{"seconds":3}` 或 `{"ms":3000}` 设置 4 个通道统一的进退响应时间（0.2~60 秒，超范围会被夹住并如实告知） |
+| `POST` | `/ota_upload` | ★ 应用层 OTA：请求体就是 `.ams` 更新包的原始字节（`Content-Type: application/octet-stream`），设备**边收边写**，全部校验通过后自动重启 |
 | `POST` | `/ap_set` | `{"on":1}` 开配置热点 / `{"on":0}` 关 |
 
 **为什么要有 `/status`**：页面上有 IP、WiFi、MQTT、通道、硬件五块状态，早期是发 5 个
@@ -547,7 +557,14 @@ M400 U1
 | MQTT 配置永远存不下来 | 只有 MQTT 当场连上才写 `config.json`，而 AP 模式下根本没联网 → 必然失败 | **先落盘，再连接**；连不上只作提示，返回 `saved` / `connected` 两个字段 |
 | 每个请求白等 | accept 循环里 `await sleep(500ms)` | 改成 20ms 轮询 |
 | 偶尔打不开 | 读请求头用阻塞 `recv` + 3 秒超时，浏览器的空闲预连接会把服务端卡满 3 秒 | 非阻塞读 + `await` 让步，总上限 0.6 秒，等不到就丢掉连接 |
-| 页面卡死 | 主循环用阻塞的 `wait_msg()` 收 MQTT，把整个事件循环按住 | 改用非阻塞的 `poll_msg()`，没消息立刻返回 |
+| **页面卡死**<br>「一卡几十秒，像崩溃了一样」 | `/status` 里调 `check_mqtt_connection()` → **真的在 SSL 上发 PINGREQ**。打印机连接一旦半死（拔电 / 换网 / 休眠），这个阻塞写会一直卡到 TCP 自己超时 —— **几十秒**，而 `/status` 每 2 秒被轮询一次 | `/status` 只读主循环留下的缓存标志 `mqtt_alive_cached()`，**一次网络 I/O 都不做**；真实探测仍由主循环做，但带 0.8 秒硬超时 |
+| **要刷好几次才出页面** | ① `accept → 处理 → accept` 串行，一个慢连接堵住后面全部；② `listen(2)` 太小，浏览器一次开 6 个连接，多出来的 SYN 被内核丢掉，浏览器按 TCP 退避（1s→2s→4s…）重试；③ 浏览器的「预连接」套接字什么都不发，服务端却给它白等 600ms | ① 改成 3 个 worker 轮流 accept（读请求头那段是 `await` 让步的，并发是真的）；② `listen(8)`；③ 加一个 180ms 的「首字节窗口」，这么久还没开始发就直接丢掉 |
+| **打印机没开机时网页周期性假死** | 主循环每 10 秒用 SSL 连一次不可达的打印机，每次都卡到系统超时（好几秒甚至几十秒） | 先花最多 1 秒做 TCP 预探测，探不通就跳过这一轮（`preflight=True`） |
+| **MQTT 每重连一次漏一个 socket** | `self.client = MQTTClient(...)` 直接覆盖，老对象连同它的 SSL socket 从来没被关过，跑几小时就 socket 耗尽 | 重连前先 `close_client()`，把旧连接真正断开 + 置空 |
+| **点一下点动就转圈几十秒** | 手动点动直接调同步的 `bus.run()`，内部用 `time.sleep_ms` 度过整个时长，整个 uasyncio 事件循环被按住 | 改成两段式 `begin()` / `finish()`：按下瞬间吸合 + 转起来 → **立刻回包** → 后台任务 `await asyncio.sleep_ms` 计时 → 到点停电机、断开离合 |
+| **点保存时网页像卡死** | `handle_mqtt_cennect` 里现场做 TLS 握手 + 订阅，打印机没开机时卡好几秒，最后还回一句「失败」 | 只落盘 + 置脏标志，由主循环后台重连；回包如实说「已保存 / 正在后台连接」 |
+| **页面一慢就报「保存失败」** | 保存结果只有「成功 / 失败」两种说法，「配置其实存好了、只是还没连上」被说成失败 | 返回 `saved` / `connecting` / `connected` 三个字段，页面分别给提示 |
+| **页面卡死**<br>「换料和刷新一起就卡」 | 主循环用阻塞的 `wait_msg()` 收 MQTT，把整个事件循环按住 | 改用非阻塞的 `poll_msg()`，没消息立刻返回 |
 | MQTT 频繁重连 | 「每 20 轮重连一次」，而每轮都阻塞，实际几秒断一次 | 改成按时间，每 5 分钟才重建 |
 | 状态灯拖慢网页 | `check_mqtt_connection()` 每秒真的发一次 `PINGREQ` | 按 5 秒节流（`MQTT_PING_INTERVAL_MS`） |
 | GC 过频 | `gc.threshold(1024)`：每分配 1KB 就回收一次 | 放宽到 16KB |
@@ -578,6 +595,8 @@ M400 U1
 | `RETRACT_STEPS` / `LOAD_RETRY_TIMES` | `15` / `10` | 退料步数 / 进料重试次数（有开关时提前结束） |
 | `NO_LIMIT_RETRACT_MS` | `6000` | ★ 降级模式退料时长，**需实测调整** |
 | `NO_LIMIT_LOAD_MS` | `8000` | ★ 降级模式进料时长，**需实测调整** |
+| `JOG_TIME_MS` | `1000` | ★ 网页手动点动的「进退响应时间」出厂默认值（毫秒）。只作用于手动点动，**不影响自动换料** |
+| `JOG_MIN_MS` / `JOG_MAX_MS` | `200` / `60000` | 上面那个值的安全区间（0.2 ~ 60 秒）。网页上填超范围会被自动夹住 |
 | `LED_PIN` | `2` | 状态指示灯 |
 | `CONFIG_FILE` | `"config.json"` | 持久化配置文件 |
 
@@ -652,6 +671,90 @@ import device_processing
 
 出现 `离合体检异常` / `离合状态异常，已全部断开` 时，说明检测到了多路吸合，
 请立刻断电检查离合的驱动电路是否有短路。
+
+---
+
+## 应用层 OTA（网页升级，不用插 USB）
+
+### 能更新什么、不能更新什么
+
+| 对象 | 网页 OTA | 说明 |
+| --- | --- | --- |
+| 全部程序逻辑（`AMS_WEB.py` / 换料逻辑 / `bambu/` …） | ✅ | 它们在文件系统里是 `.py` 源码 |
+| 网页界面（`index.html`） | ✅ | 同样在文件系统里 |
+| MicroPython 内核本身 | ❌ | 见下面的「为什么不做整机固件 OTA」，要动只能插 USB |
+
+### 为什么不做「上传整机固件 BIN」
+
+这块板子的分区表是**单个 factory 应用分区 + 2 MB littlefs**，没有 `ota_0` / `ota_1`
+两个备份分区、也没有 `otadata`：
+
+```
+nvs       0x009000    24 KB
+phy_init  0x00f000     4 KB
+factory   0x010000  1984 KB   ← MicroPython 内核 + 本项目代码
+vfs       0x200000  2048 KB   ← 文件系统
+```
+
+所以**没法**像手机那样「把新固件写进备用分区再切过去」。要那样做必须先改分区表、
+用 USB 重刷一次。基于这个前提，本项目选了更实用的一条路：
+
+> 既然「换料逻辑」和「网页界面」本来就在文件系统里（构建时直接打进 littlefs，
+> 不做 `.mpy`），那就**整个替换文件系统里的文件** —— 这就是应用层 OTA。
+
+用户如果把 `esp32c3-ams-firmware.bin` 直接拖进来，设备会**识别出来并明确提示
+改用 USB 刷写**，而不是扔一句「格式错误」让人干瞪眼。
+
+### `.ams` 更新包格式
+
+```
+偏移 0    8 字节   magic  b"AMSUPD1\n"
+偏移 8    u16      文件个数 file_count
+偏移 10   u16      清单字节数 manifest_bytes
+偏移 12   u32      载荷总字节数 total_payload
+偏移 16   manifest（每项：u8 name_len + name + u32 size + u32 crc32）
+之后      各文件载荷按清单顺序首尾相接
+```
+
+`crc32` 是标准 CRC-32，**和 PC 侧 `zlib.crc32` 逐字节一致**（有测试钉住）。
+生成命令：
+
+```bash
+python tools/make_update_pack.py                 # 默认输出 dist/ams-update.ams
+python tools/make_update_pack.py --out dist/x.ams
+```
+
+它会把 `python_code/` 整个打进去（跳过 `__pycache__` / `.pyc`），
+并且**不打包** `config.json` / `wifi.dat`（设备上这两个是用户数据）。
+
+### 升级流程与安全设计
+
+1. 网页上选 `.ams` 文件 → 点「上传并升级」，浏览器直接把文件的**原始字节**
+   作为请求体 POST 到 `/ota_upload`（`application/octet-stream`，不用 multipart）
+2. 设备**边收边写**：每收到一块就喂给 `OtaUpdate`，它负责写文件和算 CRC32。
+   ★ 绝不会把几百 KB 的包先读进内存 —— ESP32-C3 的空闲堆只有几十 KB
+3. 每个文件都**先写成 `名字.new` 临时文件**，写完立刻核对**长度 + CRC32**
+4. **所有文件全部校验通过**之后，才把 `.new` 依次改名成正式名字
+   （改名是原子操作，中途掉电最多「一部分新一部分旧」，不会出现半个文件）
+5. 回包告诉浏览器「写入了几个文件、即将重启」→ 等 0.9 秒把响应发完 → 重启
+6. **任何失败路径都会删掉全部 `.new` 并如实报错，绝不重启、绝不留半截文件**
+
+另外，更新包会被当**不可信输入**处理：拒绝绝对路径、拒绝 `..`、
+拒绝覆盖 `config.json` / `wifi.dat` / `boot_stat.json`（那里面是 WiFi 密码和
+打印机访问码，被覆盖一次等于把设备配置清了）。
+
+### 页面上的使用说明
+
+「系统 → 系统升级 (OTA)」页面里能直接选包上传，并显示：
+
+- 正在上传的文件名和大小（`… 请不要断电`）
+- 成功之后：`升级完成，已写入 N 个文件，设备将在 1 秒后自动重启`
+- 失败时：设备给出的中文原因（例如 `AMS_WEB.py 校验失败（CRC32 不匹配），更新包可能已损坏`）
+
+升级过程中**不要断电**；写完之后页面会失联十几秒，重启完成后刷新即可。
+
+> 💡 参数（单个文件上限、接收块大小、两种超时）都在 `AMS_WEB.py` 顶部：
+> `OTA_MAX_BYTES` / `OTA_RECV_CHUNK` / `OTA_IDLE_TIMEOUT_MS` / `OTA_TOTAL_TIMEOUT_MS`。
 
 ---
 
@@ -731,7 +834,7 @@ python tools/make_firmware_bin.py \
 python tests/run_tests.py
 ```
 
-共 78 项测试，分五块。
+共 116 项测试，分六块。
 
 **① 电磁离合安全约束**（核心，改动硬件层时必看）
 
@@ -809,6 +912,50 @@ python tests/run_tests.py
 | `test_page_has_left_menu_and_log_panel` | 左侧菜单 + 右侧内容 + 右下角常驻日志，且新日志会自动滚到底 |
 | `test_page_reports_mqtt_save_result_precisely` | 「已保存但连不上」和「彻底失败」要给不同提示 |
 | `test_page_never_builds_request_body_outside_json` | 写操作必须带 JSON 请求体和 `Content-Type` |
+| `test_page_has_ota_menu_and_upload` | ★ 系统菜单里要有「系统升级 (OTA)」，且真的把文件 POST 到 `/ota_upload` |
+| `test_page_ota_hints_usb_for_firmware_bin` | 页面要写明整机固件 BIN 不能走这里、要点名那个文件名 |
+| `test_page_hardware_has_jog_time_setting` | ★ 硬件调试页要有「进退响应时间」输入框，并写明「不影响自动换料」 |
+| `test_page_jog_buttons_follow_the_device_setting` | ★ 点动按钮上的秒数跟着设备设置走，且正在输入时不被 2 秒轮询覆盖 |
+| `test_page_mqtt_status_distinguishes_configured_but_retrying` | 页面要区分「还没配」和「配好了、后台正在重试」 |
+
+**⑥ 这一版新增：卡顿 / 转圈 / 刷新不出页面的回归保护**
+
+| 测试 | 验证内容 |
+| --- | --- |
+| `test_status_never_touches_network` | ★ `/status` 里不能再出现 `check_mqtt_connection`（真实网络 I/O）；把所有网络入口换成「一碰就炸」，接口仍必须可用 |
+| `test_mqtt_alive_cached_does_no_io` | ★ `mqtt_alive_cached()` 一次网络 I/O 都不做（网页每 2 秒读它一次） |
+| `test_mqtt_ping_has_hard_timeout` | ★ `ping` 有 0.8 秒硬超时，且 ping 完把 socket 超时还原成不限制 |
+| `test_mqtt_preflight_skips_unreachable_printer` | ★ 打印机连不上时跳过这一轮，**绝不**去构造 SSL 连接 |
+| `test_web_uses_worker_pool_and_big_backlog` | ★ 多 worker 并发 + `listen(8)`；`run_web_loop` 本身不能再直接处理请求（否则退回串行） |
+| `test_web_first_byte_window_is_short` | ★ 浏览器的「预连接」套接字要在 180ms 内被丢掉 |
+| `test_web_routing_works_on_raw_bytes_headers` | ★ 路由正则必须能解析 socket 读来的 **bytes** 请求行（str 模式匹配 bytes 会每请求都 500） |
+| `test_bus_two_phase_api_is_non_blocking` | ★ `begin()` 立刻返回并让电机转起来；`finish()` 用 `finally` 兜底断开；忙时拒绝切换通道；`stop` 抛异常也不卡在忙态 |
+| `test_jog_does_not_block_event_loop` | ★ 点动不能再调同步的 `bus.run()`；计时必须用 `await asyncio.sleep_ms` |
+| `test_hardware_test_replies_before_the_action_finishes` | ★ 回包那一刻电机已经在转、后台任务还没跑完；跑完后电机停、离合断开、总线空闲 |
+| `test_jog_rejects_when_bus_is_busy` | ★ 忙时立刻拒绝并说明，**不排队** |
+| `test_hardware_test_validates_input` | 非法通道 / 方向回 400 并说人话，拒绝后电机停、离合断开 |
+| `test_jog_time_clamped_to_safe_range` | ★ 进退响应时间夹在 0.2~60 秒，非数字退回默认 |
+| `test_jog_time_is_uniform_for_four_channels` | ★ 一个值管 4 个通道，并写进 `config.json` |
+| `test_jog_time_survives_restart` | ★ 重启后从配置恢复；坏值 / 超范围值都要安全处理 |
+| `test_jog_set_endpoint_clamps_and_reports` | ★ `/jog_set` 如实报告「实际生效」的秒数，被夹过要说明 |
+| `test_jog_time_only_affects_manual_jog` | ★ 自动换料流程与驱动层都不许读 `jog_ms` |
+| `test_status_exposes_jog_ms_and_mqtt_configured` | `/status` 要带 `jog_ms` 和 `mqtt_configured` |
+| `test_hardware_status_reports_busy` | 硬件状态要带 `busy`，页面才能显示「正在动作」 |
+| `test_mqtt_config_is_saved_before_connecting` | ★ MQTT 配置「先落盘，再交给后台连接」，请求里**不做** TLS 握手 |
+| `test_mqtt_save_reports_honest_status` | ★ 保存要如实回 `saved` / `connecting` / `connected`，并置脏标志 |
+| `test_mqtt_save_rejects_blank_required_fields` | 必填项留空回 400 并点名中文字段，且**绝不写盘** |
+| `test_ams_loop_reconnects_when_mqtt_config_is_dirty` | ★ 主循环看到脏标志要 `close_client()` 后用新参数重连 |
+| `test_close_client_releases_old_socket` | ★ 重连前必须真正断开旧连接（否则每重连一次漏一个 socket） |
+| `test_ota_crc32_matches_zlib` | ★ 纯 Python CRC32 与 `zlib.crc32` 逐字节一致，且支持分块增量 |
+| `test_ota_pack_roundtrips_byte_for_byte` | ★ 更新包按不规则分块喂入后逐字节还原，子目录自动创建，不留 `.new` |
+| `test_ota_pack_rejects_corrupt_payload` | ★ 改动一个字节 → CRC 发现并中止，绝不写出正式文件 |
+| `test_ota_pack_rejects_truncated_upload` | ★ 只收了一半 → `finish()` 拒绝，不留半截文件 |
+| `test_ota_rejects_firmware_bin_with_helpful_message` | ★ 整机固件 BIN 被识别并明确提示「改走 USB」 |
+| `test_ota_rejects_unsafe_names` | ★ 拒绝绝对路径 / `..` / 覆盖 `config.json`、`wifi.dat`、`boot_stat.json` |
+| `test_ota_route_is_streamed` | ★ `ota_upload` 走流式路径，且在「读请求体」之前分流 |
+| `test_ota_upload_endpoint_writes_files_then_asks_for_reboot` | ★ 端到端：`POST /ota_upload` 把文件写进文件系统并回 `reboot:true` |
+| `test_ota_upload_endpoint_rejects_bad_pack` | ★ 坏包回 400，一个文件都不写；`Content-Length` 为 0 也挡住 |
+| `test_reboot_is_skipped_in_selftest_mode` | `allow_reboot=False` 时不真重启（桌面自测用） |
 
 改动相应模块后请先跑一遍再上传。
 
@@ -951,9 +1098,9 @@ esptool.py --chip esp32c3 --port COM5 write_flash -z 0x0 esp32c3-ams-firmware.bi
 </details>
 
 <details>
-<summary><b>网页打开很慢 / 偶尔刷新不出来</b></summary>
+<summary><b>网页打开很慢 / 偶尔刷新不出来 / 一卡几十秒像崩溃了一样</b></summary>
 
-这两个问题在本版本已经修掉了，对应原因分别是：
+这几个问题在本版本已经修掉了，对应原因分别是：
 
 - **慢** —— `index.html` 以前是逐行发送、每行还 `await sleep(10ms)`，400 多行的
   页面光发 HTML 就要 4 秒以上；再加上 accept 循环里 `await sleep(500ms)`，
@@ -964,12 +1111,144 @@ esptool.py --chip esp32c3 --port COM5 write_flash -z 0x0 esp32c3-ams-firmware.bi
   读 + `await` 让步，总等待上限 0.6 秒。
 - 还有一个隐藏元凶：主循环用阻塞的 `wait_msg()` 收 MQTT，没有消息时会把整个
   uasyncio 事件循环按住，Web 和状态灯任务全被饿死。现在改用非阻塞 `poll_msg()`。
+- **一卡几十秒** —— `/status` 里原来调 `check_mqtt_connection()`，它会**真的在
+  SSL 上发一次 PINGREQ**。打印机连接一旦半死（拔电、换网、休眠），这个阻塞写
+  会一直卡到 TCP 自己超时 —— 几十秒；而 `/status` 是每 2 秒被轮询一次的，
+  于是网页周期性假死、看起来「像崩溃了」。现在 `/status` **只读主循环留下的
+  缓存标志**，一次网络 I/O 都不做；真实探测仍由主循环做，但带 0.8 秒硬超时。
+  同理，主循环连打印机之前会先花最多 1 秒做 TCP 预探测，打印机没开机时
+  直接跳过这一轮，不再「每 10 秒冻一次、每次好几秒」。
+- **要刷好几次才出来** —— 三件事凑在一起：① 服务端是
+  `accept → 处理 → accept` 的**串行**循环，一个慢连接就把后面所有请求全堵住；
+  ② `listen(2)` 太小，浏览器一次页面加载开 6 个连接，多出来的 SYN 被内核直接
+  丢掉，由浏览器按 TCP 退避（1s→2s→4s…）重试；③ 浏览器的「预连接」套接字
+  什么都不发，服务端却给每个白等 600ms，6 个连接就是 3.6 秒。
+  现在：**3 个 worker 轮流 accept**（读请求头那段是 `await` 让步的，并发是真的）、
+  `listen(8)`、再加一个 **180ms 的「首字节窗口」**——这么久还没开始发就直接丢掉。
 
 如果你刷了旧固件还有这个问题，重新下载 Releases 里最新的
-`esp32c3-ams-firmware.bin` 整片烧一次即可。
+`esp32c3-ams-firmware.bin` 整片烧一次即可，或者用网页上的
+[系统升级 (OTA)](#应用层-ota网页升级不用插-usb) 上传 `.ams` 包。
 
 > 例外：**正在换料的那十几秒页面会卡一下**，这是有意为之。换料要精确控制电机
 > 时序，不能被协程调度打断。换料结束后页面会自己恢复。
+>
+> 另一个例外：**升级（OTA）写文件那段时间**页面也会卡，因为写入是同步的。
+> 属正常现象，几秒到十几秒。
+</details>
+
+<details>
+<summary><b>网页上点一下点动，一直在转圈，几十秒后才有动作</b></summary>
+
+这是**手动点动原来是同步阻塞**导致的（已修）。
+
+旧实现按一下按钮就直接调 `bus.run()`，而 `run()` 内部用 `time.sleep_ms`
+度过整个 `times_ms`。也就是说，**整个 uasyncio 事件循环被按住好几秒**：
+网页转圈、其它请求全排队、状态灯也停摆。感受上就是「按一下等半天」。
+
+现在改成**两段式**：
+
+```
+上半场（立刻做）：吸合离合 → 让电机转起来 → 立刻回包（几十毫秒）
+下半场（后台做）：await asyncio.sleep_ms(时长) → 停电机 → 断开全部离合
+```
+
+- 按下按钮**立刻**就开始动作并回响应，网页不转圈
+- 动作期间再按别的通道，会被**明确拒绝**并提示「通道X 正在动作中，等它停下来再按」，
+  **不会排队**（排队正是「等几十秒」的观感来源）
+- 点动期间网页依然流畅，因为计时用的是 `await asyncio.sleep_ms`（会让出 CPU）
+
+如果你刷的还是旧固件，升到最新版本即可。
+</details>
+
+<details>
+<summary><b>想改手动点动的转动时长 / 改了会不会影响自动换料</b></summary>
+
+到「打印 → 硬件调试」页面，最上面有一个 **「进退响应时间（4 个通道统一用这一个值）」**
+区块：
+
+- 填 **0.2 ~ 60 秒**，点「保存响应时间」
+- 这个值**存在设备里**（`config.json` 的 `jog_ms`），重启也记得
+- 4 个通道**统一用这一个值**，不用一个一个设
+- 填超范围会被自动夹到安全区间，页面提示里会写明「已按安全范围调整」
+
+> ⚠️ **它只影响下面那些手动点动按钮，不会改变自动换料时的转动时长。**
+> 自动换料走的是 `NO_LIMIT_LOAD_MS` / `NO_LIMIT_RETRACT_MS` / `FILAMENT_STEP_MS`
+> 那一套（在 `hardware_config.py` 里），跟这个值完全无关。
+
+改完之后，点动按钮上的文案（「进料 1 秒」）会跟着变成新的秒数。
+</details>
+
+<details>
+<summary><b>点「保存并连接」提示失败，可是重启几次它自己又连上了</b></summary>
+
+这是**旧版本「先把结果说死」的毛病**（已修）。
+
+旧逻辑在保存请求里**现场做 TLS 握手 + 订阅**，然后按结果回一句「成功」或「失败」。
+可是：
+
+1. TLS 握手是阻塞的，打印机没开机 / 不在同一网段时会卡好几秒，网页看着像卡死；
+2. 更要命的是，**配置其实已经写进 `config.json` 了**，只是「当场没连上」——
+   而重启之后主循环拿新配置一连就成功。用户看到的自然就是
+   「提示失败，但重启几次它自己又连上了」这种自相矛盾的现象。
+
+现在改成 **先落盘，再交给后台连接**：
+
+| 返回字段 | 含义 |
+| --- | --- |
+| `saved` | 配置已经写进设备（**一定**为真，除非校验没过） |
+| `connecting` | 已通知主循环，正在后台重连 |
+| `connected` | 当前这一刻 MQTT 是否已经连上（纯读缓存，不做探测） |
+
+页面上会分别给出提示：
+
+- 「配置已保存，正在后台连接打印机…连上后『运行状态』里的 MQTT 会变绿」
+- 设备当前没联网时：「配置已保存。设备当前没联网，联网后会自动连接打印机，不用再改设置」
+
+另外，只有 **打印机 IP / 序列号 / 访问码** 是必填，用户名、客户端名、端口留空会
+自动填 `bblp` / `mqttx_3c73cd31` / `8883`。
+</details>
+
+<details>
+<summary><b>怎么在线升级（OTA）？能不能直接上传那个固件 BIN？</b></summary>
+
+到「系统 → 系统升级 (OTA)」页面，选 `.ams` 更新包上传即可，
+设备会自动写文件并重启，**不用插 USB、不用重新配网**。详见
+[应用层 OTA](#应用层-ota网页升级不用插-usb)。
+
+**但 `esp32c3-ams-firmware.bin` 不能走这里。** 那块 BIN 是**整机固件**，
+而这块板子的分区表只有单个 factory 应用分区，没有备用分区可以切换 ——
+MicroPython 里没地方安全地写「正在运行的自己」。
+
+所以你把它拖进去时，设备会明确告诉你：
+
+```
+这是整机固件 BIN，不是应用更新包。网页 OTA 只能更新程序与界面（.ams 包）；
+要整机升级请用 USB 刷写 esp32c3-ams-firmware.bin
+```
+
+整机升级仍然用：
+
+```bash
+esptool.py --chip esp32c3 --port COM5 write_flash -z 0x0 esp32c3-ams-firmware.bin
+```
+</details>
+
+<details>
+<summary><b>用 <code>tools/make_update_pack.py</code> 生成的更新包上传后提示「校验失败」</b></summary>
+
+按顺序排查：
+
+1. **上传过程被打断**（手机切后台、WiFi 抖动）→ 会报
+   `上传中断（已收到 x/y 字节）`，重传即可。
+2. **文件传坏了** → 会报某个文件 `CRC32 不匹配`。重新生成包再传：
+   `python tools/make_update_pack.py`。
+3. **`python_code/` 里改完代码忘了重新打** → 包里的还是旧内容（这不会报错，
+   只是升级后行为没变）。改完代码务必重新生成。
+4. 报 `更新包长度不一致` / `清单被截断` → 包本身不完整，重新生成。
+
+> 升级包**不包含** `config.json` / `wifi.dat` / `boot_stat.json`，
+> 也不允许包里去覆盖它们（会被拒绝）。所以升级不会丢 WiFi 和打印机配置。
 </details>
 
 <details>

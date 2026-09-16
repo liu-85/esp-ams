@@ -22,12 +22,18 @@ tools/preview_server.py —— 网页在电脑上的本地预览服务
 
 import json
 import os
+import shutil
 import sys
+import tempfile
+import threading
 import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 INDEX = os.path.join(ROOT, "python_code", "index.html")
+
+sys.path.insert(0, os.path.join(ROOT, "python_code"))
+from ota_update import OtaUpdate, OtaError     # noqa: E402
 
 # 一份"看起来像真机"的假状态，方便肉眼检查各种情况的显示效果
 STATUS = {
@@ -46,6 +52,8 @@ STATUS = {
     "color_list": ["#E53935", "#1E88E5", "#43A047", "#FB8C00"],
     "access_list": [1, 2, 3, 4],
     "current_access": 2,
+    # 手动点动的「进退响应时间」（4 个通道统一），单位毫秒
+    "jog_ms": 1000,
     "hardware": {
         "active_channel": None,
         "owner": None,
@@ -54,6 +62,7 @@ STATUS = {
         "motor_direction": 0,
         "channels": [1, 2, 3, 4],
         "limits": [False, False, False, False],
+        "busy": False,
     },
     # 刻意做成"接上负载后一直重启"的场景，方便肉眼检查诊断卡片的告警样式
     "reset": {
@@ -146,6 +155,11 @@ class Handler(BaseHTTPRequestHandler):
         except Exception:
             return {}
 
+    def _raw_body(self):
+        """原样读请求体（OTA 上传的是二进制包，不能当 JSON 解）"""
+        length = int(self.headers.get("Content-Length") or 0)
+        return self.rfile.read(length) if length else b""
+
     def do_GET(self):
         path = self.path.split("?")[0].rstrip("/") or "/"
         if path == "/":
@@ -179,19 +193,21 @@ class Handler(BaseHTTPRequestHandler):
             STATUS["color_list"] = data.get("color_list", STATUS["color_list"])
             LOGS.append("%s 改变映射通道及其颜色 %s"
                         % (time.strftime("%H:%M:%S"), data.get("color_list")))
-            self._json(info="切换通道成功")
+            self._json({"info": "切换通道成功"})
         elif path == "/mqtt_connect":
-            # 真机上是"先落盘，再连接"，这里照样演一遍，方便检查两种提示
+            # 真机上是"先落盘，再交给后台连接"，这里照样演一遍，方便检查提示文案。
+            # ★ 不会再出现"提示失败"：配置存下来了就是存下来了。
             LOGS.append("%s MQTT 配置已写入 config.json（IP=%s）"
                         % (time.strftime("%H:%M:%S"), data.get("mqtt_server")))
             STATUS["mqtt_configured"] = True
-            connected = bool(STATUS["wifi_isconnected"])
-            if connected:
-                self._json({"info": "配置已保存，MQTT 连接成功",
-                            "saved": True, "connected": True})
+            if STATUS["wifi_isconnected"]:
+                self._json({"saved": True, "connecting": True, "connected": False,
+                            "info": "配置已保存，正在后台连接打印机…"
+                                    "连上后「运行状态」里的 MQTT 会变绿"})
             else:
-                self._json({"info": "配置已保存；设备当前没联网，联网后会自动连接打印机",
-                            "saved": True, "connected": False})
+                self._json({"saved": True, "connecting": True, "connected": False,
+                            "info": "配置已保存。设备当前没联网，联网后会自动连接打印机，"
+                                    "不用再改设置"})
         elif path == "/wifi_connect":
             LOGS.append("%s 配网成功，已保存到 wifi.dat: %s"
                         % (time.strftime("%H:%M:%S"), data.get("name")))
@@ -200,11 +216,81 @@ class Handler(BaseHTTPRequestHandler):
                                 % data.get("name"),
                         "ip": "192.168.1.66", "wifi_ssid": data.get("name"),
                         "ap_on": False})
+        elif path == "/jog_set":
+            if "ms" in data:
+                want = int(data["ms"])
+            elif "seconds" in data:
+                want = int(float(data["seconds"]) * 1000)
+            else:
+                self._json({"ok": False, "info": "请提供 seconds（秒）或 ms（毫秒）"}, 400)
+                return
+            ms = max(200, min(60000, want))
+            STATUS["jog_ms"] = ms
+            LOGS.append("%s 进退响应时间已改为 %.1f 秒（4 个通道统一生效）"
+                        % (time.strftime("%H:%M:%S"), ms / 1000.0))
+            self._json({"ok": True, "jog_ms": ms,
+                        "info": "进退响应时间已设为 %.1f 秒（4 个通道统一生效）%s"
+                                % (ms / 1000.0,
+                                   "；已按安全范围调整" if ms != want else "")})
         elif path == "/hardware_test":
-            LOGS.append("%s 网页手动点动: 通道%s 方向%s %sms"
-                        % (time.strftime("%H:%M:%S"), data.get("channel"),
-                           data.get("direction"), data.get("times_ms")))
-            self._json(info="通道%s 动作完成，离合已全部断开" % data.get("channel"))
+            # ★ 真机上这里是"立刻回包 + 后台计时"的两段式。
+            #   预览里照样演：先回包，再用一个后台线程到点把状态清掉，
+            #   这样能亲眼看到"按下去马上有反馈、按钮不再转圈"。
+            hw = STATUS["hardware"]
+            ch = data.get("channel")
+            direction = data.get("direction")
+            ms = int(data.get("times_ms") or STATUS["jog_ms"])
+            action = "进料" if direction == 1 else "退料"
+            if hw.get("busy"):
+                self._json({"ok": False, "running": True,
+                            "info": "通道%s 正在动作中，等它停下来再按"
+                                    % hw.get("active_channel")})
+                return
+            hw["busy"] = True
+            hw["active_channel"] = ch
+            hw["engaged"] = [ch]
+            hw["motor_direction"] = direction
+            LOGS.append("%s 网页手动点动: 通道%s %s %dms"
+                        % (time.strftime("%H:%M:%S"), ch, action, ms))
+            self._json({"ok": True, "running": True, "ms": ms,
+                        "info": "通道%s 已开始%s，%.1f 秒后自动停止"
+                                % (ch, action, ms / 1000.0)})
+
+            def _finish():
+                time.sleep(ms / 1000.0)
+                hw["busy"] = False
+                hw["active_channel"] = None
+                hw["engaged"] = []
+                hw["motor_direction"] = 0
+                LOGS.append("%s 通道%s 点动结束，电机已停、离合已全部断开"
+                            % (time.strftime("%H:%M:%S"), ch))
+
+            threading.Thread(target=_finish, daemon=True).start()
+        elif path == "/ota_upload":
+            # ★ 预览模式下**只演练、不落盘**：把包解到临时目录里校验一遍，
+            #   再把临时目录删掉。这样不会把 python_code/ 覆盖掉。
+            raw = self._raw_body()
+            tmp = tempfile.mkdtemp(prefix="ams-ota-preview-")
+            cwd = os.getcwd()
+            try:
+                os.chdir(tmp)
+                upd = OtaUpdate(len(raw))
+                for i in range(0, len(raw), 1024):      # 模拟真机分包接收
+                    upd.feed(raw[i:i + 1024])
+                names = upd.finish()
+                LOGS.append("%s 升级包校验通过：%d 个文件（预览模式，未真正写盘）"
+                            % (time.strftime("%H:%M:%S"), len(names)))
+                self._json({"ok": True, "files": len(names), "reboot": True,
+                            "info": "预览模式：更新包校验通过（%d 个文件）。"
+                                    "真机上此时会写入文件系统并自动重启。" % len(names)})
+            except OtaError as e:
+                LOGS.append("%s ★ 升级包被拒绝: %s" % (time.strftime("%H:%M:%S"), e))
+                self._json({"ok": False, "info": str(e)}, 400)
+            except Exception as e:
+                self._json({"ok": False, "info": "接收失败: %s" % e}, 400)
+            finally:
+                os.chdir(cwd)
+                shutil.rmtree(tmp, ignore_errors=True)
         elif path == "/ap_set":
             set_ap(data.get("on"))
             self._json({"info": "配置热点已%s" % ("打开，手机连上 AMS_WIFI 后访问 http://192.168.4.1"

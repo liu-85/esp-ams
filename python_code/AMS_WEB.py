@@ -75,7 +75,16 @@ from machine import Pin, PWM
 from info_load import read_profiles, write_profiles, read_json_file, write_json_file
 from hardware_config import LED_PIN, CONFIG_FILE
 from motor_clutch import MotorBusError, ClutchConflictError
+from ota_update import OtaUpdate, OtaError
 import reset_info
+
+# 重启：应用层 OTA 写完文件后要重启才生效。
+# 桌面自测的 machine 桩里也有 reset()（语义是"清空引脚"），所以这里
+# 只是把它取回来，真正调不调由 allow_reboot 决定。
+try:
+    from machine import reset as _machine_reset
+except ImportError:                     # pragma: no cover - 取决于端口
+    _machine_reset = None
 
 # ---------------------------------------------------------------------------
 # 垃圾回收
@@ -98,11 +107,25 @@ INDEX_FILE = "index.html"
 WEB_PORT = 80
 WEB_POLL_MS = 20            # accept 轮询间隔；越小网页响应越快，20ms 兼顾性能与开销
 HEADER_WAIT_MS = 600        # 读请求头的**最长等待**；浏览器预连接会空等，不能设太长
+# ★ 浏览器"预连接"套接字连上之后什么都不发，如果每个都白等 HEADER_WAIT_MS，
+#   一次页面加载开 6 个连接就要浪费 3.6 秒 —— 这正是"刷新好几次才出来页面"。
+#   所以只给它一个很短的"首字节窗口"：这么久了第一个字节还没来，直接丢掉。
+#   真正的请求头一旦开始到达，仍可以一直读到 HEADER_WAIT_MS。
+HEAD_FIRST_BYTE_MS = 180
 BODY_WAIT_MS = 800          # 读完请求头后，再给请求体这么多时间（POST 才有）
 SEND_TIMEOUT_S = 3.0        # 发送阶段超时，防止客户端半死不活把服务端拖住
 # 请求（头 + 体）总量上限。MQTT 配置这份 JSON 约 300 字节，
 # 5120 足够宽裕，异常请求会在这里被截断丢弃。
 MAX_REQUEST_BYTES = 5120
+# ★ 同时处理几个连接。旧实现是"accept 一个、读一个、处理完再 accept 下一个"，
+#   一个慢连接（预连接、手机弱信号）会把后面所有请求堵在门外。
+#   改成固定几个 worker 轮流 accept，读请求头那段时间是 await 让步的，
+#   所以并发是真的有效。数目不能大：每个连接都要占一份缓冲区。
+WEB_WORKERS = 3
+# ★ 监听队列长度。旧值是 2 —— 浏览器一次开 6 个连接，多出来的 SYN 会被
+#   内核直接丢掉，由浏览器按 TCP 退避重试（1s→2s→4s…），
+#   表现就是"刷新也不打不开、要刷好几次"。给足 8 个。
+LISTEN_BACKLOG = 8
 SEND_CHUNK = 2048           # 内存里已有的二进制响应分片发送的块大小
 # ★ 字符串响应是"切块 → 逐块 encode"发出去的，这是单块字符数。
 #   512 个中文字符最多 1.5 KB，保证不会一次要一大块连续内存。
@@ -111,6 +134,12 @@ ENC_CHUNK = 512
 #   必须远小于空闲堆：1 KB 在任何情况下都能分配出来，而且块间 await 让步，
 #   发 40 KB 页面时其它任务不会饿死。**不要调大！**
 FILE_CHUNK = 1024
+# ★ OTA 上传的接收块大小与总长度上限（应用更新包约 300 KB）。
+OTA_RECV_CHUNK = 1024
+OTA_MAX_BYTES = 1024 * 1024
+OTA_IDLE_TIMEOUT_MS = 15000     # 中间超过这么久没有新数据，判定上传中断
+OTA_TOTAL_TIMEOUT_MS = 180000   # 整个上传的总上限
+REBOOT_DELAY_MS = 900           # 回完包到真正重启之间留的缓冲时间
 MQTT_PING_INTERVAL_MS = 5000  # MQTT 存活探测节流（keepalive=60s，5 秒一次足够）
 LOG_TAIL = 24               # /log 一次给网页多少行（和 logout.LOG_MAX_LINES 对齐）
 
@@ -125,7 +154,13 @@ _REASON = {
 
 # 需要请求体的写接口。这些路径收到空请求体时应该回 400 说明情况，
 # 绝不能掉进 404 —— 那会让用户以为是"接口不存在"，实际上只是请求体没读到。
-WRITE_ROUTES = ("wifi_connect", "mqtt_connect", "access_set", "hardware_test")
+WRITE_ROUTES = ("wifi_connect", "mqtt_connect", "access_set", "hardware_test",
+                "jog_set")
+
+# ★ 这些接口的请求体太大，**不能先整份读进内存**（OTA 更新包约 300 KB，
+#   而 ESP32-C3 的空闲堆只有几十 KB）。
+#   它们走"边收边写文件"的流式路径，见 handle_ota_upload。
+STREAM_ROUTES = ("ota_upload",)
 
 # 内存不够时的兜底页面：故意做得极小（几百字节，任何时候都发得出去），
 # 至少让浏览器有内容可显示，而不是一片空白让人摸不着头脑。
@@ -258,6 +293,15 @@ class AMS_WEB(AMS):
         #   改成打开文件、分块 sendall（见 send_file）。
         self._sent = 0                # 本次连接已发出的字节数（OOM 兜底时判断还能不能回包）
         self._page_logged = False     # 页面首次发送的日志只打一次，别刷屏
+        # ★ 应用层 OTA 写完文件后要不要真的重启。
+        #   桌面自测里 machine 桩的 reset() 语义是"清空引脚状态"而不是重启，
+        #   所以测试会把它设成 False，避免把其它用例的引脚状态清掉。
+        self.allow_reboot = True
+        # ★ 当前正在后台计时的手动点动动作。
+        #   点动改成"立刻回包 + 后台计时"之后，得有个标识避免同一时刻
+        #   排一堆动作（总线本身也会拒绝，但这里能给出更好的提示）。
+        self._jog_channel = None
+        self._jog_until = 0
 
     # ======================================================================
     # 配置读写
@@ -434,6 +478,17 @@ class AMS_WEB(AMS):
 
         另外 ssids 走缓存：真正的扫描只在用户点「重新扫描」时才做，
         否则每次刷新页面都会因为 scan() 阻塞 2 秒。
+
+        ★★ 第三条硬规矩（这一版新增，之前踩得很惨）：
+            这里**绝对不能有任何网络 I/O**。
+            旧代码写的是 `_safe(self.check_mqtt_connection, ...)`，而
+            check_mqtt_connection 会真的在 SSL 上发一次 PINGREQ。打印机那边
+            连接一旦半死，这个阻塞写会一直卡到 TCP 自己超时 —— **几十秒**。
+            而 /status 是每 2 秒被轮询一次的，于是网页周期性假死，
+            表现就是"系统响应太慢、像崩溃、刷新也打不开"。
+
+            现在只读主循环留下的缓存标志 mqtt_alive_cached()。
+            真实探测由 run_ams_loop / status_lED 负责，且都带硬超时。
         """
         return {
             "ok": True,
@@ -444,13 +499,24 @@ class AMS_WEB(AMS):
             "wifi_isconnected": _safe(self.wlan_sta.isconnected, False, "wifi_isconnected"),
             "wifi_ssid": _safe(self.current_ssid, "", "wifi_ssid"),
             "wifi_status_text": _safe(self.status_text, "", "wifi_status_text"),
-            "is_mqtt_con": _safe(self.check_mqtt_connection, False, "is_mqtt_con"),
+            # ★ 只读缓存：不碰网络。见上面的第三条硬规矩。
+            "is_mqtt_con": _safe(self.mqtt_alive_cached, False, "is_mqtt_con"),
+            # 打印机参数是否已经配好（三项都有才算）。网页靠它区分
+            # "未连接是因为还没配" 和 "配好了、后台正在重试" ——
+            # 以前设备根本不发这个字段，页面上那行"已保存/尚未保存"
+            # 永远是"尚未保存"，纯属误导。
+            "mqtt_configured": _safe(
+                lambda: bool(self.mqtt_server and self.DEVICE_SERIAL and self.password),
+                False, "mqtt_configured"),
             # 只给前 12 个：SSID 一多，这段 JSON 就会明显变胖
             "ssids": _safe(lambda: list(self._scan_cache[:12]), [], "ssids"),
             "color_list": _safe(lambda: self.color_list, [], "color_list"),
             "access_list": _safe(lambda: self.access_list, [], "access_list"),
             "current_access": _safe(lambda: self.filament_current, 0, "current_access"),
             "hardware": _safe(self._hardware_dict, {}, "hardware"),
+            # 手动点动的「进退响应时间」（4 个通道统一）。网页要拿它来
+            # 更新按钮文案，否则用户改了设置却看到按钮还写着旧的秒数。
+            "jog_ms": _safe(lambda: self.jog_ms, 1000, "jog_ms"),
             # 复位诊断：接负载后"一直重启"到底是欠压还是引脚接错，看这两个字段
             "reset": _safe(reset_info.summary, {}, "reset"),
             "boot_safety": _safe(boot_safety_lite, {"ok": True, "problems": []},
@@ -522,7 +588,8 @@ class AMS_WEB(AMS):
             "mqtt_server": self.mqtt_server,
             "client_id": self.client_id,
             "username": self.username,
-            "is_mqtt_con": self.check_mqtt_connection(),
+            # ★ 同样走缓存，不在网页请求里真发 ping（见 _status_dict 的第三条硬规矩）
+            "is_mqtt_con": self.mqtt_alive_cached(),
         }
         self.send_response(client, ujson.dumps(data), is_json=True)
 
@@ -565,35 +632,250 @@ class AMS_WEB(AMS):
 
     # ======================================================================
     # 手动点动调试（网页"硬件调试"用）
-    # 请求体示例：{"channel":2,"direction":1,"times_ms":1000}
-    # 该接口同样受"同一时刻只能 1 路离合吸合"的约束保护
+    #
+    # 请求体：{"channel":2,"direction":1}
+    #   times_ms 可选；**不传就用网页上设的「进退响应时间」(self.jog_ms)**。
+    #   时长由设备端决定，是"统一设置 4 个通道响应时间"能成立的关键 ——
+    #   前端只管按哪个通道、往哪个方向，改设置不用改前端。
+    #
+    # ★ 这个接口以前是**同步**的：直接调 bus.run()，而 run() 中间用
+    #   time.sleep_ms 度过整个 times_ms。于是按一下按钮，整个 uasyncio
+    #   事件循环被按住好几秒 —— 网页转圈、其它请求全排队、状态灯也停摆。
+    #   现在改成两段式：
+    #       上半场（这里）：吸合 + 让电机转起来 → **立刻回包**
+    #       下半场（后台任务）：await 计时 → 停电机 + 断开全部离合
+    #   回包只要几十毫秒，事件循环也不再被按住。
     # ======================================================================
-    def handle_hardware_test(self, client, data):
-        dict_info = {"info": None}
+    async def handle_hardware_test(self, client, data):
+        info = {"info": None, "ok": False}
         try:
             if not isinstance(data, dict):
                 raise ValueError("请求体格式不正确")
             channel = int(data.get("channel", 1))
             direction = int(data.get("direction", 1))
-            times_ms = int(data.get("times_ms", 1000))
             if direction not in (1, -1):
                 raise ValueError("direction 只能是 1(进料) 或 -1(退料)")
+            if channel not in self.motor_bus.channels:
+                raise ValueError("通道 %d 不存在" % channel)
+
+            raw_ms = data.get("times_ms", None)
+            if raw_ms is None or raw_ms == "":
+                times_ms = self.jog_ms
+            else:
+                times_ms = int(raw_ms)
+            times_ms = self.clamp_jog_ms(times_ms)
             if times_ms <= 0:
-                raise ValueError("times_ms 必须大于 0")
-            if times_ms > 5000:
-                times_ms = 5000          # 安全上限，防止网页误操作把料顶坏
-            logout("网页手动点动: 通道%s 方向%s %sms" % (channel, direction, times_ms))
-            self.motor_bus.run(channel, direction, times_ms,
-                               release=True, owner="web-test")
-            self.motor_bus.assert_single()   # 动作结束后复核一次
-            dict_info["info"] = "通道%d 动作完成，离合已全部断开" % channel
-            self.send_response(client, ujson.dumps(dict_info), is_json=True)
+                raise ValueError("动作时长必须大于 0")
+
+            # 总线忙 → 直接说明白，**绝不让用户排队**。
+            #   （排队等待正是"按一下转圈半天"的观感来源）
+            if self.motor_bus.busy or self._jog_channel is not None:
+                running = self._jog_channel or self.motor_bus.active_channel
+                info["info"] = ("通道%s 正在动作中，等它停下来再按"
+                                % (running if running else "?"))
+                info["running"] = True
+                self.send_response(client, ujson.dumps(info), is_json=True)
+                return False
+
+            action = "进料" if direction == 1 else "退料"
+            logout("网页手动点动: 通道%s %s %dms" % (channel, action, times_ms))
+
+            # 上半场：吸合 + 转起来（absorb 阶段内部只有几十毫秒的机械等待）
+            self.motor_bus.begin(channel, direction, owner="web-jog")
+            self._jog_channel = channel
+            self._jog_until = time.ticks_add(time.ticks_ms(), times_ms)
+            asyncio.create_task(self._finish_jog(channel, times_ms))
+
+            info["ok"] = True
+            info["running"] = True
+            info["ms"] = times_ms
+            info["info"] = "通道%d 已开始%s，%.1f 秒后自动停止" % (
+                channel, action, times_ms / 1000.0)
+            self.send_response(client, ujson.dumps(info), is_json=True)
+            return True
         except MotorBusError as e:
-            dict_info["info"] = "总线拒绝执行: " + str(e)
-            self.send_response(client, ujson.dumps(dict_info), status_code=400, is_json=True)
+            info["info"] = "总线拒绝执行: " + str(e)
+            self.send_response(client, ujson.dumps(info), status_code=400, is_json=True)
+            return False
         except Exception as e:
-            dict_info["info"] = "执行失败: " + str(e)
-            self.send_response(client, ujson.dumps(dict_info), status_code=400, is_json=True)
+            info["info"] = "执行失败: " + str(e)
+            self.send_response(client, ujson.dumps(info), status_code=400, is_json=True)
+            return False
+
+    async def _finish_jog(self, channel, times_ms):
+        """点动的下半场：等够时间 → 停电机 → 断开全部离合。
+
+        ★ 用 await asyncio.sleep_ms 而不是 time.sleep_ms —— 前者会把 CPU
+          让给 Web / 状态灯 / 换料主循环，后者会把整个事件循环按住。
+          这就是"点动期间网页依然流畅"的原因。
+        """
+        try:
+            await asyncio.sleep_ms(times_ms)
+        except Exception:
+            pass
+        finally:
+            try:
+                self.motor_bus.finish()
+            except Exception as e:
+                logout("点动收尾异常，强制回到安全态: " + str(e), is_error=True)
+                try:
+                    self.motor_bus.release_all()
+                except Exception:
+                    pass
+            self._jog_channel = None
+            self._jog_until = 0
+            logout("通道%s 点动结束，电机已停、离合已全部断开" % channel)
+
+    # ======================================================================
+    # 手动点动的「进退响应时间」（4 个通道统一）
+    # 请求体：{"seconds": 3}  或  {"ms": 3000}
+    # ======================================================================
+    def handle_jog_set(self, client, data):
+        info = {"info": None, "ok": False}
+        try:
+            if not isinstance(data, dict):
+                raise ValueError("请求体格式不正确")
+            if "ms" in data:
+                want = data["ms"]
+            elif "seconds" in data:
+                want = float(data["seconds"]) * 1000.0
+            else:
+                raise ValueError("请提供 seconds（秒）或 ms（毫秒）")
+            try:
+                want_ms = int(float(want))
+            except Exception:
+                raise ValueError("秒数必须是数字")
+
+            ms = self.set_jog_ms(want_ms)
+            clamped = (want_ms != ms)
+            info["ok"] = True
+            info["jog_ms"] = ms
+            info["info"] = "进退响应时间已设为 %.1f 秒（4 个通道统一生效）%s" % (
+                ms / 1000.0,
+                "；已按安全范围调整" if clamped else "")
+            self.send_response(client, ujson.dumps(info), is_json=True)
+            return True
+        except Exception as e:
+            info["info"] = "设置失败: " + str(e)
+            self.send_response(client, ujson.dumps(info), status_code=400, is_json=True)
+            return False
+
+    # ======================================================================
+    # 应用层 OTA：网页上传 .ams 更新包 → 写进文件系统 → 重启
+    #
+    # ★ 为什么不能走"先整份读进内存再解析"：
+    #   更新包约 300 KB，而 ESP32-C3 的空闲堆只有几十 KB —— 一次 read
+    #   就会 memory allocation failed。所以这里是**流式**的：收到一块就喂给
+    #   OtaUpdate，由它负责写文件和算 CRC32。
+    #
+    # ★ 为什么不用 multipart/form-data：
+    #   那需要在这边解析分界线和各段头部，MicroPython 上又慢又容易出错。
+    #   网页直接 `fetch(url, {method:'POST', body: file})` 把文件原始字节发过来
+    #   （Content-Type: application/octet-stream），Content-Length 就是长度，
+    #   最省事也最可靠。
+    #
+    # ★ 为什么不做"上传整机固件 BIN"：
+    #   分区表只有单个 factory 分区，没有 ota_0/ota_1，MicroPython 里没地方
+    #   安全地写"正在运行的自己"。用户很容易把 esp32c3-ams-firmware.bin
+    #   直接拖进来，OtaUpdate 会识别出来并明确告诉他改走 USB。
+    # ======================================================================
+    async def handle_ota_upload(self, client, head, extra):
+        info = {"info": None, "ok": False}
+        total = _content_length(head)
+        if total <= 0:
+            info["info"] = "没有收到升级文件内容（Content-Length 为 0）"
+            self.send_response(client, ujson.dumps(info), status_code=400, is_json=True)
+            return False
+        if total > OTA_MAX_BYTES:
+            info["info"] = "升级包太大（%d 字节，上限 %d 字节）" % (total, OTA_MAX_BYTES)
+            self.send_response(client, ujson.dumps(info), status_code=400, is_json=True)
+            return False
+
+        logout("开始接收升级包：%d 字节（%s）" % (total, mem_note()))
+        upd = OtaUpdate(total)
+        try:
+            if extra:
+                upd.feed(extra)              # 读请求头时可能已经捎带了一部分
+
+            client.setblocking(False)
+            deadline = time.ticks_add(time.ticks_ms(), OTA_TOTAL_TIMEOUT_MS)
+            idle = time.ticks_add(time.ticks_ms(), OTA_IDLE_TIMEOUT_MS)
+            while upd.received < total:
+                if time.ticks_diff(deadline, time.ticks_ms()) <= 0:
+                    raise OtaError("上传超时（已收到 %d/%d 字节）"
+                                   % (upd.received, total))
+                if time.ticks_diff(idle, time.ticks_ms()) <= 0:
+                    raise OtaError("上传中断（已收到 %d/%d 字节）"
+                                   % (upd.received, total))
+                try:
+                    chunk = client.recv(OTA_RECV_CHUNK)
+                except OSError:
+                    chunk = None                 # 暂时没数据，正常
+                if chunk is None:
+                    await asyncio.sleep_ms(10)    # ★ 让出事件循环，网页不会卡住
+                    continue
+                if not chunk:
+                    raise OtaError("连接被断开（已收到 %d/%d 字节）"
+                                   % (upd.received, total))
+                upd.feed(chunk)
+                idle = time.ticks_add(time.ticks_ms(), OTA_IDLE_TIMEOUT_MS)
+        except OtaError as e:
+            upd.abort()                          # ★ 绝不留半截文件
+            logout("升级包被拒绝: " + str(e), is_error=True)
+            info["info"] = str(e)
+            self.send_response(client, ujson.dumps(info), status_code=400, is_json=True)
+            return False
+        except Exception as e:
+            upd.abort()
+            logout("升级包接收失败: " + str(e), is_error=True)
+            info["info"] = "接收失败: %s" % e
+            self.send_response(client, ujson.dumps(info), status_code=400, is_json=True)
+            return False
+
+        # ---- 全量校验通过后才改正式文件名 ----
+        try:
+            names = upd.finish()
+        except OtaError as e:
+            logout("升级包写入失败: " + str(e), is_error=True)
+            info["info"] = str(e)
+            self.send_response(client, ujson.dumps(info), status_code=400, is_json=True)
+            return False
+        except Exception as e:
+            upd.abort()
+            logout("升级包写入异常: " + str(e), is_error=True)
+            info["info"] = "写入失败: %s" % e
+            self.send_response(client, ujson.dumps(info), status_code=400, is_json=True)
+            return False
+
+        logout("升级完成：写入 %d 个文件，准备重启" % len(names))
+        info["ok"] = True
+        info["files"] = len(names)
+        info["reboot"] = True
+        info["info"] = ("升级完成，已写入 %d 个文件，设备将在 1 秒后自动重启"
+                        % len(names))
+        self.send_response(client, ujson.dumps(info), is_json=True)
+
+        # 先把包发出去，再重启 —— 否则浏览器只会看到"连接被重置"
+        await asyncio.sleep_ms(REBOOT_DELAY_MS)
+        self._reboot()
+        return True
+
+    def _reboot(self):
+        """重启设备以应用更新。
+
+        allow_reboot 关掉时只记日志不真重启（桌面自测用：machine 桩的
+        reset() 语义是"清空引脚状态"，真调会把别的用例搞乱）。
+        """
+        if not self.allow_reboot or _machine_reset is None:
+            logout("（自测模式）跳过重启；更新已写入文件系统，手动重启即可生效")
+            return False
+        logout("重启设备以应用更新")
+        try:
+            _machine_reset()
+            return True
+        except Exception as e:
+            logout("重启失败: " + str(e), is_error=True)
+            return False
 
     # ======================================================================
     # 连接 WiFi
@@ -736,14 +1018,14 @@ class AMS_WEB(AMS):
     def handle_mqtt_cennect(self, client, data):
         """保存打印机 MQTT 配置。
 
-        ★ 和旧版最大的区别：**先落盘，再连接**。
+        ★ 和旧版最大的区别：**先落盘，再（由后台）连接**。
           旧代码是 `if self.conent_and_subscribe(): ... write_json_file(...)`，
           也就是说只有 MQTT 当场连上才会写配置。可是在 AP 配置模式下根本
           没联网，MQTT 必然连不上 —— 于是"保存"永远失败，config.json 里
           永远空空如也，重启之后还得重填。现在：
             1. 参数校验 → 写进 config.json（这一步一定做）
-            2. 再尝试连接；连不上只作为提示返回，配置已经存好了
-            3. 返回 saved / connected 两个字段，让网页能给出准确的说法
+            2. 请求里**不做** TLS 连接，只置脏标志让主循环去连
+            3. 返回 saved / connecting / connected，网页能给出准确的说法
         """
         logout("配置 MQTT")
         info = {"info": None, "saved": False, "connected": False}
@@ -778,34 +1060,36 @@ class AMS_WEB(AMS):
             self.send_response(client, ujson.dumps(info), status_code=500, is_json=True)
             return False
 
-        # ---- 2) 再尝试连接 ----
+        # ---- 2) 交给后台去连，**不在请求里做 TLS 握手** ----
+        #
+        # ★ 这是"MQTT 设置提示失败，重启几次又自动连接上了"的正面修法。
+        #   旧代码在这里直接 conent_and_subscribe()：
+        #     · TLS 握手 + 订阅全是阻塞的，会把事件循环按住好几秒，
+        #       网页表现就是"一点保存就卡住"；
+        #     · 打印机没开机 / 不在同一网段时更久，最后必然失败，
+        #       于是回一句"失败" —— 可配置其实已经存好了，
+        #       重启之后主循环按新配置一连就成功。用户看到的就是
+        #       "提示失败，但重启几次它自己又连上了"这种自相矛盾的现象。
+        #
+        #   现在：只更新参数 + 置一个脏标志，主循环（run_ams_loop）看到
+        #   就立刻用新参数重连。回包如实说明"已保存、正在后台连接"。
         self.mqtt_update_info(mqtt_server=clean["mqtt_server"],
                               DEVICE_SERIAL=clean["DEVICE_SERIAL"],
                               password=clean["mqtt_password"],
                               username=clean["username"],
                               client_id=clean["client_id"],
                               mqtt_port=clean["mqtt_port"])
+        self._mqtt_dirty = True
+        info["connecting"] = True
+        info["connected"] = self.mqtt_alive_cached()
 
-        # 先把旧连接拆掉。这里**故意不用 check_mqtt_connection(force=True) 去探测**：
-        # 旧连接如果是坏的，SSL 上的 ping 会阻塞很久，把整个事件循环按住。
-        if self.client is not None:
-            try:
-                self.client.disconnect()
-            except Exception:
-                pass
-            self.client = None
-            self._mqtt_alive = False
-
-        if self.conent_and_subscribe():
-            info["connected"] = True
-            info["info"] = "配置已保存，MQTT 连接成功"
-            logout("MQTT 连接成功: %s" % clean["mqtt_server"])
+        if not self.wlan_sta.isconnected():
+            info["info"] = ("配置已保存。设备当前没联网，联网后会自动连接打印机，"
+                            "不用再改设置")
         else:
-            if self.wlan_sta.isconnected():
-                info["info"] = "配置已保存；MQTT 暂时连不上，请核对打印机 IP / 序列号 / 访问码"
-            else:
-                info["info"] = "配置已保存；设备当前没联网，联网后会自动连接打印机"
-            logout("MQTT 暂未连接（%s）" % info["info"])
+            info["info"] = ("配置已保存，正在后台连接打印机…"
+                            "连上后「运行状态」里的 MQTT 会变绿")
+        logout("MQTT 配置已保存，等待后台重连: %s" % clean["mqtt_server"])
 
         self.send_response(client, ujson.dumps(info), is_json=True)
         return True
@@ -830,56 +1114,84 @@ class AMS_WEB(AMS):
                 await asyncio.sleep_ms(1000)
 
     # ======================================================================
-    # 读请求头（非阻塞 + 让步，避免被浏览器的空闲连接拖死）
+    # 读请求（非阻塞 + 让步，避免被浏览器的空闲连接拖死）
     # ======================================================================
-    async def _read_request(self, client):
-        """读一整个 HTTP 请求（请求头 + 请求体）。
+    async def _read_headers(self, client):
+        """只读到请求头结束（`\\r\\n\\r\\n`），返回 (head, extra)。
 
-        ★ 旧实现只读到 `\\r\\n\\r\\n` 就收手，而 POST 的 JSON 请求体往往在
-          **下一个** TCP 段里。于是 process_json 找不到 `{`，返回 None，
-          路由条件 `data is not None` 不成立 → 掉进 404 —— 网页上就是
-          "保存提示 404，而且什么都没存进去"。
-          现在按 Content-Length 把请求体也读完。
+        extra 是"顺手已经收到"的请求体片段，可能为空 —— 交给调用方接着处理。
 
-        整个过程都是非阻塞读 + await 让步：浏览器会开一个"预连接"套接字却
-        什么都不发，阻塞等它会把整个事件循环按住（"网页偶尔打不开"的元凶）。
+        ★ 两层超时，缺一不可：
+          · **首字节窗口** HEAD_FIRST_BYTE_MS：浏览器会开"预连接"套接字却
+            什么都不发。旧代码给每个这样的连接白等 600ms，一次页面加载开 6 个
+            连接就是 3.6 秒 —— 这就是"刷新好几次才出来页面"的直接原因。
+            现在第一个字节迟迟不来就直接丢掉，成本降到 180ms。
+          · 头一旦开始到达，就给足 HEADER_WAIT_MS 读完（弱信号手机上请求头
+            也可能分几段到达，不能收一半就走）。
+
+        整个过程非阻塞读 + await 让步，不会按住事件循环。
         """
         client.setblocking(False)
         deadline = time.ticks_add(time.ticks_ms(), HEADER_WAIT_MS)
+        first_byte_deadline = time.ticks_add(time.ticks_ms(), HEAD_FIRST_BYTE_MS)
         buf = b""
-        head_end = -1
-        body_len = 0
-        body_deadline = None
 
         while True:
-            if head_end < 0:
-                pos = buf.find(b"\r\n\r\n")
-                if pos >= 0:
-                    head_end = pos + 4
-                    body_len = _content_length(buf[:head_end])
-                    if body_len > 0:
-                        # 请求体已经属于"下一个阶段"，给它一份独立的超时预算
-                        body_deadline = time.ticks_add(time.ticks_ms(), BODY_WAIT_MS)
-                elif time.ticks_diff(deadline, time.ticks_ms()) <= 0:
-                    break                       # 请求头都没收全，放弃
-            else:
-                if len(buf) >= head_end + body_len:
-                    break                       # ★ 请求体读齐了，收工
-                if body_deadline is not None and \
-                        time.ticks_diff(body_deadline, time.ticks_ms()) <= 0:
-                    break
+            pos = buf.find(b"\r\n\r\n")
+            if pos >= 0:
+                client.setblocking(True)
+                return buf[:pos + 4], buf[pos + 4:]
+            if buf:
+                if time.ticks_diff(deadline, time.ticks_ms()) <= 0:
+                    break                    # 头没收全，放弃
+            elif time.ticks_diff(first_byte_deadline, time.ticks_ms()) <= 0:
+                break                        # ★ 预连接：一个字都没来，立刻丢掉
             if len(buf) > MAX_REQUEST_BYTES:
                 break
 
             try:
                 chunk = client.recv(512)
             except OSError:
-                chunk = None                    # 没数据可读，正常
+                chunk = None                 # 没数据可读，正常
             if chunk is None:
-                await asyncio.sleep_ms(10)      # ★ 让出 CPU，别把循环堵住
+                await asyncio.sleep_ms(10)   # ★ 让出 CPU，别把循环堵住
                 continue
             if not chunk:
-                break                           # 对端已关闭
+                break                        # 对端已关闭
+            buf += chunk
+
+        client.setblocking(True)
+        return None, b""
+
+    async def _read_body(self, client, head, extra):
+        """把请求体读齐（普通 JSON 接口用，总量受 MAX_REQUEST_BYTES 限制）。
+
+        ★ 旧实现只读到请求头就收手，而 POST 的 JSON 请求体往往在**下一个**
+          TCP 段里。于是 process_json 找不到 `{`，返回 None，路由条件不成立
+          → 掉进 404 —— 网页上就是"保存提示 404，而且什么都没存进去"。
+        """
+        body_len = _content_length(head)
+        if body_len <= 0:
+            return extra or None
+        if body_len > MAX_REQUEST_BYTES:
+            body_len = MAX_REQUEST_BYTES
+
+        client.setblocking(False)
+        deadline = time.ticks_add(time.ticks_ms(), BODY_WAIT_MS)
+        buf = extra or b""
+
+        while len(buf) < body_len:
+            if time.ticks_diff(deadline, time.ticks_ms()) <= 0:
+                break
+            try:
+                chunk = client.recv(512)
+            except OSError:
+                chunk = None
+            if chunk is None:
+                await asyncio.sleep_ms(10)   # ★ 让出 CPU
+                continue
+            if not chunk:
+                break
             buf += chunk
 
         client.setblocking(True)
@@ -889,6 +1201,20 @@ class AMS_WEB(AMS):
     # Web 主循环
     # ======================================================================
     async def run_web_loop(self, port=WEB_PORT):
+        """起监听，并拉起 WEB_WORKERS 个 worker 一起服务请求。
+
+        ★ 为什么不是一个循环 accept → 处理 → accept：
+          浏览器一次页面加载会并发开好几个连接（页面本体、/status、/log、
+          预连接…）。旧实现是**串行**的：一个连接没处理完就绝不 accept
+          下一个，于是一个慢连接就能把后面所有请求全堵住 ——
+          用户看到的就是"一直转圈、要刷好几次"。
+          现在几个 worker 轮流 accept，而读请求头那段是 await 让步的，
+          所以多个连接可以真正并行地等数据、解析、回包。
+
+        ★ listen 队列一起放大（LISTEN_BACKLOG=8）：旧值 2 太小，
+          浏览器多开的连接会被内核直接丢掉 SYN，由浏览器按 TCP 退避
+          （1s→2s→4s…）重试 —— 那正是"几十秒后才有反应"的另一个来源。
+        """
         addr = socket.getaddrinfo("0.0.0.0", port)[0][-1]
         self.server_socket = socket.socket()
         # 快速重启时避免 "Address in use"
@@ -897,16 +1223,25 @@ class AMS_WEB(AMS):
         except Exception:
             pass
         self.server_socket.bind(addr)
-        self.server_socket.listen(2)
+        self.server_socket.listen(LISTEN_BACKLOG)
         self.server_socket.setblocking(False)
-        logout("Web 服务已启动，监听 %s:%d" % (addr[0], port))
+        logout("Web 服务已启动，监听 %s:%d（%d 个 worker）"
+               % (addr[0], port, WEB_WORKERS))
         logout("连上同一网络后用浏览器访问 http://%s 或 http://192.168.4.1" % addr[0])
 
-        while True:
-            # ★ 旧值是 500ms，每个请求平均要多等 250ms；改 20ms，
-            #   既不会空转烧 CPU，又保证网页几乎"秒开"。
-            await asyncio.sleep_ms(WEB_POLL_MS)
+        workers = [asyncio.create_task(self._web_worker(i))
+                   for i in range(WEB_WORKERS)]
+        await asyncio.gather(*workers)
 
+    async def _web_worker(self, index):
+        """一个服务循环：抢到一个连接就服务完，然后再抢下一个。
+
+        ★ accept() 是非阻塞的，而且"从 accept 到拿到 client"这一段中间
+          没有 await，所以多个 worker 不会抢到同一个连接。
+          抢不到就是 OSError，睡 20ms 再看，不会空转烧 CPU。
+        """
+        while True:
+            await asyncio.sleep_ms(WEB_POLL_MS)
             try:
                 client, caddr = self.server_socket.accept()
             except OSError:
@@ -916,72 +1251,7 @@ class AMS_WEB(AMS):
                 continue
 
             try:
-                request = await self._read_request(client)
-                if request is None or b"HTTP" not in request:
-                    continue              # 空连接 / 非法请求，直接丢掉
-
-                client.settimeout(SEND_TIMEOUT_S)
-
-                url = "404"
-                match = ure.search("(?:GET|POST|OPTIONS) /(.*?)(?:\\?.*?)? HTTP", request)
-                if match:
-                    try:
-                        url = match.group(1).decode("utf-8").rstrip("/")
-                    except Exception:
-                        url = match.group(1).rstrip("/")
-
-                data = self.process_json(request)
-                if url != "status" and url != "":
-                    logout("请求: %s" % url)
-
-                if url == "":
-                    await self.hanld_rootv2(client)
-
-                # ---- 聚合状态 / 日志 / 强制扫描 ----
-                elif url == "status":
-                    await self.get_status(client)
-                elif url == "log":
-                    await self.get_log(client)
-                elif url == "wifi_scan":
-                    await self.handle_wifi_scan(client)
-                elif url == "boot_clear":
-                    await self.handle_boot_clear(client)
-                elif url == "ap_set":
-                    self.handle_ap_set(client, data)
-
-                # ---- 写操作 ----
-                # ★ 统一的空请求体处理：旧代码是 `elif url == "xxx" and data is not None`，
-                #   请求体没读到时条件不成立就落到 handle_not_found 回了 404，
-                #   用户看到"保存提示404"却完全不知道是请求体的问题。
-                elif url in WRITE_ROUTES:
-                    if data is None:
-                        self.handle_bad_body(client, url)
-                    elif url == "wifi_connect":
-                        self.handle_wifi_cennect(client, data)
-                    elif url == "mqtt_connect":
-                        self.handle_mqtt_cennect(client, data)
-                    elif url == "access_set":
-                        self.handle_access_cenect(client, data)
-                    else:
-                        self.handle_hardware_test(client, data)
-
-                # ---- 兼容老接口 ----
-                elif url == "get_wifi_info":
-                    await self.get_wifi_info(client)
-                elif url == "get_mqtt_info":
-                    await self.get_mqtt_info(client)
-                elif url == "get_access_info":
-                    await self.get_access_info(client)
-                elif url == "get_hardware_info":
-                    await self.get_hardware_info(client)
-                elif url == "get_ip_info":
-                    await self.get_ip_info(client)
-
-                elif url == "favicon.ico":
-                    self.send_response(client, b"", status_code=204)
-                else:
-                    self.handle_not_found(client, url)
-
+                await self._serve_client(client)
             except MemoryError as e:
                 # ★ 内存不足：先记录现场，再回收碎片，最后尽量给浏览器一句人话，
                 #   并把"还剩多少内存"打进日志 —— 下次再 OOM 才有据可查。
@@ -989,14 +1259,100 @@ class AMS_WEB(AMS):
                 gc.collect()
                 logout("处理请求出错: 内存不足（%s）；%s，回收后 %s"
                        % (e, before, mem_note()), is_error=True)
-                self.oom_respond(client)
+                try:
+                    self.oom_respond(client)
+                except Exception:
+                    pass
             except Exception as e:
-                logout("处理请求出错: " + str(e) + "（" + mem_note() + "）", is_error=True)
+                logout("处理请求出错: " + str(e) + "（" + mem_note() + "）",
+                       is_error=True)
             finally:
                 try:
                     client.close()
                 except Exception:
                     pass
+
+    async def _serve_client(self, client):
+        """服务一个连接：读请求 → 路由 → 回包。"""
+        head, extra = await self._read_headers(client)
+        if not head or b"HTTP" not in head:
+            return                        # 空连接 / 预连接 / 非法请求，丢掉
+
+        client.settimeout(SEND_TIMEOUT_S)
+
+        url = "404"
+        # ★ 模式必须是 bytes：请求头是从 socket 读来的原始字节（bytes）。
+        #   MicroPython 的 re 要求"模式与目标同类型"，用 str 模式去匹配 bytes
+        #   会直接抛 TypeError（CPython 一样）。这里统一用 bytes，groupId
+        #   拿到的是 bytes，下面再 decode 成字符串。
+        match = ure.search(b"(?:GET|POST|OPTIONS) /(.*?)(?:\\?.*?)? HTTP", head)
+        if match:
+            try:
+                url = match.group(1).decode("utf-8").rstrip("/")
+            except Exception:
+                url = match.group(1).rstrip("/")
+
+        if url not in ("status", "", "log"):
+            logout("请求: %s" % url)
+
+        # ---- 流式接口：请求体可能几百 KB，绝不能先读进内存 ----
+        if url in STREAM_ROUTES:
+            if url == "ota_upload":
+                await self.handle_ota_upload(client, head, extra)
+            return
+
+        body = await self._read_body(client, head, extra)
+        data = self.process_json(body) if body else None
+
+        if url == "":
+            await self.hanld_rootv2(client)
+
+        # ---- 聚合状态 / 日志 / 强制扫描 ----
+        elif url == "status":
+            await self.get_status(client)
+        elif url == "log":
+            await self.get_log(client)
+        elif url == "wifi_scan":
+            await self.handle_wifi_scan(client)
+        elif url == "boot_clear":
+            await self.handle_boot_clear(client)
+        elif url == "ap_set":
+            self.handle_ap_set(client, data)
+
+        # ---- 写操作 ----
+        # ★ 统一的空请求体处理：旧代码是 `elif url == "xxx" and data is not None`，
+        #   请求体没读到时条件不成立就落到 handle_not_found 回了 404，
+        #   用户看到"保存提示404"却完全不知道是请求体的问题。
+        elif url in WRITE_ROUTES:
+            if data is None:
+                self.handle_bad_body(client, url)
+            elif url == "wifi_connect":
+                self.handle_wifi_cennect(client, data)
+            elif url == "mqtt_connect":
+                self.handle_mqtt_cennect(client, data)
+            elif url == "access_set":
+                self.handle_access_cenect(client, data)
+            elif url == "jog_set":
+                self.handle_jog_set(client, data)
+            else:
+                await self.handle_hardware_test(client, data)
+
+        # ---- 兼容老接口 ----
+        elif url == "get_wifi_info":
+            await self.get_wifi_info(client)
+        elif url == "get_mqtt_info":
+            await self.get_mqtt_info(client)
+        elif url == "get_access_info":
+            await self.get_access_info(client)
+        elif url == "get_hardware_info":
+            await self.get_hardware_info(client)
+        elif url == "get_ip_info":
+            await self.get_ip_info(client)
+
+        elif url == "favicon.ico":
+            self.send_response(client, b"", status_code=204)
+        else:
+            self.handle_not_found(client, url)
 
 
 # ==========================================================================

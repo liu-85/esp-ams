@@ -380,6 +380,15 @@ class FilamentMotorBus:
         """累计冲突次数。正常应该永远是 0"""
         return self._conflicts
 
+    @property
+    def busy(self):
+        """是否正处在一次两段式动作中（begin() 之后、finish() 之前）。
+
+        网页靠它判断"现在能不能再按一下点动"：忙的时候直接拒绝并说明，
+        而不是让用户排长队等（那正是"按一下转圈半天"的来源）。
+        """
+        return self._busy
+
     def engaged_channels(self):
         """当前处于吸合状态的通道号列表"""
         return [ch for ch in self.channels if self.clutches[ch].is_engaged()]
@@ -402,6 +411,7 @@ class FilamentMotorBus:
             "conflicts": self._conflicts,
             "motor_direction": self.motor.direction,
             "channels": list(self.channels),
+            "busy": self._busy,
         }
 
     # ------------------------------------------------------------------
@@ -521,13 +531,59 @@ class FilamentMotorBus:
     def run(self, channel, direction=1, times_ms=200, release=True, owner=None):
         """吸合 channel → 电机按 direction 转 times_ms → 停 → （默认）断开全部离合。
 
-        用 try/finally 保证异常时也一定释放离合，绝不会让两路同时带电。
+        ⚠️ 这是**阻塞**版本：中间的 times_ms 靠 time.sleep_ms 度过。
+           只在"调用方本来就在同步上下文里、且允许被阻塞"的场合使用
+           （比如换料主流程）。
+
+           在 uasyncio 的请求处理里**不要用它** —— 那会把整个事件循环按住，
+           网页表现就是"按一下按钮转圈好几秒，其它请求全排队"。
+           那种场合请改用 begin() / finish() 两段式（见下）。
         """
         # 先吸合（engage 自身要求 _busy 为 False），再把总线标记为"忙"
         self.engage(channel, owner=owner or ("run-ch%d" % channel))
         self._busy = True
         try:
             self.motor.run(direction, times_ms)
+            self.motor.stop()
+        finally:
+            self._busy = False
+            if release:
+                self.release_all()
+        return True
+
+    # ------------------------------------------------------------------
+    # 两段式动作（给异步/网页用，绝不阻塞事件循环）
+    # ------------------------------------------------------------------
+    def begin(self, channel, direction=1, owner=None):
+        """**非阻塞**启动：吸合通道 + 让电机转起来，然后立刻返回。
+
+        这是 `run()` 的"上半场"。调用方拿到控制权后自己决定等多久
+        （异步代码里用 `await asyncio.sleep_ms(...)`），到点再调 `finish()`。
+
+        这样做的意义：网页按一下点动可以**立刻回包**，电机继续转，
+        事件循环不被按住 —— 其它请求、状态灯、轮询都不会被饿死。
+
+        和 run() 一样受"同一时刻只能 1 路离合吸合"约束；如果总线已经忙，
+        engage() 会抛 MotorBusyError，不会出现两路同时吸合。
+        """
+        self.engage(channel, owner=owner or ("begin-ch%d" % channel))
+        self._busy = True
+        try:
+            self.motor.set_direction(direction)
+        except Exception:
+            # 电机没转起来就绝不能占着总线：立刻回到安全状态
+            self._busy = False
+            self.release_all()
+            raise
+        return True
+
+    def finish(self, release=True):
+        """结束一次 begin() 启动的动作：停电机 + （默认）断开全部离合。
+
+        用 try/finally 保证即便停电机时抛异常，也一定会走到 release_all()，
+        不会留下"离合还吸着、总线还标记忙"的僵尸状态。
+        """
+        try:
             self.motor.stop()
         finally:
             self._busy = False

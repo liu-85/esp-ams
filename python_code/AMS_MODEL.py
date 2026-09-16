@@ -56,6 +56,9 @@ from hardware_config import (
     NO_LIMIT_LOAD_MS,
     NO_LIMIT_RETRACT_MS,
     NO_LIMIT_PROBE_MS,
+    JOG_TIME_MS,
+    JOG_MIN_MS,
+    JOG_MAX_MS,
 )
 from motor_clutch import ClutchConflictError, MotorBusError
 
@@ -97,6 +100,19 @@ class AMS(Bambu_mqtt_cliet):
         self.now_warring = ""
         self.config_file = CONFIG_FILE
 
+        # ------------------------------------------------------------------
+        # 网页手动点动的"进退响应时间"（4 个通道统一用这一个值）
+        # ------------------------------------------------------------------
+        # ★ 只作用于「硬件调试」里的手动点动按钮，不影响自动换料
+        #   （自动换料走 NO_LIMIT_LOAD_MS / FILAMENT_STEP_MS 那一套）。
+        #   真正生效的值从 config.json 的 jog_ms 恢复，这里只是出厂默认。
+        self.jog_ms = JOG_TIME_MS
+
+        # ★ MQTT 配置刚被网页改过（需要主循环尽快用新参数重连一次）。
+        #   不在请求里现场连，是因为 TLS 握手会把整个事件循环按住好几秒 ——
+        #   那正是"保存 MQTT 时网页像卡死"的来源。
+        self._mqtt_dirty = False
+
     # ======================================================================
     # 日志
     # ======================================================================
@@ -132,8 +148,53 @@ class AMS(Bambu_mqtt_cliet):
             self.filament_current = saved
             logout("从配置恢复当前料盘: %s" % saved)
 
+        # 恢复网页上设的「进退响应时间」
+        self.jog_ms = self.clamp_jog_ms(file_data.get("jog_ms", self.jog_ms))
+        logout("手动点动进退响应时间: %.1f 秒" % (self.jog_ms / 1000.0))
+
         self.filament_current = self.now_filament(self.filament_current)
         return bool(new_data)
+
+    # ======================================================================
+    # 手动点动的进退响应时间（4 个通道统一）
+    # ======================================================================
+    @staticmethod
+    def clamp_jog_ms(value):
+        """把用户填的时长夹到安全区间（单位**毫秒**，整数值）。
+
+        调用方负责把"秒"换算成毫秒（见 AMS_WEB.handle_jog_set），
+        这里统一按毫秒处理。宁可夹住也不能放行：
+        0 毫秒没有意义（离合还没咬合就停了），几百秒会把关在机构里的料顶坏。
+        """
+        try:
+            ms = int(float(value))
+        except Exception:
+            return JOG_TIME_MS
+        if ms < JOG_MIN_MS:
+            return JOG_MIN_MS
+        if ms > JOG_MAX_MS:
+            return JOG_MAX_MS
+        return ms
+
+    def set_jog_ms(self, value):
+        """设置并持久化进退响应时间（返回实际生效的毫秒数）。
+
+        返回值和传入值可能不同（被 clamp 过），网页据此给出准确提示，
+        而不是显示用户填的那个数、实际却按另一个数跑。
+        """
+        ms = self.clamp_jog_ms(value)
+        changed = (ms != self.jog_ms)
+        self.jog_ms = ms
+        # 落盘（updata_data 定义在 AMS_WEB 上；单独实例化 AMS 时不强求）
+        save = getattr(self, "updata_data", None)
+        if save is not None:
+            try:
+                save({"jog_ms": ms})
+            except Exception as e:
+                logout("保存 jog_ms 失败: " + str(e), is_error=True)
+        if changed:
+            logout("进退响应时间已改为 %.1f 秒（4 个通道统一生效）" % (ms / 1000.0))
+        return ms
 
     def save_current_filament(self):
         """把当前料盘号写回 config.json，断电重启后能恢复"""
@@ -382,7 +443,14 @@ class AMS(Bambu_mqtt_cliet):
             try:
                 # ---------------- 没连上 MQTT ----------------
                 if not self.check_mqtt_connection():
+                    # ★ 网页刚改过 MQTT 配置 → 立刻用新参数试一次，
+                    #   不用等下一个 10 秒周期（用户点完保存就该看到结果）。
+                    forced = self._mqtt_dirty
+                    if forced:
+                        self._mqtt_dirty = False
+                        push_count = 0
                     push_count += 1
+
                     # ★ WiFi 都没连上时（典型场景：开机联网失败转成了配置热点），
                     #   去建 MQTT 是纯白费功夫：旧逻辑每 10 秒刷一条"未连接wifi"，
                     #   串口日志全被噪音淹没，真正有用的报错反而看不清。
@@ -392,12 +460,24 @@ class AMS(Bambu_mqtt_cliet):
                             logout("WiFi 未连接，暂不重连 MQTT（等待配网）")
                         await asyncio.sleep(30)
                         continue
-                    if push_count % 6 == 1:
+                    if forced or push_count % 6 == 1:
                         logout("MQTT 未连接，尝试重连（第 %d 次）" % push_count)
-                    self.conent_and_subscribe()
+                    # ★ preflight=True：先用最多 1 秒探一下打印机 IP:端口通不通。
+                    #   打印机没开机时，SSL 连接会一直卡到系统超时（好几秒甚至
+                    #   几十秒），而这里是每 10 秒一轮 —— 那会让网页周期性假死。
+                    self.conent_and_subscribe(preflight=True)
                     await asyncio.sleep(10)
                     continue
                 push_count = 0
+
+                # ---------------- 配置刚改过：用新参数重建连接 ----------------
+                if self._mqtt_dirty:
+                    self._mqtt_dirty = False
+                    logout("打印机配置已更新，重建连接")
+                    self.close_client()
+                    await asyncio.sleep_ms(50)
+                    self.conent_and_subscribe()
+                    continue
 
                 # ---------------- 定期重建连接 ----------------
                 # 旧代码是"每 20 轮重连一次"，而每轮都阻塞等消息，
@@ -407,10 +487,8 @@ class AMS(Bambu_mqtt_cliet):
                 if time.ticks_diff(now, last_reconnect) >= RECONNECT_INTERVAL_MS:
                     last_reconnect = now
                     logout("定期重建 MQTT 连接")
-                    try:
-                        self.client.disconnect()
-                    except Exception:
-                        pass
+                    # close_client 会把旧 socket 真正关掉，不然每重连一次漏一个
+                    self.close_client()
                     await asyncio.sleep(1)
                     self.conent_and_subscribe()
                     continue
