@@ -50,6 +50,27 @@ STATUS = {
         "channels": [1, 2, 3, 4],
         "limits": [False, False, False, False],
     },
+    # 刻意做成"接上负载后一直重启"的场景，方便肉眼检查诊断卡片的告警样式
+    "reset": {
+        "cause": "BROWN_OUT_RESET",
+        "cause_desc": "★ 欠压复位：供电电压掉到了阈值以下。负载浪涌把电源拉塌了，"
+                      "先查电源功率、线径、共地和 VM 的滤波电容",
+        "boot_count": 37,
+        "uptime_ms": 83000,
+        "power_suspect": True,
+    },
+    "boot_safety": {
+        "ok": False,
+        "report": "---- 硬件配置 ----\n共享电机 : IN1=GPIO2  IN2=GPIO3",
+        "problems": [
+            "GPIO2（电机 IN1）是 strapping 启动模式脚，绝对不能做电机输出！"
+            "AT8236 的 IN1/IN2 内置下拉电阻，上电瞬间会把它拉低，"
+            "芯片将进不了正常启动模式。请改到 [0, 1, 4, 5, 6, 7, 10] 里的引脚",
+            "GPIO3（电机 IN2）是 strapping 启动模式脚，绝对不能做电机输出！"
+            "AT8236 的 IN1/IN2 内置下拉电阻，上电瞬间会把它拉低，"
+            "芯片将进不了正常启动模式。请改到 [0, 1, 4, 5, 6, 7, 10] 里的引脚",
+        ],
+    },
 }
 
 MQTT_INFO = {

@@ -104,14 +104,30 @@ ESP32-C3 只有 `GPIO0 ~ GPIO21`，其中相当一部分不能当普通 IO 用�
 
 | GPIO | 用途 | 能否使用 |
 | --- | --- | --- |
-| `GPIO2` / `GPIO8` / `GPIO9` | strapping 引脚，上电电平决定启动模式（GPIO9 = BOOT 键） | 谨慎，见下 |
-| `GPIO4` ~ `GPIO7` | JTAG 调试口 | 可以用，代价是放弃 JTAG |
+| `GPIO2` / `GPIO3` / `GPIO8` / `GPIO9` | **strapping 启动模式脚**，上电瞬间电平决定从哪启动（GPIO9 = BOOT 键） | ⛔ **绝不能做输出** |
 | `GPIO11` ~ `GPIO17` | 模组内置 SPI Flash（含 VDD_SPI） | **不可用** |
 | `GPIO18` / `GPIO19` | USB D- / D+ | 接了 USB 座就不能用 |
 | `GPIO20` / `GPIO21` | UART0 RX / TX，默认日志与 REPL 口 | 不建议用 |
+| `GPIO4` ~ `GPIO7` | JTAG 调试口 | 可以用，代价是放弃 JTAG |
 
-因此真正「干净」的引脚只有 **GPIO0、GPIO1、GPIO3、GPIO10**（外加放弃 JTAG 的
-GPIO4~GPIO7）。本项目的默认配置就只用了这几只脚。
+因此可以安全当**输出**的引脚只有这 7 只：
+**GPIO0、GPIO1、GPIO4、GPIO5、GPIO6、GPIO7、GPIO10**。
+
+> ⚠️ **GPIO2 和 GPIO3 不是「空脚」，是启动模式选择脚。**
+>
+> 依据《ESP32-C3 技术参考手册》第 7 章表 7.2-1：复位释放后由
+> **GPIO2、GPIO3、GPIO8、GPIO9 共同控制 Boot 模式**。
+> 而且 datasheet 表 4-1 写得很明确：GPIO2、GPIO8 复位后是**浮空**，
+> 这四个脚里只有 GPIO9 带内部弱上拉。
+>
+> 把电机 H 桥的 IN1/IN2 接到 GPIO2 / GPIO3 上，AT8236 输入级的
+> **内置下拉电阻**会把这两个脚在上电瞬间拉低，芯片就进不了正常启动模式 ——
+> 现象正是**反复重启、Wi-Fi 能连但网页打不开、电机一直有电流声**。
+> （另有一条更直接的：GPIO2 上还挂着 1kHz 的状态灯 PWM，
+> IN1 也接在 GPIO2 的话，电机就变成「跟着呼吸灯闪」。）
+>
+> `hardware_config.validate()` 已经把「电机接在 strapping 脚上」列为**硬错误**，
+> 上电能直接在串口日志和网页的「上电诊断」里看到。
 
 > 📌 上游代码里的 **GPIO22 / GPIO23 是经典 ESP32（38 脚）的编号，ESP32-C3 上不存在**，
 > 必须改掉。本项目已全部重排。
@@ -125,16 +141,21 @@ GPIO4~GPIO7）。本项目的默认配置就只用了这几只脚。
 | 电磁离合 1 | `GPIO6` | 料盘位 1 |
 | 电磁离合 2 | `GPIO7` | 料盘位 2 |
 | 电磁离合 3 | `GPIO10` | 料盘位 3 |
-| 电磁离合 4 | `GPIO3` | 料盘位 4 |
-| 状态 LED | `GPIO2` | 板载蓝灯（沿用原代码） |
+| 电磁离合 4 | `GPIO3` | 料盘位 4（⚠️ strapping 脚，能跑但建议改到 `GPIO1`） |
+| 状态 LED | `GPIO2` | 板载蓝灯（⚠️ strapping 脚；设成 `None` 可彻底关掉） |
 | 到位开关 1~4 | *未安装* | 预留，见下方说明 |
 
 改接线只需要改 `python_code/hardware_config.py` 里的一组常量，不用动业务代码。
 
-**关于状态 LED 用 GPIO2**：GPIO2 是 strapping 引脚，上电瞬间需要为高电平。
-ESP32-C3 模组的 strapping 脚内部有弱上拉，上电默认为高，所以「LED 接对地」
-通常不影响启动。如果遇到偶发无法启动，把 LED 改到 `GPIO0` 或 `GPIO1`，
-并修改 `hardware_config.py` 里的 `LED_PIN`。
+**关于状态 LED 用 GPIO2**：板载 LED 在低电平时不导通、呈高阻，对 strapping
+影响很小，所以 LED 挂在 GPIO2 上是可以接受的。但它**绝不能和任何功率器件
+共用 GPIO2** —— 1kHz 的 LED PWM 会把 H 桥当灯闪。不想用状态灯就把
+`hardware_config.py` 里的 `LED_PIN` 设成 `None`，代码会自动跳过。
+
+**关于电磁离合 4 用 GPIO3**：ULN2803 的输入是达林顿基极，需要约 1.4V 才导通，
+空闲时接近高阻，等于把引脚「悬空」，而 GPIO3 的官方默认状态本来就是浮空，
+所以现在这样能用。但这属于**带病运行** —— 一旦换用输入带下拉的驱动板就会
+起不来。建议尽早把 `CLUTCH_PINS` 改成 `(6, 7, 10, 1)`。
 
 **关于到位开关（限位/微动开关）**：当前**未安装**，程序自动进入降级模式。
 它的作用是探测「当前正在用哪个料盘」和判断「料有没有真的推动」。装了开关后，
@@ -143,8 +164,9 @@ ESP32-C3 模组的 strapping 脚内部有弱上拉，上电默认为高，所以
 推荐接法（开关一端接 GPIO、另一端接 GND，内部上拉，低电平触发）：
 
 - 通道 1 / 2：`GPIO0`、`GPIO1`（最干净）
-- 通道 3 / 4：可用 `GPIO2`、`GPIO8` 或 `GPIO9` —— 这三个是 strapping 脚，
-  但「上拉 + 开关对地」的接法空闲时正好是高电平，符合 strapping 要求，是安全的
+- 通道 3 / 4：可用 `GPIO2`、`GPIO3`、`GPIO8` 或 `GPIO9` —— 这四个是 strapping 脚，
+  但「内部上拉 + 开关对地」的接法空闲时正好是高电平，符合 strapping 要求，
+  作**输入**是安全的（作输出就危险了，见上）
 
 ### 电气注意事项
 
@@ -157,6 +179,15 @@ ESP32-C3 模组的 strapping 脚内部有弱上拉，上电默认为高，所以
    （AO3400 / IRLZ44N）或光耦隔离的驱动板；三极管方案基极要串 1kΩ 电阻。
 
 另外：4 路离合的供电建议单独走一路 5V，不要和 ESP32-C3 共用同一根细线。
+
+3. **电机驱动的 VM 必须单独供电，且和 ESP32 共地到同一点。**
+   AT8236 的 VM 是 5.5V~36V 的功率电源，不要从开发板的 5V 引脚取电。
+   电机启动瞬间的浪涌电流很容易把 3.3V 拉塌，而 ESP32-C3 一旦欠压就会复位 ——
+   表现就是「空载时好好的，一接上负载就一直重启」。
+4. **AT8236 的 ISEN 要接检流电阻或直接接地**，VREF 决定峰值限流。
+   如果限流设得太小（比如 `VREF=2.0V / RISEN=0.2Ω` → 只有 1A），
+   电机带载时会「堵转式」地嗡嗡响却转不起来 —— 这也是「有电流声但没启动」的
+   常见原因之一。先把 `IN1/IN2` 接好、限流放宽，再逐步收紧。
 
 ### 物料清单
 
@@ -179,7 +210,8 @@ ESP32-C3 模组的 strapping 脚内部有弱上拉，上电默认为高，所以
 yaoams/
 ├── python_code/                  # ★ 要上传到 ESP32-C3 的全部代码
 │   ├── main.py                   # 上电自动启动入口（保持 .py，不能编译成 .mpy）
-│   ├── boot.py                   # 启动前脚本（当前为空壳，保留）
+│   ├── boot.py                   # 上电最先跑：置安全电平 + 记复位原因 + 累加启动计数
+│   ├── reset_info.py             # ★ 复位诊断：欠压 / 看门狗 / 冷启动，网页可见
 │   ├── AMS_WEB.py                # Web 配置服务 + 任务调度入口（继承 AMS）
 │   ├── AMS_MODEL.py              # ★ 换料业务逻辑：探测料盘 / 退料 / 进料 / MQTT 调度
 │   ├── device_processing.py      # ★ 硬件驱动：料盘位对象(material)、电机/离合总线工厂
@@ -458,8 +490,9 @@ M400 U1
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | `GET` | `/` | 配置页面 |
-| `GET` | `/status` | ★ 聚合状态：IP / WiFi / MQTT / 通道 / 颜色 / 硬件 / SSID 列表，一次拿全 |
+| `GET` | `/status` | ★ 聚合状态：IP / WiFi / MQTT / 通道 / 颜色 / 硬件 / 复位诊断，一次拿全 |
 | `GET` | `/wifi_scan` | 强制重新扫描 WiFi（阻塞约 2 秒，仅用户点击时调用） |
+| `GET` | `/boot_clear` | 把「启动次数」清零（排查复位循环时用） |
 | `POST` | `/wifi_connect` | `{"name":ssid,"password":pwd}` |
 | `POST` | `/mqtt_connect` | 打印机 IP / 序列号 / 访问码 / 端口等 |
 | `POST` | `/access_set` | `{"access_list":[...],"color_list":[...]}` |
@@ -519,6 +552,34 @@ import device_processing
 ---
 
 ## 调试
+
+### 上电诊断（复位原因 / 启动次数 / 引脚自检）
+
+页面上的「上电诊断」卡片，以及串口每次上电都会打印的一段：
+
+```
+======== 上电自检 ========
+复位原因 : BROWN_OUT_RESET（★ 欠压复位：供电电压掉到了阈值以下…）
+启动计数 : 第 37 次（次数持续 +1 说明在反复复位）
+==========================
+---- 硬件配置 ----
+共享电机 : IN1=GPIO4  IN2=GPIO5  换向死区=30ms
+电磁离合1: GPIO6  (高电平吸合, 吸合等待80ms)
+...
+引脚配置自检通过：全部输出脚都在安全引脚上。
+```
+
+排查「接上负载就一直重启」的用法：网页点「重置启动计数」→ 拔电重插 →
+回来看数字。**一次上电就涨了几十 = 复位循环**。
+
+复位原因对照：
+
+| 复位原因 | 含义 | 先查什么 |
+| --- | --- | --- |
+| `BROWN_OUT_RESET` | 欠压复位 | 供电功率、线径、共地、VM 滤波电容 |
+| `PWRON_RESET`（反复出现） | 反复冷启动 | 同上；供电正常则查引脚是否被拉低 |
+| `WDT_RESET` / `RTC_WDT_RESET` | 看门狗复位 | 有任务阻塞了事件循环 |
+| `SOFT_RESET` | 软复位 | 正常（软件主动复位） |
 
 ### 网页硬件面板
 
@@ -624,7 +685,7 @@ python tools/make_firmware_bin.py \
 python tests/run_tests.py
 ```
 
-共 41 项测试，分三块。
+共 54 项测试，分四块。
 
 **① 电磁离合安全约束**（核心，改动硬件层时必看）
 
@@ -658,6 +719,22 @@ python tests/run_tests.py
 | `test_mqtt_ping_throttling_behaviour` | 连续探测时，节流窗口内只应真的 `ping` 一次 |
 | `test_web_status_aggregates_everything` | `/status` 必须把页面需要的字段一次给全 |
 
+**④ 复位诊断与引脚安全**（「接上负载就一直重启」的回归保护）
+
+| 测试 | 验证内容 |
+| --- | --- |
+| `test_strapping_pins_include_gpio3` | ★ `GPIO3` 必须被列为 strapping 脚（早期版本漏了它） |
+| `test_motor_on_strapping_pin_is_hard_error` | ★ 电机接到 `GPIO2` / `GPIO3` 必须直接判错，`validate()` 不通过 |
+| `test_default_motor_pins_are_safe` | 默认电机引脚必须在安全输出集合里 |
+| `test_clutch_on_strapping_pin_is_only_warning` | 离合挂 `GPIO3`（ULN2803 输入高阻）只警告，不能让板子起不来 |
+| `test_make_safe_powers_everything_down` | ★ 上电第一件事必须把电机 / 离合 / LED 置到不上电电平 |
+| `test_make_safe_survives_bad_pin` | 单个脚初始化失败也不能抛异常挡住启动 |
+| `test_boot_py_safe_before_anything_else` | `boot.py` 必须是 `make_safe → capture → record_boot` 的顺序 |
+| `test_reset_cause_is_captured_and_reported` | 复位原因必须能识别，且能序列化给网页 |
+| `test_boot_count_increments_and_clears` | 启动计数能累加、能清零（数字疯涨 = 复位循环） |
+| `test_status_exposes_reset_diagnostics` | ★ `/status` 必须带 `reset` 和 `boot_safety` 字段 |
+| `test_led_can_be_disabled` | `LED_PIN = None` 时必须优雅跳过，不能 `AttributeError` |
+
 改动相应模块后请先跑一遍再上传。
 
 ### 页面的本地预览
@@ -676,6 +753,55 @@ python tools/preview_server.py 9000   # 换端口
 ---
 
 ## 常见问题
+
+<details>
+<summary><b>★ 接上负载后一直重启、电机一直有电流声、网页打不开</b></summary>
+
+**先对号入座，再动手改线：**
+
+| 现象 | 八成是 | 怎么处理 |
+| --- | --- | --- |
+| 电机「一会长鸣、一会间隔响」 | IN1/IN2 接到了 `GPIO2`，而 `GPIO2` 上还挂着 1kHz 的状态灯 PWM | 把电机改回 `GPIO4` / `GPIO5` |
+| 反复重启、网页永远打不开 | 电机接到了 `GPIO2` / `GPIO3`（strapping 脚），AT8236 输入的内置下拉把它拉低 | 把电机改回 `GPIO4` / `GPIO5` |
+| 空载正常、一挂负载就重启 | 电源带不动（欠压复位） | 给 AT8236 的 VM 单独供电、加粗线径、共地 |
+| 电机有电流声但转不起来 | AT8236 限流设得太小（VREF / ISEN） | 放宽限流，或把 ISEN 直接接地 |
+
+**第一步：确认引脚没接错。**
+
+电机 `IN1` / `IN2` 只能是 `GPIO0 / GPIO1 / GPIO4 / GPIO5 / GPIO6 / GPIO7 / GPIO10`
+里的引脚。**`GPIO2` 和 `GPIO3` 是 ESP32-C3 的 strapping 启动模式脚，
+AT8236 的输入内置下拉会把它们在上电瞬间拉低，一接上就起不来。**
+
+**第二步：看「上电诊断」卡片 / 串口日志。**
+
+```
+======== 上电自检 ========
+复位原因 : BROWN_OUT_RESET（★ 欠压复位：供电电压掉到了阈值以下…）
+启动计数 : 第 37 次（次数持续 +1 说明在反复复位）
+==========================
+```
+
+- `BROWN_OUT_RESET` → 供电问题。给 VM 单独供电、加粗线、共地到同一点。
+- `PWRON_RESET` 且启动次数疯涨 → 芯片在反复掉电，同样先查供电；
+  供电没问题就是引脚被拉低导致进不了启动模式。
+- `WDT_RESET` → 有任务卡住了事件循环（老代码里的 `wait_msg()` 就是这个毛病，
+  现已改成非阻塞轮询）。
+- 「引脚自检」显示未通过 → 照着红字提示把线改到安全引脚上。
+
+启动计数可以在网页上点「重置启动计数」清零：**清零 → 拔电重插 → 再看数字**，
+一次上电就涨了几十，就确定是复位循环。
+
+**第三步：把负载摘掉验证。**
+
+断开电机和离合，只留 ESP32 供电。如果这样能正常启动、网页能开，
+就说明是「负载把电源拉塌」而不是固件问题。再逐个接上电机 / 离合，
+接哪一个出问题就查哪一路。
+
+**为什么 GPIO2 上会有 1kHz 的 PWM？** 状态灯就是 1kHz
+（`AMS_WEB.py` 里 `PWM(Pin(LED_PIN))`）：MQTT 连上时 `duty(1000)` 常亮，
+只连上 WiFi 时 0.5 秒亮 / 0.5 秒灭。所以电机跟着它叫的规律正好是
+「长鸣 ↔ 间隔响」，一看就能对上。
+</details>
 
 <details>
 <summary><b>板子上电后没有反应 / 找不到 AMS_WIFI 热点</b></summary>

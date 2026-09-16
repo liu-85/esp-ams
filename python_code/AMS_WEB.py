@@ -40,8 +40,9 @@ AMS_WEB.py —— Web 配置页面 + 任务调度
 接口一览
 --------------------------------------------------------------------------
     GET  /                  配置页面（index.html）
-    GET  /status            ★ 聚合状态：IP/WiFi/MQTT/通道/颜色/硬件/SSID 列表
+    GET  /status            ★ 聚合状态：IP/WiFi/MQTT/通道/颜色/硬件/复位诊断
     GET  /wifi_scan         强制重新扫描 WiFi（阻塞约 2 秒，仅用户点击时调用）
+    GET  /boot_clear        把"启动次数"清零（排查复位循环时用）
     POST /wifi_connect      {"name":ssid,"password":pwd}
     POST /mqtt_connect      {"mqtt_server":...,"DEVICE_SERIAL":...,...}
     POST /access_set        {"access_list":[...],"color_list":[...]}
@@ -60,10 +61,12 @@ import uasyncio as asyncio
 
 from logout import logout
 from AMS_MODEL import AMS
+from device_processing import BOOT_SAFETY
 from machine import Pin, PWM
 from info_load import read_profiles, write_profiles, read_json_file, write_json_file
 from hardware_config import LED_PIN, CONFIG_FILE
 from motor_clutch import MotorBusError, ClutchConflictError
+import reset_info
 
 # ---------------------------------------------------------------------------
 # 垃圾回收
@@ -104,9 +107,14 @@ class AMS_WEB(AMS):
     def __init__(self):
         super().__init__()
         self.server_socket = None
-        self.LED = PWM(Pin(LED_PIN))
-        self.LED.freq(1000)
-        self.LED.duty(0)
+        # 状态灯：LED_PIN 设成 None 就整套跳过。
+        # （GPIO2 是 strapping 脚，想让出来 / 不想闪灯就把它设成 None）
+        if LED_PIN is None:
+            self.LED = None
+        else:
+            self.LED = PWM(Pin(LED_PIN))
+            self.LED.freq(1000)
+            self.LED.duty(0)
         self._index_cache = None      # index.html 的内存缓存
 
     # ======================================================================
@@ -200,10 +208,22 @@ class AMS_WEB(AMS):
             "access_list": self.access_list,
             "current_access": self.filament_current,
             "hardware": self._hardware_dict(),
+            # 复位诊断：接负载后"一直重启"到底是欠压还是引脚接错，看这两个字段
+            "reset": reset_info.summary(),
+            "boot_safety": BOOT_SAFETY,
         }
 
     async def get_status(self, client):
         self.send_response(client, ujson.dumps(self._status_dict()), is_json=True)
+
+    async def handle_boot_clear(self, client):
+        """把启动计数清零。
+
+        排查复位循环的用法：清零 → 拔电重插 → 再看数字。
+        如果一次上电就涨了几十，说明板子在反复重启。
+        """
+        reset_info.clear_boot_count()
+        self.send_response(client, ujson.dumps({"boot_count": 0}), is_json=True)
 
     async def handle_wifi_scan(self, client):
         """强制扫描（用户点「重新扫描 WiFi」）。会阻塞约 2 秒，先把响应头发出去。"""
@@ -431,6 +451,8 @@ class AMS_WEB(AMS):
     # 状态灯
     # ======================================================================
     async def status_lED(self):
+        if self.LED is None:
+            return                       # 没配状态灯，这个任务直接结束
         while True:
             if self.check_mqtt_connection():
                 self.LED.duty(1000)          # 常亮：MQTT 已连上
@@ -536,6 +558,8 @@ class AMS_WEB(AMS):
                     await self.get_status(client)
                 elif url == "wifi_scan":
                     await self.handle_wifi_scan(client)
+                elif url == "boot_clear":
+                    await self.handle_boot_clear(client)
 
                 # ---- 写操作 ----
                 elif url == "wifi_connect" and data is not None:

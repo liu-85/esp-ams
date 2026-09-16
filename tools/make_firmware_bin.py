@@ -65,7 +65,7 @@ DEFAULT_MICROPYTHON_VERSION = "1.23.0"
 SKIP_DIRS = {"__pycache__", ".idea", ".git", ".vscode", ".mypy_cache", ".pytest_cache"}
 SKIP_SUFFIXES = (".pyc", ".pyo", ".mpy", ".swp", ".swo", ".tmp", ".log", ".bak")
 # ⚠️ config.json / wifi.dat 含 WiFi 密码和打印机访问码，绝不能打进固件
-SKIP_FILES = {"config.json", "wifi.dat", ".DS_Store", "Thumbs.db", ".gitignore"}
+SKIP_FILES = {"config.json", "wifi.dat", "boot_stat.json", ".DS_Store", "Thumbs.db", ".gitignore"}
 
 
 def log(msg):

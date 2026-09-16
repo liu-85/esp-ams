@@ -45,6 +45,10 @@ body{
 .kv span{color:var(--dim)}
 .kv b{font-weight:600;text-align:right;word-break:break-all}
 .warn{color:var(--red);font-weight:600}
+.ok{color:var(--green);font-weight:600}
+.diag-desc{font-weight:400 !important;font-size:12.5px;color:var(--dim);line-height:1.45;max-width:64%}
+.diag-problems{margin:6px 0 0 2px;padding-left:16px;font-size:12.5px;color:var(--red);line-height:1.6}
+.diag-problems li{margin-bottom:3px}
 
 /* ---------------- 表单 ---------------- */
 .row{display:flex;gap:8px;align-items:center;margin-bottom:8px;flex-wrap:wrap}
@@ -202,6 +206,23 @@ button.mini{padding:6px 11px;font-size:13px}
     <div class="kv"><span>打印机 MQTT</span><b id="s_mqtt">-</b></div>
     <div class="kv"><span>配置热点</span><b id="s_ap">-</b></div>
     <div class="kv"><span>当前料盘</span><b id="s_cur">-</b></div>
+  </section>
+
+  <!-- ============ 上电诊断 ============ -->
+  <section class="card" id="card_diag">
+    <h2>上电诊断 <span class="sub">"接上负载就一直重启"查这里</span></h2>
+    <div class="kv"><span>本次复位原因</span><b id="d_cause">-</b></div>
+    <div class="kv"><span>原因说明</span><b id="d_cause_desc" class="diag-desc">-</b></div>
+    <div class="kv"><span>启动次数</span><b id="d_boots">-</b></div>
+    <div class="kv"><span>本次已运行</span><b id="d_uptime">-</b></div>
+    <div id="d_pins"></div>
+    <div class="row" style="margin-top:10px">
+      <button class="ghost" style="flex:1" onclick="reset_boot_count()">重置启动计数</button>
+    </div>
+    <p class="tip">排查方法：点一次「重置启动计数」，然后**拔电重插**。等网页能打开时回来看这个数字 ——
+      如果一次上电就涨了十几甚至几十，说明板子在反复重启。<br>
+      复位原因是「冷启动」或「欠压复位」→ 先查供电（电源功率、线径、共地）；
+      是「看门狗复位」→ 有任务卡住了事件循环。</p>
   </section>
 
   <!-- ============ WiFi ============ -->
@@ -670,6 +691,7 @@ function applyStatus(d){
 
   renderWifiList(d.ssids, curSsid, false);
   updateHardware(d.hardware);
+  updateDiagnostics(d);
 }
 
 function esc(s){
@@ -879,6 +901,52 @@ function updateHardware(hw){
 function hardware_test(channel, direction){
   send('/hardware_test', { channel:channel, direction:direction, times_ms:1000 }, function(d){
     toast(d.info || '动作完成', 'ok');
+    refresh();
+  });
+}
+
+/* ---------- 上电诊断：复位原因 / 启动次数 / 引脚自检 ---------- */
+function fmtUptime(ms){
+  var s = Math.floor((ms || 0) / 1000);
+  if(s < 60) return s + ' 秒';
+  var m = Math.floor(s / 60);
+  if(m < 60) return m + ' 分 ' + (s % 60) + ' 秒';
+  return Math.floor(m / 60) + ' 时 ' + (m % 60) + ' 分';
+}
+
+function updateDiagnostics(d){
+  var r = (d && d.reset) || {};
+
+  // 这几种复位说明"出过事"，标红；冷启动本身也可能是反复掉电，同样提示
+  var bad = r.power_suspect || r.cause === 'WDT_RESET' ||
+            r.cause === 'RTC_WDT_RESET' || r.cause === 'TASK_WDT_RESET';
+  $('d_cause').innerHTML = bad
+      ? '<span class="warn">' + esc(r.cause || '未知') + '</span>'
+      : esc(r.cause || '未知');
+  $('d_cause_desc').textContent = r.cause_desc || '-';
+
+  var n = r.boot_count || 0;
+  $('d_boots').innerHTML = n > 5
+      ? '<span class="warn">' + n + ' 次 · 在反复重启</span>'
+      : n + ' 次';
+  $('d_uptime').textContent = fmtUptime(r.uptime_ms);
+
+  var safety = (d && d.boot_safety) || {};
+  var box = $('d_pins');
+  if(safety.ok === false){
+    var items = (safety.problems || []).map(function(p){
+      return '<li>' + esc(String(p).replace(/^[×!!]\s*/, '')) + '</li>';
+    }).join('');
+    box.innerHTML = '<div class="kv"><span>引脚自检</span><b class="warn">未通过</b></div>' +
+                    '<ul class="diag-problems">' + items + '</ul>';
+  } else {
+    box.innerHTML = '<div class="kv"><span>引脚自检</span><b class="ok">通过</b></div>';
+  }
+}
+
+function reset_boot_count(){
+  get('/boot_clear', function(){
+    toast('启动计数已清零，现在拔电重插试试', 'ok');
     refresh();
   });
 }

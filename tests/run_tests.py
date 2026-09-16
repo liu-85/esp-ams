@@ -749,6 +749,233 @@ def test_wait_msg_timeout_respects_deadline():
 
 
 # ===========================================================================
+# 复位诊断与引脚安全
+# 背景：固件刷好、Wi-Fi 也能连，但"接上负载后一直重启、网页打不开、
+#       电机一直有电流声，一会长鸣一会间隔响"。
+#       根因是把电机 IN1/IN2 接到了 GPIO2 / GPIO3 ——
+#       这两个脚在 ESP32-C3 上是 strapping（启动模式选择）脚，
+#       而 AT8236 的 IN1/IN2 内置下拉电阻，会把它们在上电瞬间拉低。
+# ===========================================================================
+
+def test_strapping_pins_include_gpio3():
+    """GPIO3 也是 ESP32-C3 的 strapping 脚 —— 早期版本漏掉了它
+
+    依据：《ESP32-C3 技术参考手册》第 7 章表 7.2-1，
+    复位释放后由 GPIO2、GPIO3、GPIO8、GPIO9 共同决定 Boot 模式。
+    """
+    for pin in (2, 3, 8, 9):
+        check(pin in hardware_config.STRAPPING_PINS,
+              "GPIO%d 必须被列为 strapping 脚" % pin)
+
+
+def test_default_motor_pins_are_safe():
+    """电机 IN1/IN2 必须落在"可以安全做输出"的引脚上"""
+    for name, pin in (("IN1", hardware_config.MOTOR_PIN_IN1),
+                      ("IN2", hardware_config.MOTOR_PIN_IN2)):
+        check(pin in hardware_config.SAFE_OUTPUT_PINS,
+              "电机 %s = GPIO%d 不在安全输出引脚 %s 里"
+              % (name, pin, list(hardware_config.SAFE_OUTPUT_PINS)))
+
+
+def test_motor_on_strapping_pin_is_hard_error():
+    """★ 把电机接到 GPIO2 / GPIO3 必须直接判为错误
+
+    AT8236 的 IN1/IN2 是"逻辑输入，内置下拉电阻"（数据手册管脚表原文），
+    上电瞬间会把 strapping 脚拉低，芯片进不了正常启动模式 ——
+    这正是"接上负载后一直重启、网页打不开"的成因，必须在配置层拦住。
+    """
+    saved = (hardware_config.MOTOR_PIN_IN1, hardware_config.MOTOR_PIN_IN2)
+    try:
+        hardware_config.MOTOR_PIN_IN1 = 2
+        hardware_config.MOTOR_PIN_IN2 = 3
+        errors, _warnings = hardware_config.validate_detail()
+        ok, problems = hardware_config.validate()
+    finally:
+        hardware_config.MOTOR_PIN_IN1, hardware_config.MOTOR_PIN_IN2 = saved
+
+    check(len(errors) >= 2,
+          "电机接在 GPIO2/GPIO3 上应报出至少 2 条错误，实际 %d 条" % len(errors))
+    joined = " ".join(errors)
+    check("GPIO2" in joined and "GPIO3" in joined,
+          "错误信息里应该点名 GPIO2 和 GPIO3")
+
+    check_eq(ok, False, "电机接错 strapping 脚时 validate() 必须不通过")
+    check(any("strapping" in p for p in problems),
+          "问题列表里应该说明原因（strapping）")
+
+    # 还原之后必须恢复干净
+    errors_after, _ = hardware_config.validate_detail()
+    check_eq(errors_after, [], "还原默认引脚后不应该再有错误")
+
+
+def test_clutch_on_strapping_pin_is_only_warning():
+    """离合挂在 GPIO3 上只给警告，不能让整块板子起不来
+
+    ULN2803 的输入是达林顿基极，要 1.4V 以上才导通，空闲时接近高阻，
+    相当于把引脚"悬空"，而 GPIO2/GPIO3/GPIO8 的官方默认状态本来就是浮空。
+    所以现在这样能用 —— 但要在日志里提醒"带病运行"。
+    """
+    errors, warnings = hardware_config.validate_detail()
+    check_eq(errors, [], "当前默认配置不应该产生错误")
+    joined = " ".join(warnings)
+    check("GPIO3" in joined, "GPIO3 上的电磁离合应该给出警告")
+
+
+def test_boot_safety_report_explains_strapping_risk():
+    """上电自检报告要能直接说清楚"哪个脚有问题、该换到哪去\""""
+    ok, report = hardware_config.boot_safety_report()
+    check(isinstance(ok, bool), "boot_safety_report 要返回 bool")
+    check("共享电机" in report, "报告里应包含接线表")
+    check("IN1=GPIO%d" % hardware_config.MOTOR_PIN_IN1 in report,
+          "接线表里应有电机引脚")
+
+
+def test_make_safe_powers_everything_down():
+    """★ 上电第一件事必须把电机 / 离合 / LED 置到"不上电"电平
+
+    裸 GPIO 在初始化前是浮空的，H 桥输入浮空 = 输出状态不确定。
+    """
+    import reset_info
+
+    machine.reset()
+    done = reset_info.make_safe()
+
+    for pin in (hardware_config.MOTOR_PIN_IN1, hardware_config.MOTOR_PIN_IN2):
+        check_eq(machine.level(pin), 0,
+                 "电机 GPIO%d 上电必须先给低电平（H 桥滑行）" % pin)
+    for pin in CLUTCH_PINS:
+        check_eq(machine.level(pin), INACTIVE,
+                 "离合 GPIO%d 上电必须处于断开电平" % pin)
+    check(hardware_config.MOTOR_PIN_IN1 in done,
+          "make_safe() 应返回被处理过的引脚列表")
+
+
+def test_make_safe_survives_bad_pin():
+    """某个脚初始化失败也不能让 make_safe() 抛异常挡住启动"""
+    import reset_info
+
+    original = machine.Pin
+
+    class Boom(machine.Pin):
+        def __init__(self, *args, **kwargs):
+            raise OSError("引脚不存在")
+
+    try:
+        machine.Pin = Boom
+        reset_info.make_safe()      # 不允许抛异常
+    finally:
+        machine.Pin = original
+
+
+def test_boot_py_safe_before_anything_else():
+    """boot.py 必须先 make_safe，再记复位原因，最后才写启动计数，
+    而且要兜住所有异常（绝不能因为自检失败而挡住 main.py）"""
+    path = os.path.join(SRC_DIR, "boot.py")
+    with open(path, "r", encoding="utf-8") as handle:
+        src = handle.read()
+
+    order = [src.find("make_safe()"), src.find("capture()"), src.find("record_boot()")]
+    for index, name in enumerate(("make_safe()", "capture()", "record_boot()")):
+        check(order[index] >= 0, "boot.py 里必须调用 %s" % name)
+    check(order == sorted(order),
+          "boot.py 的调用顺序必须是 make_safe → capture → record_boot")
+    check("except Exception" in src,
+          "boot.py 必须兜住所有异常，不能因为自检失败而挡住启动")
+
+
+def test_reset_cause_is_captured_and_reported():
+    """复位原因是诊断"一直重启"的唯一依据，必须能识别并且能序列化给网页"""
+    import reset_info
+    import ujson
+
+    machine.reset()
+    name = reset_info.capture()
+
+    check(isinstance(name, str) and name, "capture() 必须返回一个非空名字")
+    check(isinstance(reset_info.CAUSE_DESC, str) and reset_info.CAUSE_DESC,
+          "每种复位原因都要有中文解释")
+
+    info = reset_info.summary()
+    for key in ("cause", "cause_desc", "boot_count", "uptime_ms", "power_suspect"):
+        check(key in info, "summary() 缺少字段 %s" % key)
+    ujson.dumps(info)               # 序列化失败会让 /status 直接 500
+
+
+def test_boot_count_increments_and_clears():
+    """★ 启动计数必须能累加、能清零 —— 数字疯涨就是复位循环的铁证"""
+    import reset_info
+    import tempfile
+
+    path = os.path.join(tempfile.gettempdir(), "ams_boot_stat_test.json")
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+
+    try:
+        reset_info.record_boot(path)
+        reset_info.record_boot(path)
+        check_eq(reset_info.record_boot(path), 3, "连续三次启动应该记到 3")
+        reset_info.clear_boot_count(path)
+        check_eq(reset_info.BOOT_COUNT, 0, "清零后计数应为 0")
+        check_eq(reset_info.record_boot(path), 1, "清零后再启动应该从 1 重新开始")
+    finally:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+
+def test_status_exposes_reset_diagnostics():
+    """★ 网页必须能看到复位原因和启动次数
+
+    否则"接上负载就一直重启"只能靠猜：是电源塌了（欠压复位）
+    还是引脚接错（每次都是冷启动），两种处理方式完全不同。
+    """
+    from AMS_WEB import AMS_WEB
+
+    app = AMS_WEB()
+    info = app._status_dict()
+
+    check("reset" in info, "/status 缺少 reset 字段")
+    check("boot_safety" in info, "/status 缺少 boot_safety 字段")
+
+    for key in ("cause", "cause_desc", "boot_count", "uptime_ms", "power_suspect"):
+        check(key in info["reset"], "reset 缺少字段 %s" % key)
+    for key in ("ok", "report", "problems"):
+        check(key in info["boot_safety"], "boot_safety 缺少字段 %s" % key)
+
+
+def test_led_can_be_disabled():
+    """LED_PIN 设成 None 时必须优雅跳过（GPIO2 是 strapping 脚，要能彻底让出来）"""
+    import inspect
+    import AMS_WEB as web_module
+
+    saved = web_module.LED_PIN
+    try:
+        web_module.LED_PIN = None
+        app = web_module.AMS_WEB()
+        check_eq(app.LED, None, "LED_PIN 为 None 时不应创建 PWM 对象")
+    finally:
+        web_module.LED_PIN = saved
+
+    src = inspect.getsource(web_module.AMS_WEB.status_lED)
+    check("self.LED is None" in src,
+          "status_lED 必须先判断 LED 是否为 None，否则会 AttributeError")
+
+
+def test_web_status_stays_serialisable_with_diagnostics():
+    """加了诊断字段之后，/status 仍然要能被 ujson 序列化"""
+    import ujson
+    from AMS_WEB import AMS_WEB
+
+    app = AMS_WEB()
+    text = ujson.dumps(app._status_dict())
+    check("boot_safety" in text and "reset" in text,
+          "序列化结果里应该能看到诊断字段")
+
+
+# ===========================================================================
 # 运行
 # ===========================================================================
 CASES = [v for k, v in sorted(globals().items()) if k.startswith("test_")]

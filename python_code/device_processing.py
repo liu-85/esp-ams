@@ -48,11 +48,13 @@ from hardware_config import (
     MOTOR_PIN_IN1,
     MOTOR_PIN_IN2,
     MOTOR_DEAD_TIME_MS,
+    MOTOR_BOOT_SETTLE_MS,
     CLUTCH_PINS,
     CLUTCH_ACTIVE_LEVEL,
     CLUTCH_ENGAGE_MS,
     CLUTCH_RELEASE_MS,
     CLUTCH_SETTLE_MS,
+    boot_safety_report,
 )
 from motor_clutch import (
     HBridgeMotor,
@@ -131,12 +133,43 @@ class stepping_motor_28BYJ48:
 # 二、硬件构建工厂
 # ==========================================================================
 
+# 上电引脚自检的结果，供网页显示（build_motor_bus() 里填充）
+BOOT_SAFETY = {
+    "ok": True,
+    "report": "",
+    "problems": [],
+}
+
 
 def build_motor_bus():
     """按 hardware_config.py 的配置创建"共享电机 + 4 路电磁离合"总线。
 
     ⚠️ 上电时会确保所有离合都处于断开状态，绝不会出现两路同时吸合。
+
+    另外这里还会做两件和"接上负载就重启"直接相关的事：
+        1. 先跑一遍引脚安全自检（strapping 脚不能当输出用），结果打到串口
+           并且存进 BOOT_SAFETY，网页上也能看到；
+        2. 等 MOTOR_BOOT_SETTLE_MS 毫秒再挂 H 桥 —— 上电瞬间电机/离合的
+           浪涌最容易把 3.3V 拉塌，而 ESP32-C3 一旦欠压就复位。
     """
+    ok, report = boot_safety_report()
+    # 用 update 原地修改，不要重新赋值 —— 网页那边 import 的是同一个字典对象
+    BOOT_SAFETY.update({
+        "ok": ok,
+        "report": report,
+        "problems": [] if ok else [
+            line.strip() for line in report.split("\n") if line.strip().startswith("×")
+        ],
+    })
+    logout(report)
+    if not ok:
+        logout("!! 引脚配置有问题，硬件仍会被创建（好让你能打开网页看诊断），"
+               "但请立刻按上面的提示改接线！")
+
+    # 等电源稳定：欠压复位最常见的触发点就是"上电后立刻驱动负载"
+    if MOTOR_BOOT_SETTLE_MS and MOTOR_BOOT_SETTLE_MS > 0:
+        time.sleep_ms(MOTOR_BOOT_SETTLE_MS)
+
     motor = HBridgeMotor(MOTOR_PIN_IN1, MOTOR_PIN_IN2,
                          dead_time_ms=MOTOR_DEAD_TIME_MS,
                          name="filament_motor")
