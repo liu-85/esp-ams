@@ -75,8 +75,23 @@ class network_model:
 
         self.wlan_ap = network.WLAN(network.AP_IF)   # 热点模式
         self.wlan_sta = network.WLAN(network.STA_IF)  # 连接路由器的模式
-        self.wlan_ap.active(False)
-        self.wlan_sta.active(False)
+
+        # ★★ 这里**故意不**再把两个口 active(False) 关一遍！★★
+        #
+        # 以前这里是有的，看着像是"先归零再开始"，实际是个定时炸弹：
+        # main.py 已经在堆还没碎的时候把 WiFi 拉起来了（STA 或热点），
+        # 而 AMS_WEB → AMS → Bambu_mqtt_cliet → network_model 这条继承链
+        # 会在 main_task 里再跑一次本 __init__，于是刚开好的热点/刚连上的
+        # 路由器被当场关掉。
+        #
+        # 关掉之后谁再想开回来（main_task 的 swcith_ap(1)、网页上的"打开热点"
+        # 按钮），就得调用 esp_wifi_start() 重新申请一大块**连续**内存 ——
+        # 而那时堆已经被应用切碎了（实测空闲还有 64KB，最大连续块只剩 3,584
+        # 字节），结果不是报异常，是**直接硬复位**：没有 traceback、没有
+        # panic，串口上只看得到 HARD_RESET，板子每 3.3 秒重启一轮。
+        #
+        # 一句话：WiFi 的"起"归 main.py 管，这里只读取状态，不许关。
+        # （关热点的正经入口仍然保留：swcith_ap(0)，配网成功后会用它。）
 
         # 扫描结果缓存
         self._scan_cache = []
@@ -91,12 +106,35 @@ class network_model:
         （方法名保留老拼写，避免调用方改动；新代码也可以用 switch_ap）
         """
         if status:
-            self.wlan_ap.active(True)
-            self.wlan_ap.config(essid=self.ap_ssid,
-                                password=self.ap_password,
-                                authmode=self.ap_authmode)
-            logout("配置热点已打开: " + self.ap_ssid + "  密码: " + self.ap_password)
-            logout("手机连上热点后，浏览器打开 http://192.168.4.1 配网")
+            if self.wlan_ap.active():
+                # ★★ 已经开好了就千万别再 config() 一遍！★★
+                #
+                # 实测（板子串口，堆已被应用切碎、free=56872）：
+                #   ap.active()                -> True（热点确实在跑）
+                #   ap.ifconfig()              -> ('192.168.4.1', ...) 正常
+                #   ap.active(True) 再来一次   -> OK（早就是 no-op，不重新申请内存）
+                #   ap.config(essid=...)       -> RuntimeError 0x0101
+                #   ap.config(password=...)    -> RuntimeError 0x0101
+                #   ap.config(authmode=...)    -> RuntimeError 0x0101
+                # 也就是说 esp_wifi_set_config() 在碎堆上**必定**失败（0x0101 =
+                # ESP_ERR_NO_MEM），跟传哪个参数无关。而 main_task 里这一次调用
+                # 只是把早已生效的 SSID/密码再下发一遍 —— 纯多余，却能把整个
+                # 启动流程打断（异常从 main_task 冒泡出来，板子停在 REPL）。
+                #
+                # 所以：热点"起"这件事只做一次，谁先起算谁的，后来者只认状态。
+                logout("配置热点已在运行: " + self.ap_ssid)
+            else:
+                self.wlan_ap.active(True)
+                try:
+                    self.wlan_ap.config(essid=self.ap_ssid,
+                                        password=self.ap_password,
+                                        authmode=self.ap_authmode)
+                except Exception as _cfg_error:
+                    # 真没开起来的时候才需要下发参数；万一这时内存不够，也别让
+                    # 整条启动链断在这里，用驱动默认参数继续（热点照样能出来）。
+                    logout("热点参数下发失败，用默认参数继续: %r" % (_cfg_error,))
+                logout("配置热点已打开: " + self.ap_ssid + "  密码: " + self.ap_password)
+                logout("手机连上热点后，浏览器打开 http://192.168.4.1 配网")
         else:
             self.wlan_ap.active(False)
             logout("配置热点已关闭")

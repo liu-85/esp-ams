@@ -104,7 +104,11 @@ INDEX_FILE = "index.html"
 # ---------------------------------------------------------------------------
 # Web 服务参数
 # ---------------------------------------------------------------------------
-WEB_PORT = 80
+# ★ WEB_PORT / LISTEN_BACKLOG 定义在 boot_resources.py，不在本文件：
+#   main.py 要在加载应用之前（堆还干净时）按这两个值把监听 socket 预建好，
+#   所以它俩必须由一个"很轻、不依赖本文件"的模块来提供。
+#   原因见 boot_resources.py 和 main.py 第 0.6 步。
+from boot_resources import WEB_PORT, LISTEN_BACKLOG
 WEB_POLL_MS = 20            # accept 轮询间隔；越小网页响应越快，20ms 兼顾性能与开销
 HEADER_WAIT_MS = 600        # 读请求头的**最长等待**；浏览器预连接会空等，不能设太长
 # ★ 浏览器"预连接"套接字连上之后什么都不发，如果每个都白等 HEADER_WAIT_MS，
@@ -125,7 +129,7 @@ WEB_WORKERS = 3
 # ★ 监听队列长度。旧值是 2 —— 浏览器一次开 6 个连接，多出来的 SYN 会被
 #   内核直接丢掉，由浏览器按 TCP 退避重试（1s→2s→4s…），
 #   表现就是"刷新也不打不开、要刷好几次"。给足 8 个。
-LISTEN_BACKLOG = 8
+#   （常量的值在 boot_resources.py 里，上面 import 进来的）
 SEND_CHUNK = 2048           # 内存里已有的二进制响应分片发送的块大小
 # ★ 字符串响应是"切块 → 逐块 encode"发出去的，这是单块字符数。
 #   512 个中文字符最多 1.5 KB，保证不会一次要一大块连续内存。
@@ -1215,16 +1219,27 @@ class AMS_WEB(AMS):
           浏览器多开的连接会被内核直接丢掉 SYN，由浏览器按 TCP 退避
           （1s→2s→4s…）重试 —— 那正是"几十秒后才有反应"的另一个来源。
         """
-        addr = socket.getaddrinfo("0.0.0.0", port)[0][-1]
-        self.server_socket = socket.socket()
-        # 快速重启时避免 "Address in use"
-        try:
-            self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        except Exception:
-            pass
-        self.server_socket.bind(addr)
-        self.server_socket.listen(LISTEN_BACKLOG)
-        self.server_socket.setblocking(False)
+        # ★ 监听 socket 是 main.py 在加载应用之前就建好的（boot_resources）
+        #   —— 必须趁堆还干净，否则这里一调 socket.socket() 就是
+        #   OSError(105)、getaddrinfo 就是 OSError(-203)，Web 服务直接起不来。
+        #   拿不到（比如从 REPL 直接跑本函数）才退化成现场创建。
+        import boot_resources
+
+        self.server_socket = boot_resources.take_web_server()
+        addr = ("0.0.0.0", port)
+        if self.server_socket is None:
+            addr = socket.getaddrinfo("0.0.0.0", port)[0][-1]
+            self.server_socket = socket.socket()
+            # 快速重启时避免 "Address in use"
+            try:
+                self.server_socket.setsockopt(socket.SOL_SOCKET,
+                                              socket.SO_REUSEADDR, 1)
+            except Exception:
+                pass
+            self.server_socket.bind(addr)
+            self.server_socket.listen(LISTEN_BACKLOG)
+            self.server_socket.setblocking(False)
+            logout("Web 监听 socket 是现场建的（启动阶段没预建成功）")
         logout("Web 服务已启动，监听 %s:%d（%d 个 worker）"
                % (addr[0], port, WEB_WORKERS))
         logout("连上同一网络后用浏览器访问 http://%s 或 http://192.168.4.1" % addr[0])
