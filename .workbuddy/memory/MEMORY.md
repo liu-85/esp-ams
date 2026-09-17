@@ -2,20 +2,61 @@
 
 ## 项目定位
 
-适配拓竹（Bambu Lab）打印机的 AMS 自动换料系统，ESP32-C3 + MicroPython。
+适配拓竹（Bambu Lab）打印机的 AMS 自动换料系统，ESP32-C3 / **ESP32-S3（42 针）**
+双平台 + MicroPython。
 上游是 YBA-AMS，本项目主要差异是执行机构改为「1 个共享直流电机 + 4 路电磁离合」。
 GitHub: https://github.com/liu-85/esp-ams （remote origin，main 分支）
 
+## 双开发板架构【重要：改引脚前先读这一段】
+
+同一套业务代码 + **两套引脚表** + 编译期写死板型。
+
+- `python_code/board_c3.py` / `board_s3.py`：只描述"这块芯片哪些脚能用"
+  （默认接线 / 保留脚 / strapping / SAFE_OUTPUT_PINS / SPARE_PINS）。**改接线改这里**
+- `python_code/hardware_config.py`：选板型 + 业务参数（时序、降级时长）+ 上电自检，
+  导出全部引脚常量。上层代码只写 `from hardware_config import MOTOR_PIN_IN1`，一行不改
+- `python_code/board_select.py`：**构建产物，不进 git**，内容就一行 `BOARD = "c3"/"s3"/"auto"`
+- `board_override.py`：可选现场覆盖文件（板子上放一个即可改引脚，不进 git）
+
+板型优先级：编译期 board_select.py > board_override.py > `os.uname().machine`
+（认不出按 C3 处理并提示）。
+
+引脚差异（其余相同）：
+| | 电机 | 离合 1~4 | 状态灯 |
+|---|---|---|---|
+| C3（GPIO 上限 21） | 4/5 | 6, 7, 10, **3**（3 是 strapping，带病运行） | 2 |
+| S3（GPIO 上限 48） | 4/5 | 6, 7, 8, 9（**全干净**） | 2 |
+
+S3 剩余可用 IO（未装到位开关时）：**18 只干净脚**
+`1,10,11,12,13,14,15,16,17,18,21,38,39,40,41,42,47,48`
++ 4 只空闲 strapping 脚 `0,3,45,46`。S3 保留脚：19/20(USB)、26~32(Flash)、
+33~37(八线 PSRAM)、43/44(UART0)。S3 的 strapping：0/3/45/46。
+
+**为什么推荐 S3**：C3 只有 400KB SRAM，应用加载后空闲堆仅约 60KB，
+WiFi 驱动收发要申请**连续**缓冲 → 传 40KB+ 的 index.html 会 `OSError(113)`、
+射频卡死只能复位（见下）。加 OTA 后应用变大，问题从「偶发」变「必然」。
+
+
 ## 硬件约定
 
-- 共享电机 H 桥：IN1=GPIO4 方向 1 进料，IN2=GPIO5 方向 -1 退料
-- 电磁离合 1~4：GPIO6 / GPIO7 / GPIO10 / GPIO3，高电平吸合
-- 状态 LED：GPIO2
+- **具体引脚号在 `board_c3.py` / `board_s3.py` 里，不在 hardware_config.py**
+  （hardware_config 只负责选板型 + 业务参数）
+- 共享电机 H 桥：IN1=GPIO4 方向 1 进料，IN2=GPIO5 方向 -1 退料（两块板相同）
+- 电磁离合 1~4：C3 = 6/7/10/3，S3 = 6/7/8/9，高电平吸合
+- 状态 LED：GPIO2（两块板相同）
 - **硬性约束：任何时刻最多 1 路电磁离合吸合**，由
   `motor_clutch.FilamentMotorBus` 四重机制强制（前置断开 / 吸合前复核 /
   直接调用拦截 / 运行期 assert_single）
 - ESP32-C3 禁用引脚：11~17（内置 Flash）、18/19（USB）、20/21（UART0）；
   2/8/9 是 strapping，谨慎使用
+- **WiFi 必须关省电**：ESP32 默认 `pm=1`（modem sleep），持续传输时会周期性
+  休眠 → STA 掉线（串口报 `ECONNABORTED` / `ECONNRESET`），表现是"网页传一半
+  就断"。main.py 第 0 步与 network_model.__init__ 都已 `sta/ap.config(pm=0)`，
+  而且**必须在干净堆上做**（它动 WiFi 配置，同 swcith_ap 那类 0x0101 陷阱）。
+- **C3 传大文件会失败是内存问题，不是网络问题**：应用加载后空闲堆仅约 60KB，
+  WiFi 驱动要申请**连续**缓冲 → `OSError(113)`（EHOSTUNREACH）→ 重传约 9 秒
+  放弃 → 射频卡死只能复位。ping 通、TCP 连不上就是这个症状。
+  **根治办法是换 ESP32-S3**；C3 上只能靠 .mpy 省内存勉强跑。
 - **WiFi 驱动必须抢在应用加载之前初始化**：`network.WLAN()` 第一次调用
   要一次性申请约 24KB **连续**堆；应用 import 之后堆碎片化就抢不到，
   报 `Wifi Unknown Error 0x0101`（= ESP_ERR_NO_MEM，在错误表外）。
@@ -83,25 +124,45 @@ main.py 的阶段划分就是这条规则的产物，不要在中间插 import�
 ## 常用命令
 
 ```bash
-python tests/run_tests.py      # 桌面自测，无需板子（当前 116 项）
-python tools/build_mpy.py      # mpy-cross 交叉编译 + 打包，产物 dist/ 与 esp32c3-ams-mpy.zip
-python tools/make_firmware_bin.py   # 生成单文件一键烧录固件 dist/esp32c3-ams-firmware.bin
+python tests/run_tests.py      # 桌面自测，无需板子（当前 124 项）
+python tools/build_mpy.py      # 默认 --board both：两块板各一个包（dist/c3、dist/s3）
+python tools/build_mpy.py --board c3|s3|auto   # 只编一个板型
+python tools/make_firmware_bin.py --board c3|s3 --chip esp32c3|esp32s3 \
+    --firmware-url <官方固件> --out dist/<芯片>-ams-firmware.bin
+python tools/make_update_pack.py [--board keep|c3|s3|auto]   # 网页 OTA 的 .ams 包
 ```
 
 `mpy-cross` 版本必须与板子固件一致，当前 CI 用 1.23.0（mpy v6.3）。
+本机已装在隔离环境
+`C:\Users\lkfcs\.workbuddy\binaries\python\envs\default\Scripts\python.exe`，
+用这个解释器跑构建/自测。**本机没有 gcc**，单文件固件只能在 CI 里出。
+
+官方固件缓存于 `dist/_cache/`。两个芯片的 vfs 分区都是 `0x200000` 起，
+但大小不同：**C3 = 2MB（整片 4MB）**，**S3 = 6MB（整片 8MB）**。
+→ **S3 单文件固件必须烧在 8MB 及以上 Flash 的模组**（N8R8 / N16R8 满足）。
+S3 官方固件 `ESP32_GENERIC_S3-20240602-v1.23.0.bin`
+SHA256 `b91080af2e9b78bad4308f98bb6187567cae24ed77cd7f48ef99b47af3ef0555`；
+C3 那份是 `8058b7d6eb55f8124fbdcc797e2e8b39ae947a18df635567e02c8786874c04fd`。
+分区表由脚本从官方固件里解析，不写死偏移。
+
 
 ## 单文件固件（一键烧录）约定【重要】
 
-- 产物 `dist/esp32c3-ams-firmware.bin` = 官方固件(0x0) + littlefs 镜像(0x200000)，
-  共 4MB，`esptool write_flash 0x0` 一把烧完，设备开机即跑。
-- **文件系统必须是 littlefs**：C3 v1.23.0 的 `vfs` 分区 subtype 虽标 0x81，
+- 产物 `dist/<芯片>-ams-firmware.bin` = 官方固件(0x0) + littlefs 镜像(0x200000)，
+  C3 共 4MB、S3 共 8MB，`esptool write_flash 0x0` 一把烧完，设备开机即跑。
+- 构建时会**先把源码拷到 `dist/_work/src-<board>/` 暂存目录**，在那里写入
+  按板型生成的 `board_select.py`，再打包 —— 不往版本库的 python_code/ 写生成物。
+- **文件系统必须是 littlefs**：v1.23.0 的 `vfs` 分区 subtype 虽标 0x81，
   实际由 `flashbdev.py` + `inisetup.py` 走 `VfsLfs2`。镜像 block0/1 的
   offset 8 必须有 `"littlefs"` 魔数，否则 `_boot.py` 挂载失败 → 死循环报
   "filesystem appears to be corrupted"。
 - **镜像必须用与设备同源的 littlefs 2.8.0 生成**（`tools/lfs_mkfs.c` 链接
   上游源码），不要用 pip 的 littlefs-python 直接生成（它带 2.11，有小文件
   inline 特性，存在兼容风险；只用于反向校验）。
-- 升级 MicroPython 时**五个变量必须同步**：`MICROPYTHON_VERSION`、
-  `LITTLEFS_VERSION`、`MPY_CROSS_VERSION`、固件下载 URL、固件 SHA256。
+- 升级 MicroPython 时**这些必须同步**：`MICROPYTHON_VERSION`、
+  `LITTLEFS_VERSION`、`MPY_CROSS_VERSION`，以及 **CI 里 firmware job 的
+  matrix**（两块板各自的固件 URL + SHA256）。
 - CI：push 任意分支/ tag 即触发；push main 更新滚动 `latest` 预发布，
-  打 `v*` tag 发正式 Release。产物：`.mpy` 压缩包 + 单个固件 BIN。
+  打 `v*` tag 发正式 Release。产物：**两块板各自的** `.mpy` 压缩包 + 固件 BIN。
+- `.mpy` 包与固件都带 `board_select.py`，两个通道用同一个约定，不会配置不一致。
+
