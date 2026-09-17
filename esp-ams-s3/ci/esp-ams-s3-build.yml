@@ -1,0 +1,136 @@
+# =============================================================================
+# ESP-AMS-S3 的构建校验流水线 —— 已挪到正式位置并启用
+# =============================================================================
+#
+# 这份文件原先暂存在 esp-ams-s3/ci/，因为当时用的**细粒度 PAT** 没有
+# 「Workflows: Read and write」权限：推 .github/workflows/ 下的新增会被拒绝，
+# 而且那个拒绝会连坐整条分支（只要分支上挂着这样的提交，后续推送全部失败）。
+#
+# 以后要是又推不上去，记住两件事：
+#   · 细粒度 PAT 补的是 Settings → Developer settings → Personal access tokens
+#     → Fine-grained tokens → 选该 token → Repository permissions →
+#     Workflows: Read and write
+#   · ★ 改权限**不会改变 token 的值**，凭据管理器里缓存的那份补完权限直接可用，
+#     不需要重新登录 —— 只要再推一次。
+#
+# ---------------------------------------------------------------------------
+
+name: ESP-AMS-S3 构建校验（ESP-IDF）
+
+# =============================================================================
+# 这个流水线只干一件事：**回答"esp-ams-s3 这份 C 代码到底编不编得过"**。
+#
+# 为什么单独开一个文件、而不是加进上面的 MicroPython 流水线：
+#   · 两者互不干扰 —— MicroPython 那边推新版 MicroPython 时不会被 ESP-IDF
+#     的构建拖慢，反过来也一样
+#   · 只有动过 esp-ams-s3/ 的提交才会触发，不会白烧 CI 时间
+#   · 这里**不发布任何产物**，编过就是通过，编不过就把错误原样贴出来
+#
+# 背景：开发机上没有装 ESP-IDF 工具链，本地能做到的极限是
+#   python esp-ams-s3/tools/lint_c.py esp-ams-s3   ← 只做静态判据
+# "接不接得上 IDF 的 API、签名对不对"这类问题它看不出来。所以这里必须有一次
+# 真正的 idf.py build。第一次跑大概率会报错 —— 那正是它的价值所在。
+# =============================================================================
+
+on:
+  push:
+    paths:
+      - 'esp-ams-s3/**'
+      - '.github/workflows/esp-ams-s3-build.yml'
+  pull_request:
+    paths:
+      - 'esp-ams-s3/**'
+      - '.github/workflows/esp-ams-s3-build.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: esp-ams-s3-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # ★ 换 ESP-IDF 版本时改这一行。
+  #   本项目用的是 v5.x 的 API（esp_chip_info()、OTA_SIZE_UNKNOWN、
+  #   esp_mqtt_client_config_t 的嵌套写法），**不能降到 v4.x** ——
+  #   v4 上 esp_mqtt_client_config_t 还是扁平字段，会直接编译失败。
+  IDF_VERSION: "v5.3.2"
+  IDF_CHIP: "esp32s3"
+
+jobs:
+  idf-build:
+    name: idf.py build（esp32s3）
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 拉取代码
+        uses: actions/checkout@v4
+
+      - name: 准备 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      # -----------------------------------------------------------------
+      # 第一关：静态检查。不装工具链、几秒钟出结果，失败得最快。
+      #   先跑 --selftest 验证"判据本身没坏"，再扫代码 ——
+      #   否则判据一旦失效，扫描会一路报"0 处可疑点"，比报错更危险。
+      # -----------------------------------------------------------------
+      - name: 检查静态判据本身是否可靠
+        run: python esp-ams-s3/tools/lint_c.py --selftest
+
+      - name: 扫描 esp-ams-s3 源码
+        working-directory: esp-ams-s3
+        run: python tools/lint_c.py .
+
+      # -----------------------------------------------------------------
+      # 第二关：真编译。用官方 Docker 镜像，省掉在 runner 上装工具链的十分钟。
+      #   action 会把 IDF_TARGET 设成 esp32s3，idf.py 在没有 sdkconfig 时会
+      #   按这个目标自动生成，然后吃 sdkconfig.defaults 里的默认值。
+      # -----------------------------------------------------------------
+      - name: idf.py build
+        uses: espressif/esp-idf-ci-action@v1
+        with:
+          esp_idf_version: ${{ env.IDF_VERSION }}
+          target: ${{ env.IDF_CHIP }}
+          path: 'esp-ams-s3'
+          command: 'idf.py build'
+
+      # -----------------------------------------------------------------
+      # 编译过了再看一眼体积。ota_0 分区是 0x1f0000 = 2031616 字节，
+      # 应用超过它会在烧录时失败，所以这里顺带卡一道（超了就让 CI 红）。
+      # -----------------------------------------------------------------
+      - name: 检查固件体积是否放得下 OTA 分区
+        run: |
+          set -e
+          BIN=esp-ams-s3/build/esp-ams-s3.bin
+          LIMIT=2031616
+          SIZE=$(stat -c %s "$BIN")
+          echo "应用体积: $SIZE 字节 / 分区上限 $LIMIT 字节"
+          {
+            echo "### ESP-AMS-S3 构建结果"
+            echo ""
+            echo "| 项 | 值 |"
+            echo "| --- | --- |"
+            echo "| ESP-IDF | \`${IDF_VERSION}\` |"
+            echo "| 目标芯片 | \`${IDF_CHIP}\` |"
+            echo "| 应用体积 | ${SIZE} 字节 |"
+            echo "| ota_0 分区上限 | ${LIMIT} 字节 |"
+            echo "| 余量 | $((LIMIT - SIZE)) 字节 |"
+            echo ""
+            echo "烧录: \`idf.py -p COM3 flash monitor\`（工程目录 esp-ams-s3/）"
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ "$SIZE" -gt "$LIMIT" ]; then
+            echo "::error::应用 ${SIZE} 字节超过 ota_0 分区上限 ${LIMIT} 字节，需要缩小或改 partitions.csv"
+            exit 1
+          fi
+
+      - name: 上传固件产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: esp-ams-s3-firmware-${{ github.sha }}
+          path: |
+            esp-ams-s3/build/esp-ams-s3.bin
+            esp-ams-s3/build/bootloader/bootloader.bin
+            esp-ams-s3/build/partition_table/partition-table.bin
+            esp-ams-s3/build/ota_data_initial.bin
+            esp-ams-s3/build/flasher_args.json
+          retention-days: 30
