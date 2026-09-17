@@ -16,6 +16,11 @@ GitHub: https://github.com/liu-85/esp-ams （remote origin，main 分支）
   直接调用拦截 / 运行期 assert_single）
 - ESP32-C3 禁用引脚：11~17（内置 Flash）、18/19（USB）、20/21（UART0）；
   2/8/9 是 strapping，谨慎使用
+- **WiFi 驱动必须抢在应用加载之前初始化**：`network.WLAN()` 第一次调用
+  要一次性申请约 24KB **连续**堆；应用 import 之后堆碎片化就抢不到，
+  报 `Wifi Unknown Error 0x0101`（= ESP_ERR_NO_MEM，在错误表外）。
+  main.py 顶部已前置 `WLAN(AP_IF)+WLAN(STA_IF)`，之后再调只花 16 字节
+  （对象复用）。**往 main.py 前面加 import 时，别把这段挪到后面。**
 
 ## 代码约定
 
