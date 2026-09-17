@@ -34,7 +34,13 @@ if ($SSID -eq '') {
 }
 if ($Password -eq '') {
     $raw = (netsh wlan show profile name=$SSID key=clear 2>&1 | Out-String)
-    $m = [regex]::Match($raw, '(?:Key Content|关键内容)\s*:\s*(\S+)')
+    # The label in front of the password is localised ("Key Content" on an English
+    # Windows, a 4-character Chinese label on a Chinese one). Do NOT paste that
+    # label as a literal: this file is UTF-8 without BOM and Windows PowerShell
+    # 5.1 reads it as GBK, which silently corrupts any non-ASCII literal and makes
+    # the match fail. Build the pattern from codepoints instead -- stays ASCII.
+    $keyLabel = [string][char]0x5173 + [string][char]0x952E + [string][char]0x5185 + [string][char]0x5BB9
+    $m = [regex]::Match($raw, "(?:Key Content|$keyLabel)\s*:\s*(\S+)")
     if (-not $m.Success) { $m = [regex]::Match($raw, 'Content\s*:\s*(\S+)') }
     if ($m.Success) {
         $Password = $m.Groups[1].Value
@@ -51,7 +57,7 @@ $sp = New-Object System.IO.Ports.SerialPort $Port, $Baud, 'None', 8, 'One'
 $sp.ReadTimeout = 300
 $sp.ReadBufferSize = 262144
 $sp.Encoding = [System.Text.Encoding]::UTF8
-$sp.DtrEnable = $false
+$sp.DtrEnable = $false   # provisional; Get-Repl below picks the right state
 $sp.RtsEnable = $false
 try { $sp.Open() } catch { "OPEN_FAIL: " + $_.Exception.Message | Out-File $out -Encoding utf8; exit 1 }
 
@@ -68,11 +74,43 @@ function Send([string]$line) { $sp.Write($line + "`r"); Start-Sleep -Millisecond
 
 $log = @()
 
-# get a clean REPL (Ctrl-C spam, then paste mode)
-$e = (Get-Date).AddSeconds(3)
-while ((Get-Date) -lt $e) { $sp.Write([char]3); Start-Sleep -Milliseconds 30 }
-Start-Sleep -Milliseconds 400
-Drain 800 | Out-Null
+# ---------------------------------------------------------------------------
+# Get a clean REPL -- but first find out which DTR state this board needs.
+#
+#   * Board wired through a USB-UART bridge (CH340 / CP210x): the REPL is on
+#     UART0 and DTR must stay LOW. Driving DTR/RTS asserts the auto-reset
+#     circuit, so a wrong guess can even hold the chip in reset.
+#   * Board using the chip's OWN USB (ESP32-S3 / -S2 native CDC): the REPL is
+#     gated on the host asserting DTR. With DTR low the port opens perfectly
+#     and then stays completely silent -- looks exactly like a dead board.
+#
+#   So try DTR low first, and only retry with DTR high when nothing comes back.
+# ---------------------------------------------------------------------------
+function Get-Repl([bool]$dtr) {
+    $sp.DtrEnable = $dtr
+    Start-Sleep -Milliseconds 200
+    $e = (Get-Date).AddSeconds(2.5)
+    while ((Get-Date) -lt $e) { $sp.Write([char]3); Start-Sleep -Milliseconds 30 }
+    Start-Sleep -Milliseconds 400
+    return (Drain 1000)
+}
+
+$banner = Get-Repl $false
+if ($banner -notmatch '>>>') {
+    $log += "DTR_LOW_SILENT -> retrying with DTR asserted (chip-native USB)"
+    $banner = Get-Repl $true
+    if ($banner -notmatch '>>>') {
+        $log += "NO_REPL in either DTR state. Raw dump:"
+        $log += $banner
+        $sp.Close(); $sp.Dispose()
+        ($log -join "`r`n") | Out-File $out -Encoding utf8
+        exit 4
+    }
+    $log += "DTR_HIGH_OK"
+} else {
+    $log += "DTR_LOW_OK"
+}
+$sp.DiscardInBuffer()
 
 $sp.Write([char]5); Start-Sleep -Milliseconds 250; Drain 400 | Out-Null
 Send 'import info_load'
@@ -85,9 +123,15 @@ $log += "=== WRITE wifi.dat ==="
 $log += (Drain 6000)
 
 if (-not $NoReboot) {
-    $sp.RtsEnable = $true
-    Start-Sleep -Milliseconds 150
-    $sp.RtsEnable = $false
+    # Soft reboot from the REPL (Ctrl-D).
+    # Preferred over pulsing RTS: a board whose REPL lives on the chip's OWN USB
+    # has no reset line wired to RTS at all, so the old RTS pulse silently left
+    # such boards running the old firmware and the freshly written wifi.dat was
+    # never picked up. Ctrl-D also keeps the same COM port open, so the whole
+    # boot log can be captured right here.
+    $sp.DiscardInBuffer()
+    $sp.Write([char]4)
+    Start-Sleep -Milliseconds 500
 
     $sw = [System.Diagnostics.Stopwatch]::StartNew()
     $sb = New-Object System.Text.StringBuilder

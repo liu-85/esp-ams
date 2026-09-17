@@ -103,23 +103,66 @@ main.py 的阶段划分就是这条规则的产物，不要在中间插 import�
   → **不要手动插拔料盘**，否则记录与实际不一致
 - 送料按时间推进，`NO_LIMIT_LOAD_MS` / `NO_LIMIT_RETRACT_MS` 需实测调整
 
-## 已知硬件问题：AP 热点发不出信号（2026-09-17 确诊，软件无解）
+## AP 热点：已实测证明**设备侧完全正常**（2026-09-17 21:19 推翻旧结论）
 
-- 现象：启动日志一切正常（`配置热点已打开: AMS_WIFI`，0.57s 就起来），
-  但**任何客户端都搜不到这个热点**。软件状态全对（active/essid/authmode/
-  channel/hidden/ifconfig 都对），就是不发 beacon。
-- 已排除（都实测过）：应用代码、**整片 erase_flash 后只烧官方纯净固件**
-  依然如此；擦 NVS + phy_init 无效；开放/WPA2、config 前后顺序、信道
-  1/6/11、TX 功率降到 2dBm 全部无效；eFuse 正常。
-- 对照组（说明射频本身是好的）：关掉 AP 后 STA `scan()` 能扫到 14 个网
-  （最近的 -40dBm），STA 也能连上路由器拿 IP。
-- 旁证：`ap.config(channel=6)` 之后 `ap.config("channel")` 永远读回 1，
-  说明 AP 的射频层根本没真正起来，只是 `active(True)` 没报错。
-- 结论：板子射频发射侧（天线/PA/供电）有问题。**排查方向：手机贴 10cm
-  搜 → 换 USB 口/短线/外接 5V → 看模块是否有 IPEX 座没插天线 → 换模块。**
-  项目自带的 boot.py 自检一直提示"欠压复位"，供电嫌疑最大。
-- 绕行方案：`tools/serial_provision.ps1` —— 串口直写 wifi.dat 配网，
-  让板子走 STA 连路由器，不依赖热点。
+⛔ **旧结论「射频发射侧坏了 / 天线 / 欠压」是错的，已作废**（那段曾写在
+本文件里）。当时是拿"板子自己扫不到自己的热点"和 `ap.config('channel')`
+读回 1 当证据 —— 两条都是**无效证据**：
+
+1. **APSTA 模式下 `sta.scan()` 扫不到自己的 SoftAP**（实测 `SELF_SEEN 0`，
+   而同一时刻电脑网卡扫到它 99%）。所以"板子扫不到自己"什么都证明不了。
+2. `config('channel')` 读回 1 也不是故障。翻了板子那版 MicroPython 1.23.0 的
+   `ports/esp32/network_wlan.c`：读 channel 走的是**实时** `esp_wifi_get_channel()`，
+   写 channel 走 `esp_wifi_set_channel()`。信道 1 就是 AP 默认值，而且它工作正常。
+   → 这条只能说明"set_channel 没改成 6"，不能说明"射频没起来"。
+3. 另一个逻辑硬伤：STA 能关联路由器拿 IP **本身就必须发帧**，"发射坏了"和它矛盾。
+
+### ★ 判决性做法：用**独立射频**（电脑网卡）扫，别信板子自己的说法
+
+```powershell
+netsh wlan show networks mode=bssid   # 找 AMS_WIFI，看 信号/信道/BSSID
+```
+
+实测（ESP32-S3，板子日志 `配置热点已打开: AMS_WIFI`）：
+
+```
+SSID 1 : AMS_WIFI   WPA2-个人  CCMP   BSSID b4:3a:45:a6:09:b9
+        信号 99%   2.4GHz   信道 1
+```
+
+BSSID 与板子自报 MAC 一致（板子打印成 `b'\xb4:E\xa6\t\xb9'`，`:` `E` 其实是
+字节 `0x3A 0x45` 被当字符打出来 —— 别误读成 MAC 少了字节）。中断应用时和
+应用正常运行中都各扫一次，两次都在 → **热点一直在正常发射**。
+
+### 健康读数（S3，同一时刻取的）
+
+| 项 | 值 | 说明 |
+|---|---|---|
+| 复位原因 | `PWRON_RESET`（code 1） | **不是欠压复位**，旧结论的"欠压嫌疑"不成立 |
+| STA TX 功率 | 20.0 dBm | 满功率，不是被降过 |
+| `pm` | 0 | 省电已关 |
+| AP `ifconfig` | 192.168.4.1 | IP 层正常 |
+| `max_clients` | 10 | 不会被"占满" |
+| Web | `监听 0.0.0.0:80（3 个 worker）` | 服务已起 |
+
+启动链干净：`没有已保存的 WiFi 记录 → 配置热点已运行(幂等) → Web 服务已启动`，
+无 traceback、无复位循环（`启动计数` 只随手动复位 +1）。
+
+### 所以问题在**客户端**，优先排查（按命中率排序）
+
+1. **手机上"忘记"这个网络再重连** —— 手机存了旧的 AMS_WIFI 档案（改过密码/
+   改过加密方式），自动重连用旧密码**静默失败且不再弹密码框**。这是"看得见
+   但连不上"的第一名。顺带会清掉以前设过的**静态 IP**。
+2. **关掉"智能网络切换 / WLAN+ / WLAN 助理"** —— AMS_WIFI 没有外网，小米、
+   华为等会把它判为"无网络"并自动切回家里那个有网的热点，表现是连上又掉。
+3. 手动"添加网络"输入 `AMS_WIFI` / `A12345678`（注意大小写，结尾别带空格）。
+4. 手机别开"仅 5GHz"；iOS 弹"无 Internet 连接"要点"保持连接"。
+
+### 不依赖手机的绕行（一直可用）
+
+`tools/serial_provision.ps1` —— 串口直写 `wifi.dat` 配网，让板子走 STA 连
+路由器，完全不碰热点。
+
 - ⚠️ **板子 ping 不通是正常的**（MicroPython 的 lwIP 不回 ICMP），
   别用 ping 判断板子在不在线，用 HTTP 或看串口日志。
 
@@ -207,16 +250,49 @@ C3 那份是 `8058b7d6eb55f8124fbdcc797e2e8b39ae947a18df635567e02c8786874c04fd`�
 
 ### 验证与工具
 
-- `esp-ams-s3/tools/lint_c.py`：核心判据是**"代码位置出现中文字符"**（C 标识符只能
-  是 ASCII，中文只能出现在字符串/注释里，越界即字符串被提前截断）。
-  ★ **不要退回"数引号奇偶"** —— 引号成对的 bug 它看不见（已实际踩到）。带
-  `--selftest`（8 条用例）。两个命令都返回非 0，可当 CI 门禁。
+- `esp-ams-s3/tools/lint_c.py`：两条核心判据 ——
+  ① **"代码位置出现中文字符"**（C 标识符只能是 ASCII，中文只能出现在字符串/注释里，
+     越界即字符串被提前截断）。★ **不要退回"数引号奇偶"** —— 引号成对的 bug 它看不见
+     （已实际踩到）。
+  ② **"文件带 UTF-8 BOM"**（以**字节**为入口检查）。带 `--selftest`（**12 条用例**）。
+     扫描范围含 `.csv`（分区表最怕 BOM，但它不是 .c/.h）。两个命令都返回非 0，可当 CI 门禁。
 - CI `.github/workflows/esp-ams-s3-build.yml`：**只在该目录改动时触发**，
   用 `espressif/esp-idf-ci-action@v1`（镜像 `espressif/idf:v5.3.2`）跑 `idf.py build`，
   并检查应用体积 ≤ `ota_0` 上限 2031616 字节。不发布产物。
 - ⏳ **本机没有 ESP-IDF 工具链（也没有 gcc），`idf.py build` 从未跑过** ——
   改完要验证编译只能推分支让 CI 跑。
-- 分区表按 8MB Flash 排（占 5MB）：nvs 0x9000/24K、otadata 0xF000/8K、
+- 分区表按 8MB Flash 排（占 5.06MB）：nvs 0x9000/24K、otadata 0xF000/8K、
   phy_init 0x11000/4K、ota_0 0x20000/1.94M、ota_1 0x210000/1.94M、
-  storage 0x400000/1M。4MB 模组的替代表见 `esp-ams-s3/README.md`。
+  storage 0x400000/1M、**coredump 0x500000/64K**。4MB 模组的替代表见 `esp-ams-s3/README.md`。
+- ✅ **分区表可以离线验证**（不用装工具链）：`gen_esp32part.py` 是纯 Python，
+  从 IDF v5.3.2 tag 下下来直接跑
+  `python gen_esp32part.py --flash-size 8MB --offset 0x8000 partitions.csv out.bin`
+  → `Verifying table...` 退出码 0，再把 out.bin 回读自洽。当前结果是
+  `ota_0 = 1984K = 2031616 字节`，与 CI 体积上限一致。
+
+### ★ `partitions.csv` 绝对不能带 UTF-8 BOM（已踩，必挂）
+
+`gen_esp32part.py` 以**二进制**读入后 `data.decode()`（默认 utf-8，**不是** utf-8-sig），
+再用 `line.strip().startswith('#')` 跳注释 —— **不做 BOM 剥离**。带 BOM 时首字符是
+U+FEFF 而不是 `#`，跳过逻辑失效 → 首行注释被当成一条分区定义解析 →
+`Field 'type' can't be left empty.`，**构建直接失败**，且报错完全指不到 BOM。
+
+⚠️ **写文件工具会保留/回写 BOM** —— 用编辑器重写后 BOM 会回来。剥 BOM 必须用
+**字节级操作**（Python `rb` 读 → 切掉前 3 字节 → `wb` 写），改完**再跑一次 lint 复核**。
+
+### 推送 / CI 的现实约束（2026-09-17）
+
+- 分支 `esp-ams-s3-idf` 已推到 origin（= `54e953b`，**不含** CI 文件）。
+  `origin/main` 保持 `1633d1b` **未动**。
+- ⛔ **HTTPS + PAT 不允许推送 `.github/workflows/` 下的新增或修改**，除非 token 带
+  `workflow` scope（细粒度 token 要 `Workflows: Read and write`）。当前凭据缺这个
+  scope，所以 CI 文件留在**本地一个待推提交**。SSH 不受此限，但本机
+  `~/.ssh/id_ed25519` **没注册到 GitHub**。给 classic PAT **加 scope 不会改变 token 值**，
+  补完直接重推即可，不必重新登录。
+- ⚠️ 本环境 **`git checkout -b feat/xxx`（带斜杠）建不出引用**：返回 0、HEAD 变 unborn，
+  接着 `git add` 会把全仓库文件标成新增（差点提交出"整仓库都是新文件"）。
+  **用不带斜杠的分支名**，并且建完立刻 `git rev-parse --verify refs/heads/<名字>` 复核。
+  恢复无损：`git symbolic-ref HEAD refs/heads/main` + `git reset`（不动工作区）。
+- 推分支会同时触发**既有那条 MicroPython 流水线**（它监听任意分支 push），
+  看到"有 run 在跑"不等于 IDF 编译跑了 —— 要核对 run 的名字。
 
