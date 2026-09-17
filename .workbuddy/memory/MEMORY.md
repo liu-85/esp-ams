@@ -2,8 +2,10 @@
 
 ## 项目定位
 
-适配拓竹（Bambu Lab）打印机的 AMS 自动换料系统，ESP32-C3 / **ESP32-S3（42 针）**
-双平台 + MicroPython。
+适配拓竹（Bambu Lab）打印机的 AMS 自动换料系统。**两套并存实现，互不影响**：
+- `python_code/` —— MicroPython（ESP32-C3 / ESP32-S3 42 针，双板型）
+- `esp-ams-s3/` —— ESP-IDF（C，ESP32-S3，见文末专节）
+
 上游是 YBA-AMS，本项目主要差异是执行机构改为「1 个共享直流电机 + 4 路电磁离合」。
 GitHub: https://github.com/liu-85/esp-ams （remote origin，main 分支）
 
@@ -165,4 +167,56 @@ C3 那份是 `8058b7d6eb55f8124fbdcc797e2e8b39ae947a18df635567e02c8786874c04fd`�
 - CI：push 任意分支/ tag 即触发；push main 更新滚动 `latest` 预发布，
   打 `v*` tag 发正式 Release。产物：**两块板各自的** `.mpy` 压缩包 + 固件 BIN。
 - `.mpy` 包与固件都带 `board_select.py`，两个通道用同一个约定，不会配置不一致。
+
+## ESP-IDF 版分支 `esp-ams-s3/`（2026-09-17 新增，与 MicroPython 版并存）
+
+同一套硬件，用 ESP-IDF（C）重写。**两套实现互不影响**：MicroPython 版仍在
+`python_code/`，各有独立 CI 流水线。重写的最大收益：Python 版
+「干净堆预分配」那一整类约束（射频抢连续内存、handler 必须非阻塞）从架构上消失
+—— IDF 下 WiFi 用静态缓冲、`esp_http_server` / `esp-mqtt` 各跑在自己的任务里，
+**handler 可以放心写阻塞代码**；并且有了真正的 ota_0/ota_1 双分区整机 OTA。
+
+### 硬约束（踩过或差点踩，别改回去）
+
+- **必须 ESP-IDF v5.x，不能降到 v4.x**：v4 的 `esp_mqtt_client_config_t` 还是扁平
+  字段（`uri`/`username`/`password`），会直接编译失败。
+- MQTT 模块必须叫 `bambu_mqtt.c/h`，**不能叫 `mqtt_client.c/h`** —— IDF 自带
+  `mqtt_client.h`，同名会把官方头文件遮住，`esp_mqtt_client_init` 找不到。
+- **电机 IN1/IN2 绝不同时为高**（H 桥直通烧驱动芯片）→ `motor_apply()` 必须
+  "先双路清零、再给目标通道赋值"。写成先写目标通道，会在换向瞬间直通。
+- 离合最多 1 路吸合 → `clutch.c` 四重仲裁（与 Python 版 FilamentMotorBus 同级）。
+- `main/CMakeLists.txt` 的 `REQUIRES` **必须留 `esp_psram`**（哪怕一行它的 API 都
+  没调）：`CONFIG_SPIRAM*` 定义在 `esp_psram` 的 Kconfig 里，组件不在依赖列表里
+  就可能不被解析 → 配置被当未知项丢掉、PSRAM 悄悄没打开（不报错，只是内存少）。
+- `sdkconfig.defaults` 里**不许写** `CONFIG_ESP_WIFI_POWER_SAVE_NONE`（该符号根本
+  不存在）和 `CONFIG_SPIRAM_TYPE_AUTO`（v5.0 已删）。WiFi 省电在 IDF 里是**运行时**
+  设置，唯一正确位置是 `esp_wifi_set_ps(WIFI_PS_NONE)`（在 `wifi_mgr_init()`）。
+- `main.c` 末尾 `if (web_ok) esp_ota_mark_app_valid_cancel_rollback();` **不能省**，
+  否则"升级成功但一重启变回旧版"，极难查。放最后 = 只有体检通过才确认。
+- IDF v5.0 起 `esp_chip_info.h` / `esp_random.h` / `esp_mac.h` 不再由 `esp_system.h`
+  间接包含，必须显式 include。取芯片版本用 `esp_chip_info()`，**没有
+  `esp_get_revision()` 这个 API**。
+
+### 引脚与流程
+
+引脚：电机 4/5，离合 6/7/8/9，LED 2；**每路 3 个微动**（停止/开始/自吸），
+通道1~4 = 11/12/13、14/15/16、17/18/21、38/47/48；挤出机到位 GPIO1。
+剩余可用 10、39~42 + strapping 0/3/45/46。改接线只改 `main/board_pins.h`。
+自吸流程：自吸微动 → 送料到停止微动 → 等挤出机到位（GPIO 或 MQTT 事件，最长 15s）
+→ **蠕动送料 3 次**（慢速短脉冲）→ 停电机 + 断离合。
+
+### 验证与工具
+
+- `esp-ams-s3/tools/lint_c.py`：核心判据是**"代码位置出现中文字符"**（C 标识符只能
+  是 ASCII，中文只能出现在字符串/注释里，越界即字符串被提前截断）。
+  ★ **不要退回"数引号奇偶"** —— 引号成对的 bug 它看不见（已实际踩到）。带
+  `--selftest`（8 条用例）。两个命令都返回非 0，可当 CI 门禁。
+- CI `.github/workflows/esp-ams-s3-build.yml`：**只在该目录改动时触发**，
+  用 `espressif/esp-idf-ci-action@v1`（镜像 `espressif/idf:v5.3.2`）跑 `idf.py build`，
+  并检查应用体积 ≤ `ota_0` 上限 2031616 字节。不发布产物。
+- ⏳ **本机没有 ESP-IDF 工具链（也没有 gcc），`idf.py build` 从未跑过** ——
+  改完要验证编译只能推分支让 CI 跑。
+- 分区表按 8MB Flash 排（占 5MB）：nvs 0x9000/24K、otadata 0xF000/8K、
+  phy_init 0x11000/4K、ota_0 0x20000/1.94M、ota_1 0x210000/1.94M、
+  storage 0x400000/1M。4MB 模组的替代表见 `esp-ams-s3/README.md`。
 
