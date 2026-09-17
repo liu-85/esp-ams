@@ -2,17 +2,25 @@
 # -*- coding: utf-8 -*-
 """构建「单文件烧录」固件 —— 把 MicroPython 官方固件和本项目的代码合成一个 BIN。
 
+支持两块开发板：ESP32-C3 和 ESP32-S3（42 针）。
+    --board c3   官方固件取 ESP32_GENERIC_C3，文件系统里写入 BOARD = "c3"
+    --board s3   官方固件取 ESP32_GENERIC_S3，文件系统里写入 BOARD = "s3"
+    （--board auto 也可以，那是「按芯片自动识别」的通用镜像）
+
 为什么需要它
 ------------
 常规做法是「先烧固件、再用 mpremote/Thonny 把 .py 一个个传上去」，两步而且容易漏文件。
-这个脚本产出的 BIN 从地址 0x0 开始、覆盖整片 4MB Flash，里面已经包含：
+这个脚本产出的 BIN 从地址 0x0 开始、覆盖整片 Flash，里面已经包含：
 
-    0x000000  ESP32-C3 引导程序
+    0x000000  引导程序（ESP32-C3 / ESP32-S3，取决于 --board）
     0x008000  分区表
     0x010000  MicroPython 应用（官方发布的固件，未做任何修改）
     0x200000  文件系统（littlefs v2），放着本项目全部 .py / index.html / umqtt
+              ★ 其中 board_select.py 由本脚本按 --board 生成，
+                设备上 hardware_config.py 靠它加载对应板型的引脚表
 
 也就是说：一条命令烧一个文件，板子插上电就直接跑起来，不需要再传任何文件。
+两块板的固件分别烧各自的 BIN，互不通用（官方固件本身就是芯片专属的）。
 
 用了哪些手段保证「烧进去一定能启动」
 ------------------------------------
@@ -28,15 +36,30 @@
 
 用法
 ----
-    python tools/make_firmware_bin.py \
+    # ESP32-C3
+    python tools/make_firmware_bin.py --board c3 \
         --firmware-url https://micropython.org/resources/firmware/ESP32_GENERIC_C3-20240602-v1.23.0.bin \
         --firmware-sha256 8058b7d6eb55f8124fbdcc797e2e8b39ae947a18df635567e02c8786874c04fd \
         --lfs-tool tools/build/lfs_mkfs \
         --out dist/esp32c3-ams-firmware.bin
 
+    # ESP32-S3（42 针）
+    python tools/make_firmware_bin.py --board s3 \
+        --firmware-url https://micropython.org/resources/firmware/ESP32_GENERIC_S3-20240602-v1.23.0.bin \
+        --firmware-sha256 b91080af2e9b78bad4308f98bb6187567cae24ed77cd7f48ef99b47af3ef0555 \
+        --lfs-tool tools/build/lfs_mkfs \
+        --out dist/esp32s3-ams-firmware.bin
+
+不写 --out 时按板型自动命名：dist/<芯片>-ams-firmware.bin。
+
 烧录（整片覆盖，正常情况不需要先擦除；升级/异常时可用 erase_flash 救援）：
 
     esptool.py --chip esp32c3 --port COM3 write_flash -z 0x0 dist/esp32c3-ams-firmware.bin
+    esptool.py --chip esp32s3 --port COM3 write_flash -z 0x0 dist/esp32s3-ams-firmware.bin
+
+⚠️ ESP32-S3 的官方固件按 8MB Flash 布局（vfs 分区 0x200000 起、6MB），
+   所以单文件固件要烧在 8MB 及以上的 S3 模组上（N8R8 / N16R8 都满足）。
+   4MB Flash 的 S3 模组请改用 .mpy 部署包，或自行改小分区表。
 """
 
 import argparse
@@ -55,11 +78,23 @@ import urllib.request
 PARTITION_TABLE_OFFSET = 0x8000       # ESP-IDF 分区表固定位置
 PARTITION_ENTRY_SIZE = 32
 PARTITION_MAGIC = b"\xaa\x50"
-FLASH_SECTOR = 4096                   # ESP32-C3 闪存擦除粒度，也是文件系统的 block_size
+FLASH_SECTOR = 4096                   # ESP32-C3 / ESP32-S3 都是 4096，也是文件系统的 block_size
 
 DEFAULT_SOURCE = "python_code"
-DEFAULT_OUT = os.path.join("dist", "esp32c3-ams-firmware.bin")
 DEFAULT_MICROPYTHON_VERSION = "1.23.0"
+
+# ---------------------------------------------------------------------------
+# 板型 → 芯片名。两个开发板共用一套业务代码，只有官方固件和引脚表不同，
+# 而引脚表的差别靠文件系统里的 board_select.py 在编译期写死。
+# ---------------------------------------------------------------------------
+BOARD_CHOICES = ("c3", "s3", "auto")
+BOARD_CHIP = {"c3": "esp32c3", "s3": "esp32s3", "auto": "esp32"}
+BOARD_LABEL = {
+    "c3": "ESP32-C3",
+    "s3": "ESP32-S3（42 针）",
+    "auto": "通用镜像（按芯片自动识别引脚表）",
+}
+BOARD_SELECT_FILE = "board_select.py"
 
 # 不进文件系统的目录 / 文件
 SKIP_DIRS = {"__pycache__", ".idea", ".git", ".vscode", ".mypy_cache", ".pytest_cache"}
@@ -169,6 +204,54 @@ def find_partition(parts, name):
         if p["name"] == name:
             return p
     return None
+
+
+# ---------------------------------------------------------------------------
+# 板型下发：编译期把 board_select.py 写进文件系统
+# ---------------------------------------------------------------------------
+def write_board_select(directory, board_id):
+    """生成 board_select.py —— 设备上 hardware_config.py 靠它加载对应引脚表。
+
+    和 tools/build_mpy.py 生成的完全一样，两个部署通道（.mpy 包 / 单文件固件）
+    用的是同一个约定，所以不会出现"两个包里配置不一致"。
+    """
+    path = os.path.join(directory, BOARD_SELECT_FILE)
+    text = (
+        "# board_select.py -- 由 tools/make_firmware_bin.py 自动生成，请勿手改\n"
+        "# ===============================================================\n"
+        "# 这个文件决定了设备上 hardware_config.py 加载哪一份引脚表：\n"
+        "#\n"
+        "#     BOARD = \"c3\"    -> board_c3.py（ESP32-C3）\n"
+        "#     BOARD = \"s3\"    -> board_s3.py（ESP32-S3 42 针）\n"
+        "#     BOARD = \"auto\"  -> 由 os.uname().machine 现场识别芯片\n"
+        "#\n"
+        "# 之所以编译期就写死，是为了让两块板各自的固件\"天生\"用对配置，\n"
+        "# 不依赖运行时字符串识别（识别不出来时默认按 C3 处理）。\n"
+        "\n"
+        "BOARD = \"%s\"\n" % board_id
+    )
+    with open(path, "w", encoding="utf-8", newline="\n") as f:
+        f.write(text)
+    log("已写入板型配置: %s -> BOARD = \"%s\"" % (BOARD_SELECT_FILE, board_id))
+    return path
+
+
+def stage_source(source_dir, work_dir, board_id):
+    """把源码目录整份拷到暂存目录，再塞进生成的 board_select.py。
+
+    为什么要拷贝而不是直接改原目录：构建过程不该往版本库里写生成物，
+    而且失败时原目录保持干净。
+    """
+    stage = os.path.join(work_dir, "src-%s" % board_id)
+    if os.path.exists(stage):
+        shutil.rmtree(stage)
+    os.makedirs(work_dir, exist_ok=True)
+    shutil.copytree(
+        source_dir, stage,
+        ignore=shutil.ignore_patterns(*sorted(SKIP_DIRS), BOARD_SELECT_FILE, ".git*"),
+    )
+    write_board_select(stage, board_id)
+    return stage
 
 
 # ---------------------------------------------------------------------------
@@ -375,6 +458,11 @@ def build_parser():
     src = p.add_argument_group("来源")
     src.add_argument("--source", default=DEFAULT_SOURCE,
                      help="要打进固件的源码目录（默认 %(default)s）")
+    src.add_argument("--board", default="c3", choices=list(BOARD_CHOICES),
+                     help="目标开发板：c3 = ESP32-C3，s3 = ESP32-S3（42 针），"
+                          "auto = 通用镜像（默认 %(default)s）")
+    src.add_argument("--chip", default=None,
+                     help="芯片名，用于产物命名与烧录提示（默认按 --board 推导）")
     src.add_argument("--firmware-url", default=None, help="MicroPython 官方固件下载地址")
     src.add_argument("--firmware-file", default=None, help="本地已有的官方固件（离线构建用）")
     src.add_argument("--firmware-sha256", default=None, help="官方固件 SHA256，填了就强校验")
@@ -382,7 +470,8 @@ def build_parser():
                      help="对照检查 littlefs 版本的 MicroPython 版本（默认 %(default)s）")
 
     out = p.add_argument_group("产物")
-    out.add_argument("--out", default=DEFAULT_OUT, help="输出的 BIN 路径（默认 %(default)s）")
+    out.add_argument("--out", default=None,
+                     help="输出的 BIN 路径（默认 dist/<芯片>-ams-firmware.bin）")
     out.add_argument("--work-dir", default=os.path.join("dist", "_work"),
                      help="中间文件目录（清单、文件系统镜像）")
     out.add_argument("--cache-dir", default=os.path.join("dist", "_cache"),
@@ -402,6 +491,15 @@ def build_parser():
 def main(argv=None):
     args = build_parser().parse_args(argv)
     root = os.path.abspath(os.getcwd())
+
+    # 0. 定板型 / 芯片 / 产物路径
+    chip = args.chip or BOARD_CHIP[args.board]
+    if args.out is None:
+        args.out = os.path.join("dist", "%s-ams-firmware.bin" % chip)
+    log("目标板型: %s  →  芯片 %s" % (BOARD_LABEL[args.board], chip))
+    log("产物路径: %s" % args.out)
+    if args.board == "auto":
+        warn("通用镜像：请自行确认 --firmware-url 指向的官方固件与手上的板子芯片一致")
 
     tool = resolve_tool(args.lfs_tool)
     log("镜像工具: %s" % tool)
@@ -431,7 +529,7 @@ def main(argv=None):
     # 2. 读分区表，定位文件系统分区
     parts = parse_partition_table(fw)
     if not parts:
-        die("在 0x%x 处没解析到分区表，这个文件可能不是完整固件（MicroPython 的 C3 固件是从 0x0 开始的整片镜像）"
+        die("在 0x%x 处没解析到分区表，这个文件可能不是完整固件（MicroPython 的 ESP32 固件是从 0x0 开始的整片镜像）"
             % PARTITION_TABLE_OFFSET)
     log("分区表:")
     for p in parts:
@@ -452,9 +550,10 @@ def main(argv=None):
         die("固件(%d 字节)已经越过 vfs 分区起点(0x%06x)，说明官方固件布局变了，需要更新脚本"
             % (len(fw), vfs["offset"]))
 
-    # 3. 生成文件清单
+    # 3. 生成文件清单（先做暂存目录：拷贝源码 + 写入板型配置）
     os.makedirs(args.work_dir, exist_ok=True)
-    dirs, files = collect_files(args.source)
+    staged_source = stage_source(args.source, args.work_dir, args.board)
+    dirs, files = collect_files(staged_source)
     manifest = write_manifest(os.path.join(args.work_dir, "manifest.txt"), dirs, files)
     total_bytes = sum(os.path.getsize(src) for src, _ in files)
     log("待写入文件 %d 个 / 目录 %d 个，共 %d 字节" % (len(files), len(dirs), total_bytes))
@@ -522,18 +621,20 @@ def main(argv=None):
     print("构建完成")
     print("=" * 72)
     print("  产物      : %s" % os.path.abspath(args.out))
+    print("  开发板    : %s（芯片 %s）" % (BOARD_LABEL[args.board], chip))
+    print("  板型配置  : %s 里 BOARD = \"%s\"" % (BOARD_SELECT_FILE, args.board))
     print("  大小      : %d 字节 (%.2f MB)" % (len(image), len(image) / 1048576.0))
     print("  SHA256    : %s" % digest)
     print("  内容      : 引导程序 + 分区表 + MicroPython v%s + 文件系统(%d 个文件)"
           % (args.micropython_version, len(files)))
     print("")
     print("  烧录（一条命令，整片覆盖，正常不用先擦除）:")
-    print("    esptool.py --chip esp32c3 --port COM3 write_flash -z 0x0 %s"
-          % os.path.basename(args.out))
+    print("    esptool.py --chip %s --port COM3 write_flash -z 0x0 %s"
+          % (chip, os.path.basename(args.out)))
     print("  如果板子出现异常，先彻底擦除再烧:")
-    print("    esptool.py --chip esp32c3 --port COM3 erase_flash")
+    print("    esptool.py --chip %s --port COM3 erase_flash" % chip)
     if not args.trim:
-        print("  提示: 本文件覆盖整片 4MB Flash，所以旧的文件系统会被一并清除。")
+        print("  提示: 本文件从 0x0 覆盖到文件系统分区结尾，旧的文件系统会被一并清除。")
         print("        想得到体积更小的文件可加 --trim（但那样就建议先 erase_flash）。")
     return 0
 

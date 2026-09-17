@@ -1,6 +1,6 @@
 # YAO_AMS
 
-**基于 YBA-AMS 改进的拓竹打印机自动换料系统（ESP32-C3 + MicroPython）**
+**基于 YBA-AMS 改进的拓竹打印机自动换料系统（ESP32-C3 / ESP32-S3 双平台 + MicroPython）**
 
 <img src="./assets/83bc5bb869cc607bf0961988dcada98.jpg" alt="YAO_AMS 整机" style="zoom:40%;" />
 
@@ -36,7 +36,7 @@
 
 本项目是适配拓竹（Bambu Lab）打印机的 AMS 自动换料系统，基于 YBA-AMS 改进而来。
 
-- **主控**：ESP32-C3，使用 MicroPython 开发
+- **主控**：**ESP32-C3 或 ESP32-S3（42 针）**，使用 MicroPython 开发，两块板共用同一套代码
 - **通信**：MQTT over TLS 与打印机通信；TCP + Web 页面与操作者交互
 - **执行机构**：**1 个共享直流电机 + 4 路电磁离合**（见下文）
 - **已验证**：A1 mini，4 通道；主板预留扩展接口，最多支持 8 通道
@@ -48,6 +48,12 @@
 > 1. GPIO 从 8 个降到 6 个，且不再使用 ESP32-C3 上不存在的 GPIO22/23；
 > 2. **引入了新的安全约束：任何时刻最多只能有 1 路电磁离合吸合**，
 >    软件层用四重机制强制保证（见 [换料时序与软件架构](#换料时序与软件架构)）。
+
+> 💡 **选板建议**：**优先用 ESP32-S3（42 针）**。C3 只有 400KB SRAM，应用加载后
+> 空闲堆约 60KB，传 40KB 以上的配置页面时 WiFi 驱动可能申请不到连续收发缓冲，
+> 表现为「网页打不开 / 一直转圈」（加上 OTA 之后应用变大，这个问题会更明显）。
+> S3 有 512KB SRAM（还可带 PSRAM），同一个应用跑起来余量充足，而且 4 路离合
+> 不必再挤到 strapping 脚上。详见 [ESP32-S3（42 针）可用 IO](#esp32-s342-针可用-io)。
 
 ---
 
@@ -136,7 +142,56 @@ ESP32-C3 只有 `GPIO0 ~ GPIO21`，其中相当一部分不能当普通 IO 用�
 > 📌 上游代码里的 **GPIO22 / GPIO23 是经典 ESP32（38 脚）的编号，ESP32-C3 上不存在**，
 > 必须改掉。本项目已全部重排。
 
-### 默认接线表
+### ESP32-S3（42 针）可用 IO
+
+ESP32-S3 的 GPIO 多得多，本项目在 S3 上的默认接线**全部落在干净脚上**，
+不再有 C3 那种「4 号离合挤在 strapping 脚上」的将就。
+
+引脚性质一览（以 42 针模组排针为准）：
+
+| GPIO | 状态 | 说明 |
+| --- | --- | --- |
+| `GPIO0` | ⚠️ strapping | BOOT 键；作**输入**安全，作输出会把上电电平改掉 |
+| `GPIO1` | ✅ 空闲 | ADC1_CH0 |
+| `GPIO2` | 状态 LED | 板载灯（本方案用作状态灯） |
+| `GPIO3` | ⚠️ strapping | JTAG 信号源选择；作输入安全 |
+| `GPIO4` / `GPIO5` | 电机 | H 桥 IN1 / IN2 |
+| `GPIO6` ~ `GPIO9` | 电磁离合 1~4 | ★ 四只全是干净脚 |
+| `GPIO10` | ✅ 空闲 | |
+| `GPIO11` ~ `GPIO18` | ✅ 空闲 | `11~14` 推荐给到位开关（排针集中） |
+| `GPIO19` / `GPIO20` | ❌ USB | USB D- / D+，用掉就没法用 USB 串口 |
+| `GPIO21` | ✅ 空闲 | |
+| `GPIO22` ~ `GPIO25` | — | 该封装不引出 |
+| `GPIO26` ~ `GPIO32` | ❌ Flash | 模组内置 SPI Flash（SPI0/1） |
+| `GPIO33` ~ `GPIO37` | ❌ PSRAM | 八线 PSRAM 占用（N8R8 / N16R8）；无 PSRAM 的模组上可用 |
+| `GPIO38` | ✅ 空闲 | |
+| `GPIO39` ~ `GPIO42` | ✅ 空闲 | 默认是 JTAG（MTCK/MTDO/MTDI/MTMS），当普通 IO 就没在线调试了 |
+| `GPIO43` / `GPIO44` | ❌ UART | UART0 TX / RX（REPL 与日志口） |
+| `GPIO45` | ⚠️ strapping | VDD_SPI 电压选择；作输入安全 |
+| `GPIO46` | ⚠️ strapping | ROM 打印 / 启动；作输入安全 |
+| `GPIO47` / `GPIO48` | ✅ 空闲 | 48 在官方 DevKitC-1 上是板载 RGB 灯 |
+
+**★ 剩余可用 IO 全部引出（本方案用掉 6 只 + 1 只状态灯之后）：**
+
+| 类别 | 引脚 | 数量 |
+| --- | --- | --- |
+| 干净可用脚 | `GPIO1`、`GPIO10`、`GPIO11`、`GPIO12`、`GPIO13`、`GPIO14`、`GPIO15`、`GPIO16`、`GPIO17`、`GPIO18`、`GPIO21`、`GPIO38`、`GPIO39`、`GPIO40`、`GPIO41`、`GPIO42`、`GPIO47`、`GPIO48` | **18** |
+| 空闲 strapping 脚 | `GPIO0`、`GPIO3`、`GPIO45`、`GPIO46` | 4 |
+
+其中 `GPIO11 ~ GPIO14` 是到位开关的推荐脚；若装上 4 路到位开关占用它们，
+干净可用脚还剩 14 只。这 18 只干净脚**全部**在
+[`python_code/board_s3.py`](./python_code/board_s3.py) 的 `SPARE_PINS` 里列着，
+上电自检和构建出的 `部署说明.txt` 也会把它们打出来（`hardware_config.SPARE_PINS`）。
+
+```python
+# 在设备 REPL 里确认剩余可用 IO
+from hardware_config import SPARE_PINS, STRAPPING_SPARE_PINS, describe
+print(describe())
+```
+
+### 默认接线表（两块板）
+
+**ESP32-C3**（干净输出脚只有 7 只，刚好用完，属于将就方案）：
 
 | 信号 | GPIO | 说明 |
 | --- | --- | --- |
@@ -147,9 +202,72 @@ ESP32-C3 只有 `GPIO0 ~ GPIO21`，其中相当一部分不能当普通 IO 用�
 | 电磁离合 3 | `GPIO10` | 料盘位 3 |
 | 电磁离合 4 | `GPIO3` | 料盘位 4（⚠️ strapping 脚，能跑但建议改到 `GPIO1`） |
 | 状态 LED | `GPIO2` | 板载蓝灯（⚠️ strapping 脚；设成 `None` 可彻底关掉） |
-| 到位开关 1~4 | *未安装* | 预留，见下方说明 |
+| 到位开关 1~4 | *未安装* | 预留，见下方说明；推荐 `GPIO0 / GPIO1 / GPIO8 / GPIO9` |
 
-改接线只需要改 `python_code/hardware_config.py` 里的一组常量，不用动业务代码。
+**ESP32-S3（42 针）**（推荐，离合全在干净脚上）：
+
+| 信号 | GPIO | 说明 |
+| --- | --- | --- |
+| 电机 H 桥 IN1 | `GPIO4` | 方向 `1` = 进料（正转） |
+| 电机 H 桥 IN2 | `GPIO5` | 方向 `-1` = 退料（反转） |
+| 电磁离合 1 | `GPIO6` | 料盘位 1 |
+| 电磁离合 2 | `GPIO7` | 料盘位 2 |
+| 电磁离合 3 | `GPIO8` | 料盘位 3 |
+| 电磁离合 4 | `GPIO9` | 料盘位 4（✅ 干净脚，不再是 strapping） |
+| 状态 LED | `GPIO2` | 板载灯（设成 `None` 可彻底关掉） |
+| 到位开关 1~4 | *未安装* | 预留，见下方说明；推荐 `GPIO11 / GPIO12 / GPIO13 / GPIO14` |
+
+> 两块板的电机与离合 1~3 引脚号**故意保持一致**，这样换板子时接线基本不用动，
+> 唯一变化是 C3 的离合 4 在 `GPIO3`、S3 的离合 4 在 `GPIO9`。
+
+### 两块板怎么共用一套代码
+
+执行机构、时序、业务逻辑两块板**完全一样**，不同的只有「这块芯片哪些脚能用」。
+所以引脚差异被拆成两份独立文件，业务代码一行都不用改：
+
+| 文件 | 作用 | 要不要提交 |
+| --- | --- | --- |
+| [`python_code/board_c3.py`](./python_code/board_c3.py) | C3 的引脚表 / 保留脚 / strapping / 剩余可用 IO | ✅ 是源码 |
+| [`python_code/board_s3.py`](./python_code/board_s3.py) | S3（42 针）同上，另外列出全部剩余可用 IO | ✅ 是源码 |
+| [`python_code/hardware_config.py`](./python_code/hardware_config.py) | **唯一硬件配置入口**：选板型 + 业务参数 + 上电自检 | ✅ 是源码 |
+| `board_select.py` | 由编译脚本生成，内容就一行 `BOARD = "c3" / "s3" / "auto"` | ❌ 构建产物，别手改 |
+| `board_override.py` | 可选，放在板子上即可覆盖任意引脚，不用改仓库代码 | ❌ 现场文件 |
+
+**板型是怎么定下来的（优先级从高到低）：**
+
+1. **编译时写死的 `board_select.py`** —— `tools/build_mpy.py --board s3` 或
+   `tools/make_firmware_bin.py --board s3` 会往包里写 `BOARD = "s3"`。
+   也就是说 **CI 打出来的两个固件各自「天生」用对配置**，不依赖运行时识别。
+2. **现场覆盖 `board_override.py`** —— 手上这块板接线和别人不一样时用，例如
+   ```python
+   # 板子上放这么一个文件即可，重启生效
+   CLUTCH_PINS = (6, 7, 10, 1)
+   LED_PIN = None
+   ```
+3. **自动识别 `os.uname().machine`** —— 认得出就用对应的表；认不出来按 C3 处理，
+   并在自检日志里提示一句。
+
+上层代码（`motor_clutch` / `device_processing` / `reset_info` …）只写
+`from hardware_config import MOTOR_PIN_IN1`，所以换板子/换引脚不会波及业务逻辑。
+
+**编译两个开发板：**
+
+```bash
+python tools/build_mpy.py                 # 默认 --board both：C3 与 S3 各出一个包
+python tools/build_mpy.py --board c3      # 只编 C3 → dist/c3/
+python tools/build_mpy.py --board s3      # 只编 S3 → dist/s3/
+python tools/build_mpy.py --board auto    # 一份通用包，设备上按芯片自动识别
+
+# 单文件固件（两块板各自的官方固件不同，必须分开构建）
+python tools/make_firmware_bin.py --board c3 --firmware-url <C3 固件> --out dist/esp32c3-ams-firmware.bin
+python tools/make_firmware_bin.py --board s3 --firmware-url <S3 固件> --out dist/esp32s3-ams-firmware.bin
+```
+
+每个构建产物里都会带一份 `board_select.py` 和一份 `部署说明.txt`，
+说明里直接写出「这块板实际用哪些脚、还剩哪些脚」，不用回去翻文档。
+
+改接线只需要改 `python_code/board_c3.py` 或 `python_code/board_s3.py` 里的一组常量，
+或者用 `hardware_config.py` 里与芯片无关的业务参数，不用动业务代码。
 
 **关于状态 LED 用 GPIO2**：板载 LED 在低电平时不导通、呈高阻，对 strapping
 影响很小，所以 LED 挂在 GPIO2 上是可以接受的。但它**绝不能和任何功率器件
@@ -167,8 +285,10 @@ ESP32-C3 只有 `GPIO0 ~ GPIO21`，其中相当一部分不能当普通 IO 用�
 
 推荐接法（开关一端接 GPIO、另一端接 GND，内部上拉，低电平触发）：
 
-- 通道 1 / 2：`GPIO0`、`GPIO1`（最干净）
-- 通道 3 / 4：可用 `GPIO2`、`GPIO3`、`GPIO8` 或 `GPIO9` —— 这四个是 strapping 脚，
+- **ESP32-S3**：直接用 `GPIO11 / GPIO12 / GPIO13 / GPIO14`，
+  即 `board_s3.py` 里的 `RECOMMENDED_LIMIT_SWITCH_PINS`（全干净、排针集中）
+- **ESP32-C3**：通道 1 / 2 用 `GPIO0`、`GPIO1`（最干净），
+  通道 3 / 4 可用 `GPIO2`、`GPIO3`、`GPIO8` 或 `GPIO9` —— 这四个是 strapping 脚，
   但「内部上拉 + 开关对地」的接法空闲时正好是高电平，符合 strapping 要求，
   作**输入**是安全的（作输出就危险了，见上）
 
@@ -212,7 +332,7 @@ ESP32-C3 只有 `GPIO0 ~ GPIO21`，其中相当一部分不能当普通 IO 用�
 
 ```
 yaoams/
-├── python_code/                  # ★ 要上传到 ESP32-C3 的全部代码
+├── python_code/                  # ★ 要上传到开发板的全部代码（C3 / S3 通用）
 │   ├── main.py                   # 上电自动启动入口（保持 .py，不能编译成 .mpy）
 │   ├── boot.py                   # 上电最先跑：置安全电平 + 记复位原因 + 累加启动计数
 │   ├── reset_info.py             # ★ 复位诊断：欠压 / 看门狗 / 冷启动，网页可见
@@ -238,10 +358,10 @@ yaoams/
 │   ├── run_tests.py              # 测试入口：python tests/run_tests.py
 │   └── mpy_stubs/                # machine / network / ujson / uasyncio / umqtt 桩模块
 ├── tools/
-│   ├── make_firmware_bin.py      # ★ 合成「单文件可烧录固件」（官方固件 + 本项目代码）
+│   ├── make_firmware_bin.py      # ★ 合成「单文件可烧录固件」（官方固件 + 本项目代码），--board 选板型
 │   ├── make_update_pack.py       # ★ 把 python_code/ 打成 .ams 应用更新包（网页 OTA 用）
 │   ├── lfs_mkfs.c                # ★ 生成 / 校验文件系统镜像（littlefs 2.8，与固件内置同源）
-│   ├── build_mpy.py              # 交叉编译 .mpy 并打包部署 zip
+│   ├── build_mpy.py              # 交叉编译 .mpy 并打包部署 zip，--board both 时两块板各出一个
 │   └── preview_server.py         # 网页本地预览服务（假数据补全接口，PC 上调页面用）
 ├── .github/workflows/build.yml   # ★ GitHub Actions：检查 + 自测 + 固件 + .mpy + 发布
 ├── g_code/                       # Bambu Studio 换料 G-code（要粘贴到切片软件）
@@ -259,42 +379,67 @@ yaoams/
 
 ### 第 1 步：烧录（推荐：一个文件搞定）
 
-到本仓库的 **Releases** 页面下载 `esp32c3-ams-firmware.bin`
-（每次提交都会自动重新构建，标题为「最新构建」的那份永远是最新的），然后：
+到本仓库的 **Releases** 页面**按你手上的开发板**下载对应的固件
+（每次提交都会自动重新构建，标题为「最新构建」的那份永远是最新的）：
+
+| 开发板 | 单文件固件 | .mpy 部署包 |
+| --- | --- | --- |
+| ESP32-C3 | `esp32c3-ams-firmware.bin`（4MB） | `esp32c3-ams-mpy.zip` |
+| ESP32-S3（42 针） | `esp32s3-ams-firmware.bin`（8MB） | `esp32s3-ams-mpy.zip` |
 
 ```bash
 pip install esptool
+
+# ESP32-C3
 esptool.py --chip esp32c3 --port COM5 write_flash -z 0x0 esp32c3-ams-firmware.bin
+
+# ESP32-S3（42 针，需 8MB 及以上 Flash）
+esptool.py --chip esp32s3 --port COM5 write_flash -z 0x0 esp32s3-ams-firmware.bin
 ```
 
-就这一条命令。该文件从地址 `0x0` 开始覆盖**整片 4MB Flash**：
+就这一条命令。文件里已经按你的板型写好了 `board_select.py`，
+**板子一上电就知道该加载哪份引脚表**，不需要任何手工选择。
+
+C3 固件从地址 `0x0` 开始覆盖**整片 4MB Flash**：
 
 | 地址 | 内容 |
 | --- | --- |
 | `0x000000` | ESP32-C3 引导程序 |
 | `0x008000` | 分区表（nvs / phy_init / app / vfs） |
 | `0x010000` | MicroPython v1.23.0（官方发布的固件，未做修改） |
-| `0x200000` | 文件系统（littlefs），放着 `python_code/` 的全部代码 + `umqtt` 库 |
+| `0x200000` | 文件系统（littlefs，2MB），放着 `python_code/` 的全部代码 + `umqtt` 库 |
+
+S3 固件布局相同，只是 vfs 分区更大（`0x200000` 起、6MB），
+所以整片总长 8MB —— 官方 S3 固件本身就是按 8MB Flash 布局的，
+**4MB Flash 的 S3 模组请改用 `.mpy` 部署包**（或自行改小分区表）。
 
 也就是说：**不用先烧固件、也不用再上传任何 .py**，烧完直接上电就能跑，
 下面第 2 步可以跳过，直接看第 3 步。
 
 > 正常情况下不需要先 `erase_flash` —— 这个文件覆盖整片 Flash，旧文件系统区域会被
 > 整体重写。只有在出现异常（之前烧过别的固件、或想彻底清空）时才先补一条
-> `esptool.py --chip esp32c3 --port COM5 erase_flash`，然后再烧。
+> `esptool.py --chip <你的芯片> --port COM5 erase_flash`，然后再烧。
 
 ### 第 2 步（备选）：自己烧固件 + 上传代码
 
 需要频繁改代码调试、或者不想整片重烧时，用这种方式。
 
-先烧官方 MicroPython 固件：
+先烧官方 MicroPython 固件（C3 用 `ESP32_GENERIC_C3`，S3 用 `ESP32_GENERIC_S3`）：
 
 ```bash
+# ESP32-C3
 esptool.py --chip esp32c3 --port COM5 erase_flash
 esptool.py --chip esp32c3 --port COM5 write_flash -z 0x0 ESP32_GENERIC_C3-xxxx.bin
+
+# ESP32-S3（42 针）
+esptool.py --chip esp32s3 --port COM5 erase_flash
+esptool.py --chip esp32s3 --port COM5 write_flash -z 0x0 ESP32_GENERIC_S3-xxxx.bin
 ```
 
-固件到 [micropython.org/download/ESP32_GENERIC_C3](https://micropython.org/download/ESP32_GENERIC_C3/)
+固件分别到
+[micropython.org/download/ESP32_GENERIC_C3](https://micropython.org/download/ESP32_GENERIC_C3/)
+与
+[micropython.org/download/ESP32_GENERIC_S3](https://micropython.org/download/ESP32_GENERIC_S3/)
 下载。记住版本号（例如 `v1.23.0`），CI 与 `.mpy` 都要和它对齐。
 
 然后用 `mpremote` 上传代码：
@@ -314,16 +459,21 @@ mpremote connect /dev/ttyACM0 fs cp -r ./python_code/ :
 或者用 CI 编译好的 `.mpy` 包（体积更小、启动更快）：
 
 ```bash
-# 1) 从 GitHub Actions 下载 esp32c3-ams-mpy-v1.23.0 构件，或本地编译
+# 1) 从 GitHub Actions 下载对应板型的构件，或本地编译（默认两块板都编）
 pip install mpy-cross==1.23.0
-python tools/build_mpy.py
+python tools/build_mpy.py                      # → dist/c3/ 与 dist/s3/
+python tools/build_mpy.py --board s3           # 只编 S3 → dist/s3/
 
-# 2) 解压后整体上传
-mpremote connect COM5 fs cp -r ./dist/ :
+# 2) 解压后把**对应板型那个目录**整体上传
+mpremote connect COM5 fs cp -r ./dist/s3/ :
 ```
 
 > ⚠️ `mpy-cross` 的版本必须和板子上的固件版本一致，否则设备会报
 > `ValueError: incompatible .mpy file`。
+>
+> ⚠️ 上传 `.mpy` 包时**务必选对板型目录**（`dist/c3/` 还是 `dist/s3/`）——
+> 包里的 `board_select.py` 决定了设备加载哪份引脚表。传错了不会烧板子
+> （上电自检会报引脚错误并拒绝启用硬件），但网页会不对劲。
 >
 > 注意 `boot.py` / `main.py` 必须是源码 `.py`（MicroPython 是直接执行这两个文件，
 > 它们被编译成 `.mpy` 后不会被执行）。
@@ -427,7 +577,8 @@ M400 U1
         │    FilamentMotorBus ★ 离合互斥仲裁            │
         │    HBridgeMotor / Clutch / LimitSwitch       │
         ├─────────────────────────────────────────────┤
-        │  hardware_config.py   引脚与时序配置          │
+        │  hardware_config.py   选板型 + 时序 + 降级参数 │
+        │  board_c3.py / board_s3.py  两块板的引脚表     │
         └─────────────────────────────────────────────┘
 ```
 
@@ -579,13 +730,20 @@ M400 U1
 
 ## 硬件配置项
 
-所有硬件相关的参数都集中在 **`python_code/hardware_config.py`**，改完不用动业务代码。
+硬件相关的东西分两层，改完都不用动业务代码：
 
-| 配置项 | 默认值 | 说明 |
+| 层 | 文件 | 放什么 |
 | --- | --- | --- |
-| `MOTOR_PIN_IN1` / `MOTOR_PIN_IN2` | `4` / `5` | H 桥两个输入脚 |
+| **板型层** | `python_code/board_c3.py` / `board_s3.py` | 这块芯片哪些脚能用：默认接线、保留脚、strapping 脚、剩余可用 IO |
+| **入口层** | `python_code/hardware_config.py` | 选板型（读 `board_select.py` → 自动识别）+ 上表这套与芯片无关的业务参数 + 上电自检 |
+
+所以「换板子」只影响板型层，「调动作时间」只影响入口层。
+
+| 配置项 | 默认值（C3 / S3） | 说明 |
+| --- | --- | --- |
+| `MOTOR_PIN_IN1` / `MOTOR_PIN_IN2` | `4` / `5`（两块板相同） | H 桥两个输入脚 |
 | `MOTOR_DEAD_TIME_MS` | `30` | 换向死区时间，单位 ms |
-| `CLUTCH_PINS` | `(6, 7, 10, 3)` | 4 路电磁离合对应的 GPIO |
+| `CLUTCH_PINS` | C3 `(6, 7, 10, 3)` / S3 `(6, 7, 8, 9)` | 4 路电磁离合对应的 GPIO |
 | `CLUTCH_ACTIVE_LEVEL` | `1` | `1` = 高电平吸合；驱动板是低电平吸合时改成 `0` |
 | `CLUTCH_ENGAGE_MS` | `80` | 吸合后等待机械咬合的时间 |
 | `CLUTCH_RELEASE_MS` | `60` | 断开后等待彻底脱开的时间 |
@@ -597,16 +755,32 @@ M400 U1
 | `NO_LIMIT_LOAD_MS` | `8000` | ★ 降级模式进料时长，**需实测调整** |
 | `JOG_TIME_MS` | `1000` | ★ 网页手动点动的「进退响应时间」出厂默认值（毫秒）。只作用于手动点动，**不影响自动换料** |
 | `JOG_MIN_MS` / `JOG_MAX_MS` | `200` / `60000` | 上面那个值的安全区间（0.2 ~ 60 秒）。网页上填超范围会被自动夹住 |
-| `LED_PIN` | `2` | 状态指示灯 |
+| `LED_PIN` | `2`（两块板相同） | 状态指示灯 |
 | `CONFIG_FILE` | `"config.json"` | 持久化配置文件 |
 
-`hardware_config.validate()` 会在启动时校验引脚是否合法（重复占用、
-越界、踩到 Flash/USB/UART 保留脚），有问题直接报出来。把
-`device_processing.py` 当脚本跑一次就能打印完整接线表并逐个点动 4 个通道：
+只读的板型信息（自检和网页上都会用到）：
+
+| 常量 | 说明 |
+| --- | --- |
+| `BOARD_ID` / `BOARD_NAME` / `BOARD_SOURCE` | 当前板型，以及「板型是怎么定下来的」 |
+| `CHIP` / `GPIO_MAX` | 芯片名与 GPIO 上限（C3 是 21，S3 是 48） |
+| `SAFE_OUTPUT_PINS` | 可以安全做输出的脚 |
+| `SPARE_PINS` | ★ **剩余可用的干净 IO**（S3 上会列出全部 18 只） |
+| `STRAPPING_SPARE_PINS` | 剩余可用的 strapping 脚（仅建议作输入） |
+| `RECOMMENDED_LIMIT_SWITCH_PINS` | 这块板上到位开关的推荐脚 |
+
+`hardware_config.validate()` 会在启动时校验引脚是否合法（重复占用、越界、
+踩到 Flash/USB/UART 保留脚、strapping 误用），**按当前板型的规则**判断，
+有问题直接报出来。把 `device_processing.py` 当脚本跑一次就能打印完整接线表
+并逐个点动 4 个通道：
 
 ```bash
 # 在设备 REPL 里（或 mpremote）执行
 import device_processing
+
+# 只想看看当前板型、用了哪些脚、还剩哪些脚
+from hardware_config import describe
+print(describe())
 ```
 
 ---
@@ -765,12 +939,19 @@ python tools/make_update_pack.py --out dist/x.ams
 
 | Job | 做什么 |
 | --- | --- |
-| **语法检查与逻辑自测** | `compileall` 检查全部 Python 文件；运行 `tests/run_tests.py` 验证离合互斥等硬件约束 |
-| **交叉编译 .mpy 部署包** | 用 `mpy-cross` 把 `python_code/` 编译成 `.mpy`，打成一个 zip |
-| **构建单文件固件 BIN** | 官方固件 + littlefs 文件系统镜像 → 合成可整片烧录的 BIN，并做四道校验 |
-| **发布固件** | 主分支提交 → 更新滚动预发布版 `latest`；打 `v*` tag → 发正式 Release |
+| **语法检查与逻辑自测** | `compileall` 检查全部 Python 文件；运行 `tests/run_tests.py` 验证离合互斥、两块板引脚表等约束 |
+| **交叉编译 .mpy 部署包（matrix: c3 / s3）** | 用 `mpy-cross` 把 `python_code/` 编译成 `.mpy`，**两块板各出一个包**（包内已写入对应的 `board_select.py`） |
+| **构建单文件固件 BIN（matrix: c3 / s3）** | 各自的官方固件 + littlefs 文件系统镜像 → 合成可整片烧录的 BIN，并做四道校验；S3 的分区表由脚本自行解析（vfs `0x200000` 起、6MB） |
+| **发布固件** | 主分支提交 → 更新滚动预发布版 `latest`；打 `v*` tag → 发正式 Release，两个板型的 bin + zip 一起上传 |
 
-所有产物同时挂在 Actions 的 Artifacts 下（保留 30 天）和 Releases 页面。
+所有产物同时挂在 Actions 的 Artifacts 下（保留 30 天）和 Releases 页面：
+
+```
+esp32c3-ams-firmware.bin / .sha256      单文件固件（C3，4MB）
+esp32s3-ams-firmware.bin / .sha256      单文件固件（S3 42 针，8MB）
+esp32c3-ams-mpy.zip                     .mpy 部署包（C3，含 BOARD = "c3"）
+esp32s3-ams-mpy.zip                     .mpy 部署包（S3，含 BOARD = "s3"）
+```
 
 **发布规则**
 
@@ -802,23 +983,35 @@ git push origin v1.0.0
 > `inisetup.check_bootsec()`，只要首扇区不是 `0xFF` 就判定「文件系统损坏」并进入
 > **死循环**，所以必须一次做对。脚本还会联网核对 littlefs 版本号，不一致直接报错停止。
 
-**升级 MicroPython 版本**：改 `.github/workflows/build.yml` 顶部那 5 个变量即可，
-文件里对每一项都有说明，其中 `MICROPYTHON_VERSION` 与 `LITTLEFS_VERSION` 的配套关系
-由脚本自动检查。
+**升级 MicroPython 版本**：改 `.github/workflows/build.yml` 顶部那几个变量，
+以及 `firmware` job 的 matrix 里两块板各自的固件链接与 SHA256，文件里对每一项都有说明。
+其中 `MICROPYTHON_VERSION` 与 `LITTLEFS_VERSION` 的配套关系由脚本自动检查。
 
 **本地等价操作**：
 
 ```bash
 python tests/run_tests.py                 # 自测
-python tools/build_mpy.py                 # 交叉编译 .mpy 包
+python tools/build_mpy.py                 # 交叉编译，默认 C3 + S3 各一个包
+python tools/build_mpy.py --board s3      # 只编 S3
 
 # 单文件固件（需要先编译那个小工具，CI 里是自动完成的）
 gcc -O2 -o tools/build/lfs_mkfs tools/lfs_mkfs.c \
     <littlefs源码>/lfs.c <littlefs源码>/lfs_util.c -I<littlefs源码>
-python tools/make_firmware_bin.py \
+
+# C3
+python tools/make_firmware_bin.py --board c3 \
   --firmware-url "https://micropython.org/resources/firmware/ESP32_GENERIC_C3-20240602-v1.23.0.bin" \
+  --firmware-sha256 "8058b7d6eb55f8124fbdcc797e2e8b39ae947a18df635567e02c8786874c04fd" \
   --out dist/esp32c3-ams-firmware.bin
+
+# S3（42 针）
+python tools/make_firmware_bin.py --board s3 \
+  --firmware-url "https://micropython.org/resources/firmware/ESP32_GENERIC_S3-20240602-v1.23.0.bin" \
+  --firmware-sha256 "b91080af2e9b78bad4308f98bb6187567cae24ed77cd7f48ef99b47af3ef0555" \
+  --out dist/esp32s3-ams-firmware.bin
 ```
+
+> 不写 `--out` 时按板型自动命名成 `dist/<芯片>-ams-firmware.bin`。
 
 > 本地生成固件需要 gcc；不想装就直接用 CI 产物（每次提交都会自动构建）。
 
@@ -845,7 +1038,7 @@ python tests/run_tests.py
 | `test_assert_single_detects_external_fault` | 模拟驱动电路故障导致两路吸合，体检必须发现并立即全部断开 |
 | `test_hold_releases_on_exception` | 动作中途抛异常，也必须释放离合、停电机 |
 | `test_motor_direction_and_dead_time` | 换向必须经过「两脚都拉低」的死区，H 桥不允许上下管同时导通 |
-| `test_hardware_config_valid` | 引脚配置必须避开 ESP32-C3 的 Flash / USB / UART 保留脚 |
+| `test_hardware_config_valid` | 引脚配置必须避开**当前板型**的 Flash / USB / UART 保留脚（C3 与 S3 规则不同） |
 
 **② 联网与配网**
 
@@ -957,6 +1150,22 @@ python tests/run_tests.py
 | `test_ota_upload_endpoint_rejects_bad_pack` | ★ 坏包回 400，一个文件都不写；`Content-Length` 为 0 也挡住 |
 | `test_reboot_is_skipped_in_selftest_mode` | `allow_reboot=False` 时不真重启（桌面自测用） |
 
+**⑦ 两块开发板（ESP32-C3 / ESP32-S3）的引脚表**
+
+两块板共用一套业务代码，差异全在 `board_c3.py` / `board_s3.py`。
+这一组测试把**两份表都**拉出来校验，避免「只测了 C3、S3 那份写错了没人发现」。
+
+| 测试 | 验证内容 |
+| --- | --- |
+| `test_board_c3_pin_table_is_valid` | ★ C3 那份表：引脚不越界、不碰保留脚、电机在安全输出脚上、剩余 IO 不漏报 |
+| `test_board_s3_pin_table_is_valid` | ★ S3（42 针）那份表：同样的全套约束，`GPIO_MAX` 是 48 |
+| `test_s3_clutches_all_land_on_clean_pins` | ★ S3 的 4 路离合全在干净脚（`6/7/8/9`）上，一个都没落在 strapping 脚 |
+| `test_s3_lists_every_spare_io_pin` | ★ S3 剩余 IO = 25 只安全输出脚 − 已占 7 只 = **18 只**，且必须全部列出；保留脚一个都不许混进来 |
+| `test_board_files_agree_on_the_shared_contract` | 两份表必须提供同一套常量名（`hardware_config` 才能无差别加载）；识别关键字不能互相包含 |
+| `test_built_board_select_wins_over_chip_detection` | ★ 编译期写入的 `board_select.py` 优先级最高 —— 这就是「编译时自动套用对应配置」 |
+| `test_board_falls_back_to_chip_name_detection` | 没有 `board_select.py` 时按 `os.uname().machine` 识别；认不出来按 C3 处理并提示 |
+| `test_current_board_config_matches_the_selected_board_file` | `hardware_config` 导出的必须就是所选板型文件里的那一套；接线表要打出板型与剩余 IO |
+
 改动相应模块后请先跑一遍再上传。
 
 ### 页面的本地预览
@@ -990,6 +1199,50 @@ python tools/preview_server.py 9000 ap   # ★ 以「配置热点」模式启动
 ## 常见问题
 
 <details>
+<summary><b>★ WiFi 能连上、能 ping 通，但配置网页打不开 / 一直转圈（ESP32-C3 特有）</b></summary>
+
+**根因是内存，不是网络。** 这是本项目在 C3 上最典型、也最容易被误判成「网络问题」
+的故障。实测数据：
+
+| 状态 | 空闲堆 | 传 40KB+ 的 `index.html` |
+| --- | --- | --- |
+| 不加载应用 | ~149KB | 5.7 秒发完，链路正常 |
+| 加载应用后 | ~60KB | 第一个 TCP 分段就 `OSError(113)`，重传 9.4 秒后放弃，射频卡死，只能复位 |
+
+原因是 **ESP32 的 WiFi 驱动收发数据时要动态申请「连续」内存做收发缓冲**，
+而 MicroPython 的 GC 不做压缩 —— 应用 import 完之后空闲堆虽然还有 60KB，
+但最大连续块可能只有几 KB，于是驱动申请不到缓冲，链路就断了。
+表现就是 ping 得通、TCP 连接超时、串口里刷 `ECONNABORTED` / `WiFi 已断开`。
+
+> 加 OTA 功能之后应用体积变大，这个问题会从「偶发」变成「必然」——
+> 这也是「没加 OTA 之前只是慢，加了之后网页完全打不开」的原因。
+
+**怎么处理（按推荐顺序）：**
+
+1. **改用 ESP32-S3（42 针）** —— 这是根治办法。512KB SRAM，
+   同一个应用跑起来余量充足，并且不必再用 `.mpy` 省内存。见
+   [ESP32-S3（42 针）可用 IO](#esp32-s342-针可用-io)。
+2. **在 C3 上尽量省内存**：
+   - 用 `.mpy` 部署包而不是 `.py` 源码（`python tools/build_mpy.py --board c3`），
+     字节码导入时不需要在设备端重新编译，省下可观内存；
+   - 别在设备上跑 `board_override.py` 之类额外脚本；
+   - 确认没有别的东西在占内存（例如关掉不用的状态灯不会省多少，但能省一点）。
+3. **确认 WiFi 省电模式已关**：`main.py` 启动时会把 AP/STA 的
+   `pm` 都设成 `0`（`WIFI_PS_NONE`）。ESP32 默认是 `pm=1`（modem sleep），
+   大流量传输时会周期性休眠，加剧断链。
+
+```python
+# 在设备 REPL 里看空闲堆和各区域的「最大连续块」—— 关键指标是这个，不是总空闲量
+import gc, esp32
+gc.collect()
+print("空闲堆 =", gc.mem_free())
+for total, free, largest, minimum in esp32.idf_heap_info(esp32.HEAP_DATA):
+    print("  区域: 总 %d / 空闲 %d / 最大连续 %d" % (total, free, largest))
+```
+
+</details>
+
+<details>
 <summary><b>★ 接上负载后一直重启、电机一直有电流声、网页打不开</b></summary>
 
 **先对号入座，再动手改线：**
@@ -1003,9 +1256,16 @@ python tools/preview_server.py 9000 ap   # ★ 以「配置热点」模式启动
 
 **第一步：确认引脚没接错。**
 
-电机 `IN1` / `IN2` 只能是 `GPIO0 / GPIO1 / GPIO4 / GPIO5 / GPIO6 / GPIO7 / GPIO10`
-里的引脚。**`GPIO2` 和 `GPIO3` 是 ESP32-C3 的 strapping 启动模式脚，
-AT8236 的输入内置下拉会把它们在上电瞬间拉低，一接上就起不来。**
+电机 `IN1` / `IN2` 只能是**当前板型安全输出脚**里的引脚：
+
+- **ESP32-S3**：`GPIO1 / GPIO2 / GPIO4~GPIO18 / GPIO21 / GPIO38~GPIO42 / GPIO47 / GPIO48`
+  （避开 `GPIO0 / GPIO3 / GPIO45 / GPIO46` 这四个 strapping 脚）
+- **ESP32-C3**：`GPIO0 / GPIO1 / GPIO4 / GPIO5 / GPIO6 / GPIO7 / GPIO10`
+  （避开 `GPIO2` 和 `GPIO3` —— 它们是 strapping 启动模式脚，
+  AT8236 的输入内置下拉会把它们在上电瞬间拉低，一接上就起不来）
+
+拿不准就上电看日志里的「硬件配置」那段，它会直接告诉你当前板型、用了哪些脚、
+以及哪些脚还剩着（`hardware_config.describe()`）。
 
 **第二步：看「上电诊断」卡片 / 串口日志。**
 
@@ -1225,7 +1485,8 @@ esptool.py --chip esp32c3 --port COM5 write_flash -z 0x0 esp32c3-ams-firmware.bi
 设备会自动写文件并重启，**不用插 USB、不用重新配网**。详见
 [应用层 OTA](#应用层-ota网页升级不用插-usb)。
 
-**但 `esp32c3-ams-firmware.bin` 不能走这里。** 那块 BIN 是**整机固件**，
+**但整机固件 BIN（`esp32c3-ams-firmware.bin` / `esp32s3-ams-firmware.bin`）
+不能走这里。** 那块 BIN 是**整机固件**，
 而这块板子的分区表只有单个 factory 应用分区，没有备用分区可以切换 ——
 MicroPython 里没地方安全地写「正在运行的自己」。
 
@@ -1233,13 +1494,16 @@ MicroPython 里没地方安全地写「正在运行的自己」。
 
 ```
 这是整机固件 BIN，不是应用更新包。网页 OTA 只能更新程序与界面（.ams 包）；
-要整机升级请用 USB 刷写 esp32c3-ams-firmware.bin
+要整机升级请用 USB 刷写 esp32c3-ams-firmware.bin（C3 板）或 esp32s3-ams-firmware.bin（S3 板）
 ```
 
-整机升级仍然用：
+整机升级仍然用（换成你手上的板型）：
 
 ```bash
+# ESP32-C3
 esptool.py --chip esp32c3 --port COM5 write_flash -z 0x0 esp32c3-ams-firmware.bin
+# ESP32-S3（42 针）
+esptool.py --chip esp32s3 --port COM5 write_flash -z 0x0 esp32s3-ams-firmware.bin
 ```
 </details>
 

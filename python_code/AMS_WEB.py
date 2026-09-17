@@ -121,6 +121,13 @@ HEADER_WAIT_MS = 600        # 读请求头的**最长等待**；浏览器预连�
 HEAD_FIRST_BYTE_MS = 180
 BODY_WAIT_MS = 800          # 读完请求头后，再给请求体这么多时间（POST 才有）
 SEND_TIMEOUT_S = 3.0        # 发送阶段超时，防止客户端半死不活把服务端拖住
+# ★ 回完包、关连接之前留的"冲刷时间"（毫秒）。
+#   实测（PC 侧计数 + 板子串口）：index.html 在板子上 65 个分块、65607 字节
+#   5.67 秒全部 sendall 返回，但**紧接着 close()** 时 PC 只收到 61388 字节 ——
+#   最后约 4KB 还在路上就被关掉了。浏览器按 Content-Length 等那截尾巴，
+#   表现就是"页面加载到一半不动"。
+#   所以：sendall 返回 ≠ 对端已收到，关连接前必须给 TCP 一点时间。
+SEND_DRAIN_MS = 500
 # 请求（头 + 体）总量上限。MQTT 配置这份 JSON 约 300 字节，
 # 5120 足够宽裕，异常请求会在这里被截断丢弃。
 MAX_REQUEST_BYTES = 5120
@@ -1386,6 +1393,7 @@ class AMS_WEB(AMS):
                 logout("accept 异常: " + str(e), is_error=True)
                 continue
 
+            sent_before = self._sent      # 本次连接有没有真的回过东西
             try:
                 await self._serve_client(client)
             except MemoryError as e:
@@ -1403,6 +1411,15 @@ class AMS_WEB(AMS):
                 logout("处理请求出错: " + str(e) + "（" + mem_note() + "）",
                        is_error=True)
             finally:
+                # ★ 先冲刷再关（理由见 SEND_DRAIN_MS 的注释）：
+                #   sendall 只是把数据交给本机 TCP，最后一段可能还在路上。
+                #   只对"真的回过包"的连接等，空连接/预连接直接关，别白等。
+                #   这里用 await 而不是 time.sleep_ms —— 别把事件循环按住。
+                if self._sent != sent_before:
+                    try:
+                        await asyncio.sleep_ms(SEND_DRAIN_MS)
+                    except Exception:
+                        pass
                 try:
                     client.close()
                 except Exception:

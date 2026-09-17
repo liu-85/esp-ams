@@ -216,7 +216,9 @@ class OtaUpdate:
                     raise OtaError(
                         "这是整机固件 BIN，不是应用更新包。"
                         "网页 OTA 只能更新程序与界面（.ams 包）；"
-                        "要整机升级请用 USB 刷写 esp32c3-ams-firmware.bin")
+                        "要整机升级请用 USB 刷写 "
+                        "esp32c3-ams-firmware.bin（C3 板）或 "
+                        "esp32s3-ams-firmware.bin（S3 板）")
                 raise OtaError("文件格式不对：这不是 .ams 更新包")
             self.file_count = _u16(self._buf, 8)
             self.manifest_bytes = _u16(self._buf, 10)

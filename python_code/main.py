@@ -130,6 +130,35 @@ try:
     #     sta.scan()                 -> OK
     #     sta.connect(ssid, pwd)     -> OK  ← 预启动之前这里是会炸的
     _sta_if.active(True)             # 连路由器 / 扫 WiFi 都靠它，先在这儿开好
+
+    # ★★★ 关掉 WiFi 省电（modem sleep）—— 这是"网页打不开"的最终根因 ★★★
+    #
+    # esp_wifi 的默认省电模式是 WIFI_PS_MIN_MODEM（config('pm') 读回来是 1）。
+    # 它会让射频在空闲时打盹，配合某些路由器就会变成"关联时不时掉一下"。
+    #
+    # 实测（同一块板子、同一个路由器、RSSI=-47 信号极好）：
+    #     pm=1（默认）
+    #         · ping 时延 24~227 ms 乱跳（局域网本该只有几毫秒）
+    #         · 传 65KB 的 index.html：发出响应头 + 2KB 就卡住，
+    #           18.6 秒后 sendall 抛 OSError(113) —— EHOSTUNREACH
+    #         · 卡住的这段时间里 sta.ifconfig()[0] 从 192.168.2.153
+    #           掉成 0.0.0.0，之后又自己连回来 —— 关联在传输中真掉了
+    #         · 于是页面永远发不完，浏览器只能一直转圈
+    #     pm=0（关省电）
+    #         · ping 稳定 3~7 ms
+    #         · 同一个 65KB 页面：65 个分块、65607 字节，5.7 秒全部发完
+    #         · 传输途中 IP 全程不变
+    #
+    # 为什么放在第 0 步：调 config() 属于"改 WiFi 配置"，和 swcith_ap() 里
+    # 踩过的 0x0101（碎堆上 esp_wifi_set_config 必失败）是同一类操作，
+    # 必须在堆还完整的时候做。AP 接口也顺手设一遍 —— esp_wifi_set_ps()
+    # 是**整芯片**生效的，所以关掉之后热点侧也一起受益。
+    for _if in (_sta_if, _ap_if):
+        try:
+            _if.config(pm=0)         # 0 = WIFI_PS_NONE
+        except Exception:            # noqa: BLE001 - 老固件不认 pm 就跳过
+            pass
+
     del _ap_if, _sta_if
 except Exception as _wifi_error:     # noqa: BLE001 - 这里失败也不要挡住后面
     print("WiFi 驱动初始化失败: %r" % (_wifi_error,))

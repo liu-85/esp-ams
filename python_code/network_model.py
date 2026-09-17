@@ -76,6 +76,17 @@ class network_model:
         self.wlan_ap = network.WLAN(network.AP_IF)   # 热点模式
         self.wlan_sta = network.WLAN(network.STA_IF)  # 连接路由器的模式
 
+        # ★ 关掉 WiFi 省电（modem sleep），幂等、代价极小。
+        #   main.py 第 0 步已经在干净堆上设过一次（那才是权威位置，注释在那边），
+        #   这里再兜一次是为了"从 REPL 直接跑 main_task()"这种情况 ——
+        #   省电没关时传大文件会中途掉关联，表现就是网页永远发不完。
+        #   esp_wifi_set_ps() 是整芯片生效的，所以两个口设一次都行。
+        for _wlan in (self.wlan_sta, self.wlan_ap):
+            try:
+                _wlan.config(pm=0)       # 0 = WIFI_PS_NONE
+            except Exception:
+                pass
+
         # ★★ 这里**故意不**再把两个口 active(False) 关一遍！★★
         #
         # 以前这里是有的，看着像是"先归零再开始"，实际是个定时炸弹：

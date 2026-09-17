@@ -6,6 +6,13 @@ name: 构建与发布
 #   · push 形如 v1.0 的 tag → 编译，并发布正式 Release
 #   · Pull Request          → 只编译校验，不发布
 #   · 也可以在网页上手动点运行
+#
+# ★ 每次构建都会同时产出 **两块开发板** 的固件（ESP32-C3 和 ESP32-S3 42 针）：
+#        dist/c3/ + dist/esp32c3-ams-mpy.zip + dist/esp32c3-ams-firmware.bin
+#        dist/s3/ + dist/esp32s3-ams-mpy.zip + dist/esp32s3-ams-firmware.bin
+#   两块板共用同一套业务代码，引脚差异在 python_code/board_c3.py 与
+#   python_code/board_s3.py 里，编译时由 --board 自动往包里写 board_select.py
+#   决定设备加载哪一份。详见 README「开发板支持」。
 # =============================================================================
 on:
   push:
@@ -35,18 +42,18 @@ permissions:
 #                                  看 LFS2_VERSION：0x00020008 对应的就是 2.8
 #   3. MPY_CROSS_VERSION        —— 与 MICROPYTHON_VERSION 保持一致，否则设备报
 #                                  ValueError: incompatible .mpy file
-#   4. MICROPYTHON_FIRMWARE_URL —— 到 https://micropython.org/download/ESP32_GENERIC_C3/
-#                                  复制「含构建日期」的那个 .bin 链接
+#   4. firmware job 的 matrix   —— 每块板的官方固件链接与 SHA256，都要更新：
+#                                  C3: https://micropython.org/download/ESP32_GENERIC_C3/
+#                                  S3: https://micropython.org/download/ESP32_GENERIC_S3/
+#                                  复制「含构建日期」的那个 .bin 链接。
+#                                  SHA256 用 sha256sum 算，从官网页面或下载后自算。
 #   5. MICROPYTHON_FIRMWARE_SHA256 —— 固件校验值；留空则只下载不做强校验
 # =============================================================================
 env:
   MICROPYTHON_VERSION: "1.23.0"
   LITTLEFS_VERSION: "2.8.0"
   MPY_CROSS_VERSION: "1.23.0"
-  MICROPYTHON_FIRMWARE_URL: "https://micropython.org/resources/firmware/ESP32_GENERIC_C3-20240602-v1.23.0.bin"
-  MICROPYTHON_FIRMWARE_SHA256: "8058b7d6eb55f8124fbdcc797e2e8b39ae947a18df635567e02c8786874c04fd"
   PYTHON_VERSION: "3.12"
-  FIRMWARE_BIN: "dist/esp32c3-ams-firmware.bin"
 
 jobs:
   # ===========================================================================
@@ -70,16 +77,22 @@ jobs:
           python -m compileall -q python_code tools tests
           echo "语法检查通过"
 
-      - name: 运行逻辑自测（含电磁离合互斥约束测试）
+      - name: 运行逻辑自测（含电磁离合互斥约束 + 两块板引脚表校验）
         run: python tests/run_tests.py
 
   # ===========================================================================
   # 第二关：交叉编译成 .mpy 部署包（给习惯用 mpremote / Thonny 的场景）
+  #   matrix：C3 与 S3 各出一个包，包内 board_select.py 已写死对应板型
   # ===========================================================================
   package:
-    name: 交叉编译 .mpy 部署包
+    name: 交叉编译 .mpy 部署包（${{ matrix.board }}）
     needs: check
     runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        board: [c3, s3]
 
     steps:
       - name: 拉取代码
@@ -95,33 +108,52 @@ jobs:
           pip install "mpy-cross==${MPY_CROSS_VERSION}"
           mpy-cross --version
 
-      - name: 交叉编译并打包
-        run: python tools/build_mpy.py
+      - name: 交叉编译并打包（板型 ${{ matrix.board }}）
+        run: python tools/build_mpy.py --board ${{ matrix.board }}
+
+      - name: 确认板型配置已写入
+        run: |
+          echo "---- board_select.py ----"
+          cat "dist/${{ matrix.board }}/board_select.py"
+          echo "---- 顶层 zip ----"
+          ls -lh "dist/esp32${{ matrix.board }}-ams-mpy.zip"
 
       - name: 列出产物
         run: |
-          echo "---- dist/ ----"
-          find dist -type f | sort
-          echo "---- 顶层 zip ----"
-          ls -lh esp32c3-ams-mpy.zip
+          echo "---- dist/${{ matrix.board }}/ ----"
+          find "dist/${{ matrix.board }}" -type f | sort
 
       - name: 上传构建产物
         uses: actions/upload-artifact@v4
         with:
-          name: esp32c3-ams-mpy-v${{ env.MPY_CROSS_VERSION }}
+          name: esp32${{ matrix.board }}-ams-mpy-v${{ env.MPY_CROSS_VERSION }}
           path: |
-            dist/
-            esp32c3-ams-mpy.zip
+            dist/${{ matrix.board }}/
+            dist/esp32${{ matrix.board }}-ams-mpy.zip
           retention-days: 30
 
   # ===========================================================================
   # 第三关：构建「单文件可烧录固件」
   #   官方 MicroPython 固件 + 本项目文件系统 → 一个从 0x0 覆盖整片 Flash 的 BIN
+  #   matrix：C3 与 S3 各一份（官方固件本身是芯片专属的，必须分开下）
   # ===========================================================================
   firmware:
-    name: 构建单文件固件 BIN
+    name: 构建单文件固件 BIN（${{ matrix.board }}）
     needs: check
     runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - board: c3
+            chip: esp32c3
+            firmware_url: "https://micropython.org/resources/firmware/ESP32_GENERIC_C3-20240602-v1.23.0.bin"
+            firmware_sha256: "8058b7d6eb55f8124fbdcc797e2e8b39ae947a18df635567e02c8786874c04fd"
+          - board: s3
+            chip: esp32s3
+            firmware_url: "https://micropython.org/resources/firmware/ESP32_GENERIC_S3-20240602-v1.23.0.bin"
+            firmware_sha256: "b91080af2e9b78bad4308f98bb6187567cae24ed77cd7f48ef99b47af3ef0555"
 
     steps:
       - name: 拉取代码
@@ -153,34 +185,38 @@ jobs:
       - name: 生成单文件固件（含全套校验）
         run: |
           python tools/make_firmware_bin.py \
-            --firmware-url "${MICROPYTHON_FIRMWARE_URL}" \
-            --firmware-sha256 "${MICROPYTHON_FIRMWARE_SHA256}" \
+            --board "${{ matrix.board }}" \
+            --chip "${{ matrix.chip }}" \
+            --firmware-url "${{ matrix.firmware_url }}" \
+            --firmware-sha256 "${{ matrix.firmware_sha256 }}" \
             --micropython-version "${MICROPYTHON_VERSION}" \
             --strict-version-check \
             --source python_code \
-            --out "${FIRMWARE_BIN}"
+            --out "dist/${{ matrix.chip }}-ams-firmware.bin"
 
       - name: 产物信息
+        env:
+          FIRMWARE_BIN: dist/${{ matrix.chip }}-ams-firmware.bin
         run: |
           ls -lh "${FIRMWARE_BIN}" "${FIRMWARE_BIN}.sha256"
           {
-            echo "### 单文件固件"
+            echo "### 单文件固件（${{ matrix.board }} / ${{ matrix.chip }}）"
             echo ""
             echo '```'
             ls -l "${FIRMWARE_BIN}"
             cat "${FIRMWARE_BIN}.sha256"
             echo '```'
             echo ""
-            echo "烧录: \`esptool.py --chip esp32c3 --port COM3 write_flash -z 0x0 $(basename "${FIRMWARE_BIN}")\`"
+            echo "烧录: \`esptool.py --chip ${{ matrix.chip }} --port COM3 write_flash -z 0x0 $(basename "${FIRMWARE_BIN}")\`"
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: 上传构建产物
         uses: actions/upload-artifact@v4
         with:
-          name: esp32c3-ams-firmware-v${{ env.MICROPYTHON_VERSION }}
+          name: ${{ matrix.chip }}-ams-firmware-v${{ env.MICROPYTHON_VERSION }}
           path: |
-            ${{ env.FIRMWARE_BIN }}
-            ${{ env.FIRMWARE_BIN }}.sha256
+            dist/${{ matrix.chip }}-ams-firmware.bin
+            dist/${{ matrix.chip }}-ams-firmware.bin.sha256
           retention-days: 30
 
   # ===========================================================================
@@ -216,28 +252,47 @@ jobs:
           cat > /tmp/release-notes.md <<EOF
           由 GitHub Actions 自动构建，对应提交 \`${GITHUB_SHA:0:7}\`。
 
+          ## 两块开发板的固件都在这里
+
+          | 开发板 | 单文件固件 | .mpy 部署包 |
+          | --- | --- | --- |
+          | **ESP32-C3** | \`esp32c3-ams-firmware.bin\` | \`esp32c3-ams-mpy.zip\` |
+          | **ESP32-S3（42 针）** | \`esp32s3-ams-firmware.bin\` | \`esp32s3-ams-mpy.zip\` |
+
+          业务代码完全一样，只有引脚表不同（\`board_c3.py\` / \`board_s3.py\`），
+          编译时已自动把对应的 \`board_select.py\` 写进包里 —— **照着板子下对应的文件就行**。
+
+          > **C3 用户注意**：C3 的 SRAM 只有 400KB，应用加载完空闲堆约 60KB，
+          > 传输 40KB 以上的配置页面时 WiFi 驱动可能申请不到连续缓冲，
+          > 表现为「网页打不开/一直转圈」。要稳就用 ESP32-S3。
+
           ## 烧录
 
           \`\`\`bash
           pip install esptool
           # 端口按实际情况改：Windows 形如 COM3，Linux/macOS 形如 /dev/ttyACM0
+
+          # ESP32-C3
           esptool.py --chip esp32c3 --port COM3 write_flash -z 0x0 esp32c3-ams-firmware.bin
+
+          # ESP32-S3（42 针，需 8MB 及以上 Flash）
+          esptool.py --chip esp32s3 --port COM3 write_flash -z 0x0 esp32s3-ams-firmware.bin
           \`\`\`
 
-          \`esp32c3-ams-firmware.bin\` 从地址 0x0 覆盖整片 4MB Flash，里面已经包含
-          引导程序 + 分区表 + MicroPython v${MICROPYTHON_VERSION} + 本项目全部代码 + umqtt 库。
+          这两个 BIN 都从地址 0x0 覆盖整片 Flash，里面已经包含引导程序 + 分区表 +
+          MicroPython v${MICROPYTHON_VERSION} + 本项目全部代码 + umqtt 库。
           **烧完直接上电就能跑，不需要再单独烧固件或上传 .py 文件。**
 
-          正常情况不需要先擦除（这个文件会覆盖整片 Flash，旧文件系统会被一并清掉）；
-          若想彻底清空，先执行 \`esptool.py --chip esp32c3 --port COM3 erase_flash\`。
+          正常情况不需要先擦除（会覆盖整片 Flash，旧文件系统被一并清掉）；
+          若想彻底清空，先执行 \`esptool.py --chip <芯片> --port COM3 erase_flash\`。
 
           首次上电若连不上已知 WiFi，板子会自己开一个名为 \`AMS_WIFI\` 的热点，
           手机连上后打开浏览器进配置页面填 WiFi 与打印机信息即可。
 
           ---
 
-          \`esp32c3-ams-mpy.zip\` 是 .mpy 版本，体积更小，适合用 mpremote / Thonny 手动上传的场景。
-          两种部署方式二选一即可。
+          \`esp32c3-ams-mpy.zip\` / \`esp32s3-ams-mpy.zip\` 是 .mpy 版本，体积更小，
+          适合用 mpremote / Thonny 手动上传的场景。两种部署方式二选一即可。
           EOF
           cat /tmp/release-notes.md
 

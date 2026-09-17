@@ -5,9 +5,20 @@
 /build/
 /tools/build/
 /esp32c3-ams-mpy.zip
+/esp32s3-ams-mpy.zip
+/esp32-ams-mpy.zip
 *.exe
 *.o
 *.a
+
+# 编译期生成的板型选择文件（由 tools/build_mpy.py / make_firmware_bin.py 生成，
+# 不要提交：它决定设备加载哪一份引脚表，属于构建产物而非源码）
+python_code/board_select.py
+board_select.py
+
+# 现场接线覆盖文件（"我这块板接线和别人不一样"时放在板子上用的，不进版本库）
+board_override.py
+python_code/board_override.py
 
 # ============================================================
 # 设备上生成的敏感配置（含 WiFi 密码、打印机访问码，绝对不能提交）

@@ -2731,7 +2731,8 @@ def test_page_ota_hints_usb_for_firmware_bin():
     """★ 页面上要说清楚"整机 BIN 不能走这里"，否则用户白折腾"""
     page = _page_source()
     check("整机固件 BIN" in page, "要提示整机固件 BIN 不能走网页 OTA")
-    check("esp32c3-ams-firmware.bin" in page, "要点名那个文件名")
+    check("esp32c3-ams-firmware.bin" in page, "要点名 C3 那个文件名")
+    check("esp32s3-ams-firmware.bin" in page, "两块板都要点名（S3 那份也不能走这里）")
     check("USB" in page, "要告诉用户整机升级还得插 USB")
 
 
@@ -2776,6 +2777,227 @@ def test_page_mqtt_status_distinguishes_configured_but_retrying():
     check("已保存" in page, "配好了要显示「已保存」")
     check("d.saved" in page and "d.connected" in page,
           "仍然要按 saved / connected 分别给提示")
+
+
+# ===========================================================================
+# 两块开发板：ESP32-C3 与 ESP32-S3（42 针）的引脚表
+# 背景：执行机构是「1 个共享电机 + 4 路电磁离合」，两块板可用的 IO 完全不同，
+#       所以引脚表拆成 board_c3.py / board_s3.py，编译期再由 board_select.py
+#       决定设备加载哪一份。这里把**两份表都**拉出来校验，避免"只测了 C3、
+#       S3 那份写错了却没人发现"。
+# ===========================================================================
+
+REQUIRED_BOARD_ATTRS = (
+    "BOARD_ID", "BOARD_NAME", "CHIP", "MACHINE_KEYWORDS", "GPIO_MAX",
+    "MOTOR_PIN_IN1", "MOTOR_PIN_IN2", "CLUTCH_PINS", "LED_PIN",
+    "LIMIT_SWITCH_PINS", "RECOMMENDED_LIMIT_SWITCH_PINS",
+    "STRAPPING_PINS", "SAFE_OUTPUT_PINS", "RESERVED_PINS",
+    "SPARE_PINS", "BOARD_NOTES",
+)
+
+
+def _load_board(board_id):
+    import importlib
+    return importlib.import_module("board_%s" % board_id)
+
+
+def _used_pins(board):
+    """这块板按默认接线实际占用的引脚集合"""
+    pins = {board.MOTOR_PIN_IN1, board.MOTOR_PIN_IN2}
+    pins.update(board.CLUTCH_PINS)
+    if board.LED_PIN is not None:
+        pins.add(board.LED_PIN)
+    for pin in board.LIMIT_SWITCH_PINS:
+        if pin is not None:
+            pins.add(pin)
+    return pins
+
+
+def _check_board_pin_table(board, expected_chip):
+    """一份引脚表该满足的全部硬性条件"""
+    for name in REQUIRED_BOARD_ATTRS:
+        check(hasattr(board, name), "%s 缺少必需的常量 %s" % (board.CHIP, name))
+
+    check_eq(board.CHIP, expected_chip, "%s 的 CHIP 写错了" % board.BOARD_ID)
+    check(board.MACHINE_KEYWORDS, "MACHINE_KEYWORDS 不能为空，否则认不出芯片")
+    check(board.BOARD_NOTES, "BOARD_NOTES 不能为空")
+
+    # 4 路离合是这个方案的硬性前提
+    check_eq(len(board.CLUTCH_PINS), 4, "%s 必须是 4 路电磁离合" % board.BOARD_ID)
+    check_eq(len(board.LIMIT_SWITCH_PINS), 4,
+             "%s 的 LIMIT_SWITCH_PINS 必须和离合路数一致" % board.BOARD_ID)
+    check_eq(len(set(board.CLUTCH_PINS)), 4, "4 路离合的引脚不能重复")
+
+    # 电机两脚不能是同一个
+    check(board.MOTOR_PIN_IN1 != board.MOTOR_PIN_IN2, "电机 IN1 / IN2 不能同脚")
+
+    # 电机脚必须在"可安全输出"的集合里
+    for label, pin in (("IN1", board.MOTOR_PIN_IN1), ("IN2", board.MOTOR_PIN_IN2)):
+        check(pin in board.SAFE_OUTPUT_PINS,
+              "%s 的电机 %s = GPIO%d 不在安全输出引脚里" % (board.BOARD_ID, label, pin))
+
+    # 所有会主动驱动的脚：范围合法 + 不碰保留脚
+    used = _used_pins(board)
+    for pin in sorted(used):
+        check(isinstance(pin, int) and 0 <= pin <= board.GPIO_MAX,
+              "%s 的 GPIO%d 超出 GPIO0~GPIO%d 范围" % (board.BOARD_ID, pin, board.GPIO_MAX))
+        check(pin not in board.RESERVED_PINS,
+              "%s 的 GPIO%d 是保留脚（%s），不能用"
+              % (board.BOARD_ID, pin, board.RESERVED_PINS.get(pin)))
+
+    # 安全输出集合本身不能和保留脚冲突
+    overlap = set(board.SAFE_OUTPUT_PINS) & set(board.RESERVED_PINS)
+    check_eq(overlap, set(), "%s 的 SAFE_OUTPUT_PINS 里混进了保留脚" % board.BOARD_ID)
+
+    # strapping 集合要有意义
+    check(board.STRAPPING_PINS, "%s 必须声明 strapping 引脚" % board.BOARD_ID)
+    for pin in board.STRAPPING_PINS:
+        check(0 <= pin <= board.GPIO_MAX, "strapping 脚 GPIO%d 超出范围" % pin)
+
+    # 剩余可用 IO：范围合法、不是保留脚、也没被占用
+    spare = set(board.SPARE_PINS)
+    for pin in sorted(spare):
+        check(0 <= pin <= board.GPIO_MAX, "剩余可用 GPIO%d 超出范围" % pin)
+        check(pin not in board.RESERVED_PINS, "剩余可用里不能有保留脚 GPIO%d" % pin)
+        check(pin not in used, "GPIO%d 已被占用，不能再算剩余可用" % pin)
+        check(pin in set(board.SAFE_OUTPUT_PINS) | set(board.STRAPPING_PINS),
+              "GPIO%d 既不在安全输出脚也不在 strapping 脚里，不该列为可用" % pin)
+    # 反过来：安全输出脚里没被占用的，必须全部列出来（不许漏）
+    check_eq(spare, set(board.SAFE_OUTPUT_PINS) - used,
+             "%s 的 SPARE_PINS 必须把安全输出脚里未占用的全部列出" % board.BOARD_ID)
+
+    strap_spare = getattr(board, "STRAPPING_SPARE_PINS", ())
+    check(strap_spare, "%s 应该把空闲的 strapping 脚也列出来" % board.BOARD_ID)
+    check_eq(set(strap_spare), set(board.STRAPPING_PINS) - used,
+             "%s 的 STRAPPING_SPARE_PINS 必须等于 strapping 脚减去已占用的" % board.BOARD_ID)
+
+
+def test_board_c3_pin_table_is_valid():
+    """★ C3 引脚表：7 只干净脚，电机在安全脚上，没有越界或误用保留脚"""
+    _check_board_pin_table(_load_board("c3"), "esp32c3")
+
+
+def test_board_s3_pin_table_is_valid():
+    """★ S3（42 针）引脚表：4 路离合全在干净脚上，剩余 IO 不漏报"""
+    _check_board_pin_table(_load_board("s3"), "esp32s3")
+
+
+def test_s3_clutches_all_land_on_clean_pins():
+    """★ S3 相比 C3 最大的好处：4 路离合不用再挤到 strapping 脚上
+
+    C3 只有 7 只干净脚，4 号离合被迫放在 strapping 的 GPIO3 上"带病运行"；
+    S3 的离合 1~4 落在 GPIO6/7/8/9，四只全是干净脚，一劳永逸。
+    """
+    board = _load_board("s3")
+    for index, pin in enumerate(board.CLUTCH_PINS, 1):
+        check(pin in board.SAFE_OUTPUT_PINS,
+              "S3 的电磁离合%d = GPIO%d 不在安全输出脚上" % (index, pin))
+        check(pin not in board.STRAPPING_PINS,
+              "S3 的电磁离合%d 不该落在 strapping 脚 GPIO%d 上" % (index, pin))
+
+
+def test_s3_lists_every_spare_io_pin():
+    """★ S3 的「剩余可用 IO 全部引出」——数量与内容都要对得上
+
+    本方案占 6 只（电机 2 + 离合 4）+ 状态灯 1 只，
+    S3 可安全输出的脚共 25 只，所以剩余应为 18 只；再加上 4 只空闲 strapping 脚。
+    """
+    board = _load_board("s3")
+    check_eq(len(board.SAFE_OUTPUT_PINS), 25, "S3 安全输出脚应为 25 只")
+    check_eq(len(board.SPARE_PINS), 18, "S3 剩余干净 IO 应为 18 只")
+    check_eq(len(board.STRAPPING_SPARE_PINS), 4, "S3 剩余 strapping 脚应为 4 只")
+
+    # 到位开关的推荐脚必须真的还在剩余列表里
+    for pin in board.RECOMMENDED_LIMIT_SWITCH_PINS:
+        check(pin in board.SPARE_PINS,
+              "到位开关推荐脚 GPIO%d 应该也在剩余可用列表里" % pin)
+
+    # 保留脚一个都不能混进来
+    for pin in (19, 20, 26, 43, 44):
+        check(pin in board.RESERVED_PINS, "GPIO%d 必须被 S3 标为保留脚" % pin)
+        check(pin not in board.SPARE_PINS, "保留脚 GPIO%d 不能算剩余可用" % pin)
+
+
+def test_board_files_agree_on_the_shared_contract():
+    """两份引脚表必须提供同一套常量名，hardware_config 才能无差别地加载"""
+    c3 = _load_board("c3")
+    s3 = _load_board("s3")
+    for name in REQUIRED_BOARD_ATTRS:
+        check(hasattr(c3, name) and hasattr(s3, name),
+              "两份板型文件都要有 %s" % name)
+    check(c3.BOARD_ID != s3.BOARD_ID, "两块板的 BOARD_ID 不能相同")
+    check_eq(c3.GPIO_MAX, 21, "C3 的 GPIO 上限是 21")
+    check_eq(s3.GPIO_MAX, 48, "S3 的 GPIO 上限是 48")
+    # 机器名关键字不能互相包含，否则识别会串台
+    c3_keys = set(c3.MACHINE_KEYWORDS) - {"C3"}
+    s3_keys = set(s3.MACHINE_KEYWORDS) - {"S3"}
+    check_eq(c3_keys & s3_keys, set(), "C3 与 S3 的识别关键字不能重叠")
+
+
+def test_built_board_select_wins_over_chip_detection():
+    """★ 编译期写入的 board_select.py 优先级最高（这就是"编译自动选配置"）"""
+    saved = hardware_config._BUILT_BOARD
+    try:
+        hardware_config._BUILT_BOARD = "s3"
+        board_id, source = hardware_config._detect_board()
+        check_eq(board_id, "s3", "board_select.py 写 s3 时必须选 S3")
+        check("构建" in source or "board_select" in source,
+              "要说明板型来自构建时指定，实际: %r" % source)
+
+        hardware_config._BUILT_BOARD = "c3"
+        check_eq(hardware_config._detect_board()[0], "c3",
+                 "board_select.py 写 c3 时必须选 C3")
+    finally:
+        hardware_config._BUILT_BOARD = saved
+
+
+def test_board_falls_back_to_chip_name_detection():
+    """没有 board_select.py 时按芯片名识别；认不出来按 C3 处理"""
+    saved_built = hardware_config._BUILT_BOARD
+    saved_machine = hardware_config._machine_name
+    try:
+        hardware_config._BUILT_BOARD = "auto"
+        hardware_config._machine_name = lambda: "ESP32S3 MODULE WITH ESP32S3"
+        check_eq(hardware_config._detect_board()[0], "s3",
+                 "机器名里带 S3 要认出 S3")
+
+        hardware_config._machine_name = lambda: "ESP32C3 MODULE WITH ESP32C3"
+        check_eq(hardware_config._detect_board()[0], "c3",
+                 "机器名里带 C3 要认出 C3")
+
+        hardware_config._machine_name = lambda: "X86_64"
+        board_id, source = hardware_config._detect_board()
+        check_eq(board_id, "c3", "认不出芯片时要退回 C3")
+        check("认不出" in source, "退回默认时要提示一句，实际: %r" % source)
+    finally:
+        hardware_config._BUILT_BOARD = saved_built
+        hardware_config._machine_name = saved_machine
+
+
+def test_current_board_config_matches_the_selected_board_file():
+    """hardware_config 导出的必须就是所选板型文件里的那一套"""
+    check(hardware_config.BOARD_ID in ("c3", "s3"),
+          "BOARD_ID 只能是 c3 或 s3，实际 %r" % hardware_config.BOARD_ID)
+    check(hardware_config.BOARD_SOURCE, "要能说清板型是怎么定下来的")
+
+    board = _load_board(hardware_config.BOARD_ID)
+    check_eq(hardware_config.BOARD_NAME, board.BOARD_NAME, "板名应与板型文件一致")
+    check_eq(hardware_config.CHIP, board.CHIP, "芯片名应与板型文件一致")
+    check_eq(hardware_config.GPIO_MAX, board.GPIO_MAX, "GPIO 上限应与板型文件一致")
+    check_eq(tuple(hardware_config.CLUTCH_PINS), tuple(board.CLUTCH_PINS),
+             "离合引脚应与板型文件一致")
+    check_eq(hardware_config.MOTOR_PIN_IN1, board.MOTOR_PIN_IN1,
+             "电机 IN1 应与板型文件一致")
+    check_eq(tuple(hardware_config.SPARE_PINS), tuple(board.SPARE_PINS),
+             "剩余可用 IO 应与板型文件一致")
+    check_eq(tuple(hardware_config.STRAPPING_SPARE_PINS),
+             tuple(getattr(board, "STRAPPING_SPARE_PINS", ())),
+             "剩余 strapping 脚应与板型文件一致")
+
+    # 接线表里要把板型和剩余可用脚都打出来，方便上电核对
+    report = hardware_config.describe()
+    check(hardware_config.BOARD_NAME in report, "接线表里要写清开发板型号")
+    check("剩余可用" in report, "接线表里要列出剩余可用 IO")
 
 
 # ===========================================================================
