@@ -22,6 +22,28 @@ GitHub: https://github.com/liu-85/esp-ams （remote origin，main 分支）
   main.py 顶部已前置 `WLAN(AP_IF)+WLAN(STA_IF)`，之后再调只花 16 字节
   （对象复用）。**往 main.py 前面加 import 时，别把这段挪到后面。**
 
+### 「干净堆预分配」总规则【本项目最容易复发的一类 bug】
+
+MicroPython 的 GC **不做压缩**。应用 import 完，空闲还有 64KB，
+但**最大连续块只剩 3,584 字节**，`gc.collect()` 也只多合出 2KB。
+于是**凡是"要一大块连续内存、且只在启动时做一次"的操作，都必须抢在
+应用加载之前做完**，否则要么抛 `0x0101`，要么**直接硬复位（无 traceback）**。
+
+main.py 的阶段划分就是这条规则的产物，不要在中间插 import：
+0. 建 AP/STA 对象 + `sta.active(True)` 真开射频（AP 已起时 STA 只花 48 字节）
+0.5 `auto_connection()`，失败才 `swcith_ap(1)` 开热点
+0.6 `boot_resources.prepare_web_server()` 预建 `:80` 监听 socket
+   然后才 `import AMS_WEB`
+
+已确认会踩的同源坑（都修了，别改回去）：
+- `network_model.__init__` **不许 `active(False)`**：AMS_WEB→AMS→Bambu_mqtt_cliet
+  这条继承链会让 `__init__` 在 main_task 里再跑一次，把刚开好的口关掉
+- `swcith_ap(1)` 必须**幂等**：热点已 active 时**绝不能再 `config()`** ——
+  实测碎堆上 `ap.config(essid/password/authmode)` 任一参数都抛 0x0101
+  （`active()`、`ifconfig()` 都正常，`active(True)` 重复调是 no-op）
+- 运行期开关热点仍有风险：配网成功 `swcith_ap(0)` 安全，之后想再开热点
+  会在碎堆上 `esp_wifi_start` → 复位。要换 WiFi 请重启走第 0.5 步
+
 ## 代码约定
 
 - 所有硬件参数只在 `hardware_config.py` 里改，业务代码不写死引脚
@@ -29,6 +51,7 @@ GitHub: https://github.com/liu-85/esp-ams （remote origin，main 分支）
 - 复合动作必须用 try/finally 保证「停电机 + 断开全部离合」
 - `boot.py` / `main.py` 必须保持 `.py`，不能编译成 `.mpy`
 - `config.json` / `wifi.dat` 含密码，已在 .gitignore 里，不要提交
+- **同一文件不要并行发两个 Edit**，会互相覆盖丢改动（USER.md 明确要求）
 
 ## 当前运行模式
 
@@ -40,7 +63,7 @@ GitHub: https://github.com/liu-85/esp-ams （remote origin，main 分支）
 ## 常用命令
 
 ```bash
-python tests/run_tests.py      # 桌面自测，无需板子（18 项）
+python tests/run_tests.py      # 桌面自测，无需板子（当前 116 项）
 python tools/build_mpy.py      # mpy-cross 交叉编译 + 打包，产物 dist/ 与 esp32c3-ams-mpy.zip
 python tools/make_firmware_bin.py   # 生成单文件一键烧录固件 dist/esp32c3-ams-firmware.bin
 ```
