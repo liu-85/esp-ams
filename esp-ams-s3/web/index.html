@@ -109,6 +109,9 @@
             <div class="wifi-item dim">点「重新扫描」搜索附近 WiFi</div>
           </div>
           <div class="row">
+            <input id="wifi_ssid_manual" placeholder="WiFi 名称（列表里没有就填这里）" autocomplete="off">
+          </div>
+          <div class="row">
             <input type="password" id="wifi_pwd" placeholder="WiFi 密码" autocomplete="off">
           </div>
           <div class="row">
@@ -116,8 +119,14 @@
             <button id="btn_wifi_scan">重新扫描</button>
           </div>
           <div class="tip warn">
-            ★ <b>单射频限制</b>：配置热点开着的时候，STA 只能连上<b>和热点同信道</b>的路由器。
-            如果一直连不上路由器，先按上面的「关闭配置热点」再试 —— 这一步能解决绝大多数连不上的情况。
+            ★ <b>单射频限制</b>：ESP32 只有一个射频单元，配置热点开着的时候连不上路由器
+            （实测会一直报"找不到该 WiFi"）。所以点「连接这个 WiFi」之后，设备会<b>先关掉配置热点</b>
+            再去连路由器 —— 手机会短暂掉线，这是正常的，连上路由器后重新打开本页即可。
+            连不上的话热点会自动开回来，可以继续重试。
+          </div>
+          <div class="tip">
+            列表里是开机时扫到的网络。<b>热点上有手机连着时不再重新扫描</b> —— 官方配网文档明确写了
+            全信道扫描会让驱动来不及发信标、把已连上的手机踢下线。找不到目标网络就直接在上面填名称。
           </div>
         </div>
 

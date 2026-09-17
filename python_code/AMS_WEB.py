@@ -935,6 +935,32 @@ class AMS_WEB(AMS):
             self.send_response(client, ujson.dumps(dict_info), status_code=400, is_json=True)
             return False
 
+        # ★★★ 连接之前先判断：配置热点会不会把射频占住？★★★
+        #
+        # ESP32 只有**一个**射频，SoftAP 和 STA 是分时复用的 —— 热点开着的
+        # 时候，STA 只能关联到**和热点同信道**的路由器。
+        #
+        # 实测（这块板子，2026-09-17）：
+        #   配置热点走的是驱动默认的**信道 1**（项目从来没给它设过信道），
+        #   而要连的 xiaomi2 在**信道 13**。于是：
+        #       网页上点"连接"     → 永远失败（卡在连接状态，出不来 IP）
+        #       同样凭据，热点关着时开机连 → 5.12 秒拿到 192.168.2.100
+        #   这就是"配网总是连不上"的真凶，跟密码、加密方式都无关。
+        #
+        # 所以先扫一次核对信道：不同就先关掉热点，把射频让给 STA。
+        # 配网成功后热点本来也要关；万一连接失败，下面会把热点恢复起来。
+        ap_was_on = self.ap_is_on()
+        releasing_rf = ap_was_on and self._ap_blocks_sta(ssid)
+        if releasing_rf:
+            # 必须**先把响应发出去**：热点一关，这个客户端立刻失联，
+            # 之后再想回任何内容都回不去了。
+            dict_info["info"] = "正在让出射频并连接 %s …" % ssid
+            dict_info["ap_on"] = False
+            self.send_response(client, ujson.dumps(dict_info), is_json=True)
+            self._sleep_ms(700)          # 等这份响应真的落到客户端
+            self.swcith_ap(0)            # 关热点 → 射频自由
+            self._sleep_ms(300)
+
         if self.do_connect(ssid, password):
             ip = self.sta_ip()
             dict_info["info"] = "%s 连接成功，IP = %s" % (ssid, ip or "(等待分配)")
@@ -954,7 +980,7 @@ class AMS_WEB(AMS):
             self.updata_data({"wifi_username": ssid, "wifi_password": password})
             logout("配网成功，已保存到 wifi.dat: %s" % ssid)
 
-            # ★ 配网成功后关掉配置热点。
+            # ★ 配网成功后关掉配置热点（如果上面还没关）。
             #   这是"WiFi 连上之后就不再显示配网页面"能成立的前提：
             #   网页只在 AP 模式下显示 WiFi 配置卡片，热点一关它就消失了。
             #   先等一下再关，否则这句响应还压在缓冲里，客户端会直接断掉。
@@ -965,9 +991,62 @@ class AMS_WEB(AMS):
                 dict_info["ap_on"] = False
             return True
 
+        # 失败：如果刚才把热点关了，此刻客户端是失联的（页面已经打不开）。
+        # 不恢复热点，用户就再也进不了配置页，只能靠重启板子 —— 所以必须恢复。
+        # 运行期重开热点会走 esp_wifi_start，碎堆上有复位风险；但**就算它真
+        # 复位了，重启后启动流程也会把热点打开**，两条路都回到"热点可用"。
+        if ap_was_on and not self.ap_is_on():
+            self._restore_ap_after_failed_connect()
+
         dict_info["info"] = "连接失败（%s），请检查密码或确认路由器 2.4G 频段已开启" % self.status_text()
         self.send_response(client, ujson.dumps(dict_info), status_code=400, is_json=True)
         return False
+
+    # ----------------------------------------------------------------------
+    # 单射频：热点与目标路由器抢射频的判断 / 恢复
+    # ----------------------------------------------------------------------
+    def _ap_blocks_sta(self, ssid):
+        """配置热点会不会挡住 STA 连这台路由器？
+
+        返回 True = 需要先关掉热点（也是**判断不出来时的保守答案**）。
+
+        判据很简单：扫一次，拿目标 SSID 的信道，跟热点自己的信道比。
+        注意 scan() 在 APSTA 下是可用的（实测热点开着也能扫到周围 6 个网络）。
+        """
+        target = None
+        try:
+            for ap in self.wlan_sta.scan():
+                name = ap[0]
+                if isinstance(name, bytes):
+                    name = name.decode()
+                if name == ssid:
+                    target = ap[2]          # (ssid, bssid, channel, rssi, ...)
+                    break
+        except Exception as e:
+            logout("配网前扫描失败，按“需要关热点”处理: %r" % (e,))
+            return True
+
+        if target is None:
+            # 扫不到多半是它在 5G 频段（ESP32 收不到）或信号太弱 ——
+            # 这种连接本来也会失败，但先按保守处理，别让热点挡着。
+            logout("扫描没看到 %s（可能在 5G 或太远），按“需要关热点”处理" % ssid)
+            return True
+
+        try:
+            ap_ch = self.wlan_ap.config("channel")
+        except Exception:
+            ap_ch = 1
+
+        logout("信道核对：配置热点=%s  %s=%s" % (ap_ch, ssid, target))
+        return ap_ch != target
+
+    def _restore_ap_after_failed_connect(self):
+        """配网失败后把配置热点恢复起来，否则用户只能重启板子才能重配。"""
+        logout("配网失败，正在恢复配置热点…")
+        try:
+            self.swcith_ap(1)
+        except Exception as e:
+            logout("恢复热点失败: %r（重启后会自动重开）" % (e,))
 
     @staticmethod
     def _sleep_ms(ms):

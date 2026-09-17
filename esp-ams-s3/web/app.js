@@ -648,17 +648,24 @@
     }
 
     function connectWifi() {
+        /* 优先用手动填的名称：热点上有手机连着时设备不会重新扫描，
+         * 列表可能是开机时的旧数据、甚至是空的，手动填是最后一条兜底路径。 */
+        var nm = ($('wifi_ssid_manual').value || '').trim();
         var sel = $('wifi_list').getElementsByClassName('sel')[0];
-        if (!sel) { toast('请先选一个 WiFi', 'bad'); return; }
-        var nm = sel.getElementsByClassName('nm')[0].textContent;
-        var pwd = $('wifi_pwd').value;
+        if (!nm && sel && sel.getElementsByClassName('nm').length) {
+            nm = sel.getElementsByClassName('nm')[0].textContent;
+        }
+        if (!nm) { toast('请先选一个 WiFi，或直接填写 WiFi 名称', 'bad'); return; }
 
         busy(true);
-        post('/wifi_connect', { name: nm, password: pwd }, function (d) {
+        post('/wifi_connect', { name: nm, password: $('wifi_pwd').value }, function (d) {
             busy(false);
-            toast((d && d.info) || (d && d.ok ? '已连接' : '连接失败'),
+            toast((d && d.info) || (d && d.ok ? '配置已保存' : '连接失败'),
                   (d && d.ok) ? 'ok' : 'bad');
-            setTimeout(refresh, 500);
+            $('wifi_pwd').value = '';
+            /* 设备马上要关热点去连路由器，这台手机很快会掉线；
+             * 连上之后要重新打开本页看结果，所以这里不急着刷新。 */
+            setTimeout(refresh, 800);
         });
     }
 

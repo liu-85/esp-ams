@@ -7,6 +7,14 @@
  * MicroPython 版最大的解放：那边每个 handler 都得拆成 `await` 片段，否则
  * uasyncio 事件循环被按住，网页就整个卡死。
  *
+ * ⚠️ 唯一的例外是 /wifi_connect：它**不能**在这里等连接结果。配网时设备会
+ *    关掉配置热点，而手机正是靠那个热点连着我们的 —— 热点一关，这个响应就
+ *    再也发不回手机了。所以它先把响应发出去，再把连接交给
+ *    wifi_mgr_provision_connect() 起的独立任务去做。
+ *
+ * ⚠️ 另一个例外是 /wifi_scan：热点上还有客户端时不许做全信道扫描
+ *    （官方配网文档明确会因此把客户端踢下线），只回缓存。见该 handler 注释。
+ *
  * ----------------------------------------------------------------------------
  * 目录
  * ----------------------------------------------------------------------------
@@ -561,11 +569,30 @@ static esp_err_t h_get_mqtt_info(httpd_req_t *req)
 
 static esp_err_t h_wifi_scan(httpd_req_t *req)
 {
-    /* 强制重扫 —— 这就是「重新扫描」按钮走的路，阻塞 1.5~3 秒可以接受，
-     * 因为它只在用户主动点击时发生，不是每 2 秒一次的轮询。 */
-    ams_log("网页触发 WiFi 扫描…");
+    /* ★ 热点上有客户端连着时，**绝对不做全信道扫描**。
+     *
+     *   ESP-IDF 官方配网文档（api-reference/provisioning/wifi_provisioning）里
+     *   写得很明确：「一次性扫描所有信道可能会导致 Wi-Fi 驱动没有足够时间发送
+     *   信标，进而导致与部分站点断连」，官方为此才改成"分组扫描、每组 4 个
+     *   信道、组间至少等 120ms"。
+     *
+     *   而配网页恰恰就是"手机连在热点上"的时候打开的 —— 旧版一进 WiFi 页就
+     *   自动扫一次，正好把手机踢下线：请求发不出去、响应回不来，用户看到的
+     *   就是"配网总是失败"；手机重连后又触发下一次扫描，形成死循环。
+     *
+     *   这里只读缓存（不扫描），并把原因写在 info 里。缓存为空时前端会引导
+     *   用户手动填 SSID，配网这条路照样走得通。 */
+    int clients = wifi_mgr_ap_is_on() ? wifi_mgr_ap_client_count() : 0;
+
     wifi_mgr_ap_info_t list[WIFI_MGR_SCAN_MAX];
-    int n = wifi_mgr_scan_cached(list, WIFI_MGR_SCAN_MAX, true);
+    int n;
+    if (clients > 0) {
+        n = wifi_mgr_scan_last(list, WIFI_MGR_SCAN_MAX);   /* 只读缓存，不扫描 */
+    } else {
+        /* 没人连着热点（或者热点压根没开）→ 放心扫 */
+        ams_log("网页触发 WiFi 扫描…");
+        n = wifi_mgr_scan_cached(list, WIFI_MGR_SCAN_MAX, true);
+    }
 
     cJSON *o = cJSON_CreateObject();
     cJSON_AddBoolToObject(o, "ok", n >= 0);
@@ -581,7 +608,16 @@ static esp_err_t h_wifi_scan(httpd_req_t *req)
         cJSON_AddNumberToObject(item, "channel", list[i].channel);
         cJSON_AddItemToArray(detail, item);
     }
-    if (n < 0) {
+    if (clients > 0) {
+        char info[200];
+        snprintf(info, sizeof(info),
+                 "热点上正有 %d 台设备在用，全信道扫描会把它们踢下线，"
+                 "所以本次不扫描，只列出已缓存的 %d 个网络；"
+                 "列表里没有目标 WiFi 时请直接在上面填写名称",
+                 clients, n > 0 ? n : 0);
+        cJSON_AddStringToObject(o, "info", info);
+        cJSON_AddBoolToObject(o, "scan_skipped", 1);
+    } else if (n < 0) {
         cJSON_AddStringToObject(o, "info", "扫描失败（射频忙或超时），稍后再试");
     } else {
         char info[64];
@@ -599,43 +635,36 @@ static esp_err_t h_wifi_connect(httpd_req_t *req)
 
     if (ssid == NULL || ssid[0] == '\0') {
         cJSON_Delete(body);
-        return reply_ok(req, false, "请先选一个 WiFi");
+        return reply_ok(req, false, "请先选一个 WiFi，或直接填写 WiFi 名称");
     }
 
     ams_log("网页请求连接 WiFi: %s", ssid);
-    esp_err_t err = wifi_mgr_connect(ssid, pass ? pass : "");
 
-    char info[128];
-    if (err != ESP_OK) {
-        snprintf(info, sizeof(info), "下发连接失败: %s", esp_err_to_name(err));
-        cJSON_Delete(body);
-        return reply_ok(req, false, info);
+    /* ★ 先落盘，再连（ESP-IDF 官方配网流程的顺序）。
+     *   老版本是"连上了才存"，于是密码填错一次、或者单射频下没连上，用户
+     *   填的东西就全丢了 —— 重启后仍然回到配网模式，得从头再填一遍。
+     *   保存失败不影响本次尝试，但要在日志里说清楚。 */
+    bool saved = (config_set_wifi(ssid, pass ? pass : "") == ESP_OK);
+    if (!saved) {
+        ams_log_err("WiFi 凭据保存失败（本次仍会尝试连接）");
     }
 
-    /* 等最多 20 秒拿 IP。**这里阻塞是安全的** —— 我们在 httpd 自己的任务里，
-     * 网页不会再卡死（MicroPython 版为了这一点把整个流程拆成了状态机）。 */
-    EventGroupHandle_t eg = wifi_mgr_event_group();
-    EventBits_t bits = xEventGroupWaitBits(
-        eg, WIFI_MGR_BIT_CONNECTED | WIFI_MGR_BIT_FAIL, pdFALSE, pdFALSE,
-        pdMS_TO_TICKS(20000));
-
-    if (bits & WIFI_MGR_BIT_CONNECTED) {
-        /* 记到 NVS，下次开机直连 */
-        config_set_wifi(ssid, pass ? pass : "");
-        snprintf(info, sizeof(info), "已连接，IP=%s", wifi_mgr_sta_ip());
-        cJSON_Delete(body);
-        return reply_ok(req, true, info);
-    }
-
-    if (bits & WIFI_MGR_BIT_FAIL) {
-        snprintf(info, sizeof(info), "连接失败：%s", wifi_mgr_status_text());
-    } else {
-        snprintf(info, sizeof(info),
-                 "20 秒内没拿到 IP。若配置热点正开着，请先关掉它再试"
-                 "（单射频下 STA 只能连同信道的路由器）");
-    }
+    /* ★ 响应必须**先**发出去，再去动射频。
+     *   接下来这一步会关掉配置热点，而手机正是靠这个热点连着我们的 ——
+     *   热点一关手机就掉线。响应要是还没发完，用户永远看不到结果，
+     *   现象就是"点连接没反应"或者页面报连接失败。
+     *   真正的连接在 wifi_mgr_provision_connect() 起的任务里做。 */
+    esp_err_t err = wifi_mgr_provision_connect(ssid, pass ? pass : "");
     cJSON_Delete(body);
-    return reply_ok(req, false, info);
+
+    if (err != ESP_OK) {
+        return reply_ok(req, false, "启动连接流程失败，请重试");
+    }
+
+    return reply_ok(req, true,
+                    saved ? "配置已保存，正在关闭配置热点并连接路由器…"
+                            "手机会短暂掉线，稍后刷新本页看结果"
+                          : "正在连接…（注意：配置保存失败，重启后要重新填写）");
 }
 
 /* ==========================================================================
@@ -1272,8 +1301,10 @@ esp_err_t web_server_start(void)
     conf.server_port = WEB_SERVER_PORT;
     conf.max_uri_handlers = 24;
     conf.lru_purge_enable = true;
-    /* ★ 栈要够用：/wifi_connect 会阻塞等 20 秒，/wifi_scan 阻塞 2~3 秒，
-     *   OTA 那个 handler 还要在栈上做临时拼接 */
+    /* ★ 栈要够用：/wifi_scan 最坏要阻塞 2~3 秒、OTA 那个 handler 还要在栈上
+     *   做临时拼接。（/wifi_connect 现在**不再**在 httpd 任务里等 20 秒了：
+     *   它把连接交给 wifi_mgr_provision_connect() 起的独立任务，
+     *   处理器立刻返回 —— 见那个函数的说明。） */
     conf.stack_size = 8192;
     conf.max_open_sockets = 7;
     conf.recv_wait_timeout = 15;

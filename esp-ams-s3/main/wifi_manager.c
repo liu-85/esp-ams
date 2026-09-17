@@ -10,30 +10,29 @@
  *   4. 扫描      —— 带缓存，避免网页刷新时反复阻塞 3 秒
  *
  * ----------------------------------------------------------------------------
- * ★ 关于"单射频信道对齐"（这一段是本文件里最有价值的部分）
+ * ★ 关于"配网时必须先关热点"（这一段是本文件里最有价值的部分）
  * ----------------------------------------------------------------------------
- * ESP32 只有一个射频单元，AP 和 STA 共用。SoftAP 开着的时候，STA 只能关联到
- * **和 SoftAP 同信道**的 AP。
+ * ESP32 只有一个射频单元，AP 和 STA 共用。2026-09-17 在同一块板子上逐秒
+ * 采样实测（MicroPython 版，串口直读 status()），结论很干脆：
  *
- *   实测（MicroPython 版，同一块板子）：SoftAP 信道 6，去连信道 11 的路由器
- *   → 一直卡在 WIFI_ERR_REASON_CONNECT 状态出不来 IP；
- *   关掉 SoftAP → 同一个路由器立刻连上。
+ *     热点开着 → sta.connect() 永远停在 201（WIFI_REASON_NO_AP_FOUND），
+ *                密码填对填错都一样，连等 30 秒也不会自己好；
+ *     关掉热点 → 同一组账号密码在第 1 秒就连上，IP 192.168.2.100。
  *
- * 所以在 wifi_mgr_connect() 里做了对齐：先扫一次拿到目标 SSID 的信道，
- * 如果和当前 SoftAP 信道不同，就把 SoftAP 切过去，再让 STA 连。
+ * 所以配网流程定成"先关热点、再连路由器"，见 wifi_mgr_provision_connect()。
+ * 曾经试过"把热点信道切到和目标路由器一致"来绕开这个限制，最后放弃了：
+ *   · 改信道会重启 SoftAP，把正在配网的手机踢下线；
+ *   · 而且实测并不能解决上面那个 NO_AP_FOUND —— 现象和信道无关。
  *
- * 代价是"连接前多扫一次"（约 2 秒），但这个开销只发生在用户点「连接」按钮
- * 的时候，不影响开机自动联网（那种情况下 SoftAP 通常没开，直接跳过对齐）。
- *
- * 注意：ESP-IDF 的 esp_wifi_set_config(WIFI_IF_AP, ...) 改信道时会**重启
- * SoftAP**，已连接的客户端会掉一次 —— 这个副作用可以接受（配网时客户端刚连上，
- * 重连即可），但如果 AP 上已经有客户端，我们宁可保持现状不动它，让用户手动
- * 关热点。下面的代码就是这么做的。
+ * 只有一种情况确实需要对齐信道：STA **已经连上**之后要开热点。那时候热点
+ * 必须跟着 STA 的信道走，否则射频在两条信道之间来回跳，两边都不稳 ——
+ * 见 desired_ap_channel()。
  */
 
 #include "wifi_manager.h"
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "esp_event.h"
@@ -334,60 +333,6 @@ const char *wifi_mgr_status_text(void)
     }
 }
 
-/**
- * 单射频信道对齐：如果 SoftAP 开着且信道与目标不同，把 SoftAP 切过去。
- *
- * 只在"热点上没有客户端"时才切 —— 有客户端的时候切信道会把人家踢下来，
- * 那种情况宁可保持现状，由用户决定（配网页面上有"关闭热点"按钮）。
- */
-static void align_ap_channel_to(const char *ssid)
-{
-    if (!s_ap_on || ssid == NULL || ssid[0] == '\0') {
-        return;
-    }
-
-    int target_ch = -1;
-    wifi_mgr_ap_info_t list[WIFI_MGR_SCAN_MAX];
-    int n = wifi_mgr_scan_cached(list, WIFI_MGR_SCAN_MAX, false);
-    for (int i = 0; i < n; i++) {
-        if (strncmp(list[i].ssid, ssid, WIFI_MGR_SSID_LEN) == 0) {
-            target_ch = list[i].channel;
-            break;
-        }
-    }
-    if (target_ch <= 0) {
-        return;   /* 没扫到（可能不在范围），交给驱动自己处理 */
-    }
-
-    wifi_config_t ap_cfg;
-    if (esp_wifi_get_config(WIFI_IF_AP, &ap_cfg) != ESP_OK) {
-        return;
-    }
-    if (ap_cfg.ap.channel == (uint8_t)target_ch) {
-        return;
-    }
-
-    /* 热点上挂着客户端时不动它 */
-    wifi_sta_list_t sta_list;
-    if (esp_wifi_ap_get_sta_list(&sta_list) == ESP_OK &&
-        sta_list.num > 0) {
-        ams_log_warn("配置热点上有 %d 个设备在用，暂不改信道"
-                     "（单射频下 STA 只能连同信道的路由器；"
-                     "如果连不上 %s，请先关掉热点）",
-                     sta_list.num, ssid);
-        return;
-    }
-
-    ap_cfg.ap.channel = (uint8_t)target_ch;
-    esp_err_t err = esp_wifi_set_config(WIFI_IF_AP, &ap_cfg);
-    if (err == ESP_OK) {
-        ams_log("为连上 %s（信道 %d），已把配置热点切到同一信道", ssid,
-                target_ch);
-    } else {
-        ams_log_warn("切热点信道失败: %s", esp_err_to_name(err));
-    }
-}
-
 esp_err_t wifi_mgr_connect(const char *ssid, const char *pass)
 {
     if (!ssid || ssid[0] == '\0') {
@@ -403,9 +348,6 @@ esp_err_t wifi_mgr_connect(const char *ssid, const char *pass)
 
     strncpy(s_target_ssid, ssid, sizeof(s_target_ssid) - 1);
     s_target_ssid[sizeof(s_target_ssid) - 1] = '\0';
-
-    /* ★ 单射频对齐（见文件头第三条） */
-    align_ap_channel_to(ssid);
 
     wifi_config_t cfg = {0};
     strncpy((char *)cfg.sta.ssid, ssid, sizeof(cfg.sta.ssid) - 1);
@@ -503,6 +445,107 @@ bool wifi_mgr_auto_connect(uint32_t timeout_ms)
 
     ams_log_err("全部 WiFi 记录都连不上，转由上层打开配置热点");
     return false;
+}
+
+/* ==========================================================================
+ * 三之二、配网连接：先关热点，再连路由器
+ * ==========================================================================
+ * 网页上「连接这个 WiFi」走的就是这里。顺序不能变，每一步都有实测依据：
+ *
+ *   1. 先等 700ms —— HTTP 响应得先发到手机上。热点一关手机就掉线，响应
+ *      没发完用户就永远看不到结果（旧版"点了连接没反应 / 报连接失败"的来源）。
+ *   2. 关掉配置热点，把唯一的射频让给 STA。实测这是能不能连上的分水岭。
+ *   3. 连目标路由器，最多等 20 秒拿到 IP。
+ *   4. 连不上就把热点重新打开 —— 否则用户的手机连不回来，彻底没法重试。
+ *
+ * 整个流程在独立任务里跑，HTTP 处理器立刻返回，网页不会转圈。
+ */
+
+/** 响应发出去之后再动射频，留出的等待时间 */
+#define PROVISION_RESPONSE_GRACE_MS   700
+/** 配网时等 IP 的上限（实测正常只要 1~2 秒，留足余量给弱信号） */
+#define PROVISION_CONNECT_TIMEOUT_MS  20000
+/** 配网任务的栈深度（只有几个 snprintf，够用） */
+#define PROVISION_TASK_STACK          4096
+
+typedef struct {
+    char ssid[WIFI_MGR_SSID_LEN];
+    char pass[CONFIG_PASS_MAX];
+} provision_req_t;
+
+static void provision_task(void *arg)
+{
+    provision_req_t *req = (provision_req_t *)arg;
+
+    /* ---- 1. 给 HTTP 响应留出发出去的时间 ---- */
+    vTaskDelay(pdMS_TO_TICKS(PROVISION_RESPONSE_GRACE_MS));
+
+    /* ---- 2. 关热点，把射频让给 STA ---- */
+    if (s_ap_on) {
+        ams_log("配网：先关闭配置热点，把射频让给 STA");
+        wifi_mgr_ap_stop();
+        vTaskDelay(pdMS_TO_TICKS(300));
+    }
+
+    /* ---- 3. 连路由器 ---- */
+    xEventGroupClearBits(s_events, WIFI_MGR_BIT_CONNECTED | WIFI_MGR_BIT_FAIL);
+
+    bool ok = false;
+    esp_err_t err = wifi_mgr_connect(req->ssid, req->pass);
+    if (err == ESP_OK) {
+        EventBits_t bits = xEventGroupWaitBits(
+            s_events, WIFI_MGR_BIT_CONNECTED | WIFI_MGR_BIT_FAIL,
+            pdFALSE, pdFALSE, pdMS_TO_TICKS(PROVISION_CONNECT_TIMEOUT_MS));
+        ok = (bits & WIFI_MGR_BIT_CONNECTED) != 0;
+        if (!ok) {
+            ams_log_err("配网失败：%s", wifi_mgr_status_text());
+        }
+    } else {
+        ams_log_err("配网失败：连接请求没下发成功（%s）", esp_err_to_name(err));
+    }
+
+    if (ok) {
+        ams_log("配网成功：已连上 %s，IP = %s", s_cur_ssid, s_sta_ip);
+        ams_log("配置热点保持关闭；要重新配网时在网页上点「打开配置热点」");
+    } else {
+        /* ---- 4. 失败 → 无条件把热点开回来 ----
+         * 注意是**无条件**：wifi_mgr_connect() 里会先 disconnect，所以这时候
+         * 设备已经离线了。热点是唯一还能联系上它的入口 —— 哪怕之前热点是
+         * （连上路由器之后）关着的，也必须开回来，否则用户彻底进不去配网页。 */
+        if (!s_ap_on) {
+            ams_log_warn("正在重新打开配置热点，请连回热点后重试");
+            if (wifi_mgr_ap_start() != ESP_OK) {
+                ams_log_err("配置热点重开失败，重启设备即可恢复");
+            }
+        }
+    }
+
+    free(req);
+    vTaskDelete(NULL);
+}
+
+esp_err_t wifi_mgr_provision_connect(const char *ssid, const char *pass)
+{
+    if (ssid == NULL || ssid[0] == '\0') {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    /* 参数必须放堆上：调用方（HTTP 处理器）一返回，它的栈就没了 */
+    provision_req_t *req = calloc(1, sizeof(*req));
+    if (req == NULL) {
+        ams_log_err("配网任务参数分配失败");
+        return ESP_ERR_NO_MEM;
+    }
+    snprintf(req->ssid, sizeof(req->ssid), "%s", ssid);
+    snprintf(req->pass, sizeof(req->pass), "%s", pass ? pass : "");
+
+    if (xTaskCreate(provision_task, "wifi_prov", PROVISION_TASK_STACK, req, 5,
+                    NULL) != pdPASS) {
+        ams_log_err("配网任务创建失败");
+        free(req);
+        return ESP_FAIL;
+    }
+    return ESP_OK;
 }
 
 /* ==========================================================================
