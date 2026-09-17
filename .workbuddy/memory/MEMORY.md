@@ -60,6 +60,26 @@ main.py 的阶段划分就是这条规则的产物，不要在中间插 import�
   → **不要手动插拔料盘**，否则记录与实际不一致
 - 送料按时间推进，`NO_LIMIT_LOAD_MS` / `NO_LIMIT_RETRACT_MS` 需实测调整
 
+## 已知硬件问题：AP 热点发不出信号（2026-09-17 确诊，软件无解）
+
+- 现象：启动日志一切正常（`配置热点已打开: AMS_WIFI`，0.57s 就起来），
+  但**任何客户端都搜不到这个热点**。软件状态全对（active/essid/authmode/
+  channel/hidden/ifconfig 都对），就是不发 beacon。
+- 已排除（都实测过）：应用代码、**整片 erase_flash 后只烧官方纯净固件**
+  依然如此；擦 NVS + phy_init 无效；开放/WPA2、config 前后顺序、信道
+  1/6/11、TX 功率降到 2dBm 全部无效；eFuse 正常。
+- 对照组（说明射频本身是好的）：关掉 AP 后 STA `scan()` 能扫到 14 个网
+  （最近的 -40dBm），STA 也能连上路由器拿 IP。
+- 旁证：`ap.config(channel=6)` 之后 `ap.config("channel")` 永远读回 1，
+  说明 AP 的射频层根本没真正起来，只是 `active(True)` 没报错。
+- 结论：板子射频发射侧（天线/PA/供电）有问题。**排查方向：手机贴 10cm
+  搜 → 换 USB 口/短线/外接 5V → 看模块是否有 IPEX 座没插天线 → 换模块。**
+  项目自带的 boot.py 自检一直提示"欠压复位"，供电嫌疑最大。
+- 绕行方案：`tools/serial_provision.ps1` —— 串口直写 wifi.dat 配网，
+  让板子走 STA 连路由器，不依赖热点。
+- ⚠️ **板子 ping 不通是正常的**（MicroPython 的 lwIP 不回 ICMP），
+  别用 ping 判断板子在不在线，用 HTTP 或看串口日志。
+
 ## 常用命令
 
 ```bash
