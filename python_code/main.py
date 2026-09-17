@@ -187,6 +187,19 @@ try:
         #   能明显减少"刚连上就掉线"。代价只有 0.6 秒，非常划算。
         time.sleep_ms(WIFI_SETTLE_MS)
     else:
+        # ★ 抢在开热点之前先扫一次。此刻 STA 已经开着、AP 还没开、堆也还干净，
+        #   是这次开机里唯一"扫描既不抢射频也不会踢人"的时机。
+        #
+        #   为什么非扫不可：配网页在"热点上已经有客户端"时是**故意不做全信道
+        #   扫描**的（ESP-IDF 官方配网文档：一次扫全信道会让驱动来不及发信标，
+        #   把正在配网的手机踢下线，手机重连又触发下一次扫描 → 死循环，这正是
+        #   "配网总是失败"的一部分）。那时页面只能回缓存，缓存是空的就只能手填
+        #   SSID。先把缓存热起来，列表才是满的。
+        #   扫失败也无所谓 —— 页面上仍然可以手填 SSID。
+        try:
+            _wifi.scan_networks(force=True)
+        except Exception as _scan_error:  # noqa: BLE001 - 扫不到不该挡住开机
+            print("开机预扫描失败（配网页仍可手填 SSID）: %r" % (_scan_error,))
         _wifi.swcith_ap(1)           # 开配置热点：手机连 AMS_WIFI 后访问 192.168.4.1
 except Exception as _bringup_error:  # noqa: BLE001 - 失败也不要挡住后面
     print("启动阶段联网失败（应用启动后还会再试一次）: %r" % (_bringup_error,))

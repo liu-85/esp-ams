@@ -312,6 +312,10 @@ button.mini{padding:5px 11px;font-size:12.5px}
           <h2>WiFi 配置 <span class="sub" id="wifi_head"></span></h2>
           <div class="wifi-list" id="wifi_list"><div class="wifi-item">点开始扫描…</div></div>
           <div class="row" style="margin-top:10px">
+            <label>名称</label>
+            <input id="wifi_ssid_manual" placeholder="WiFi 名称（列表里没有就填这里）" autocomplete="off">
+          </div>
+          <div class="row">
             <label>密码</label>
             <input type="password" id="wifi_pwd" placeholder="WiFi 密码" autocomplete="off">
           </div>
@@ -319,8 +323,11 @@ button.mini{padding:5px 11px;font-size:12.5px}
             <button class="primary" style="flex:1" id="btn_wifi_conn">连接这个 WiFi</button>
             <button class="ghost" id="btn_wifi_scan">重新扫描</button>
           </div>
-          <p class="tip">选一个 2.4G 的 WiFi 并填密码。连接成功后设备会记住，以后开机会直接连、
-            不再重新扫描，同时会自动关闭配置热点 —— 那时这个页面就会从左侧菜单里消失。</p>
+          <p class="tip" id="wifi_last" style="display:none"></p>
+          <p class="tip">选一个 2.4G 的 WiFi 并填密码（列表里没有就直接填名称）。点「连接这个 WiFi」后
+            设备会<b>先关掉配置热点</b>再去连路由器 —— 手机会短暂掉线，这是正常的；连上之后重新打开
+            本页看结果，连不上热点会自动开回来。连接成功后设备会记住，以后开机会直接连，那时这个
+            页面就会从左侧菜单里消失。</p>
         </div>
       </section>
 
@@ -979,6 +986,21 @@ function applyStatus(d){
 
   $('wifi_head').textContent = apOn ? ('热点 ' + (d.ap_ssid || 'AMS_WIFI') + ' · ' + (d.ap_ip || '192.168.4.1'))
                                    : '（仅配置热点开启时可用）';
+  // ★ 上次配网的结果。为什么必须由设备回传：连接前一定要先关掉配置热点，
+  //   手机当场掉线，那次 HTTP 回包根本到不了页面（连失败也一样）——
+  //   不这么做，用户只会看到"又失败了"，永远不知道是密码错还是信号问题。
+  var wl = $('wifi_last');
+  if(wl){
+    var last = d.wifi_last || {};
+    if(last && last.ssid){
+      var verdict = last.ok === true ? '成功' : (last.ok === false ? '失败' : '进行中');
+      wl.style.display = '';
+      wl.innerHTML = '上次配网：<b>' + esc(last.ssid) + '</b> · ' + verdict +
+                     (last.info ? '<br>' + esc(last.info) : '');
+    } else {
+      wl.style.display = 'none';
+    }
+  }
   $('mqtt_head').textContent = mqttOn ? '已连接' : '未连接';
   var saved = $('mqtt_saved');
   if(saved){
@@ -1053,15 +1075,22 @@ function rescan_wifi(){
   wifiSig = null;
   send('/wifi_scan', null, function(d){
     renderWifiList(d.ssids, curSsid, true);
-    toast('扫描完成，共 ' + ((d.ssids || []).length) + ' 个网络');
+    // ★ 热点上还有手机连着时，设备会**跳过**全信道扫描（官方文档明确：一次
+    //   扫全信道会让驱动来不及发信标、把手机踢下线），并把原因放在 info 里。
+    toast(d.info || ('扫描完成，共 ' + ((d.ssids || []).length) + ' 个网络'));
   });
 }
 function connect_wifi(){
+  // ★ 优先用手动填的名称：热点上有手机连着时设备不会重新扫描，列表可能是
+  //   空的就是旧的，手动填是最后一条兜底路径。
+  var nm = ($('wifi_ssid_manual').value || '').trim();
   var sel = document.querySelector('#wifi_list .wifi-item.sel');
-  if(!sel || !sel.getElementsByClassName('nm').length){ toast('请先点「重新扫描」并选择一个 WiFi', 'err'); return; }
-  var nm = sel.getElementsByClassName('nm')[0].textContent;
+  if(!nm && sel && sel.getElementsByClassName('nm').length){
+    nm = sel.getElementsByClassName('nm')[0].textContent;
+  }
+  if(!nm){ toast('请先选一个 WiFi，或直接填写 WiFi 名称', 'err'); return; }
   send('/wifi_connect', { name:nm, password:$('wifi_pwd').value }, function(d){
-    toast(d.info || '连接成功', 'ok');
+    toast(d.info || '配置已保存', 'ok');
     $('wifi_pwd').value = '';
     wifiSig = null; wifiNeedScan = true;
     refresh();

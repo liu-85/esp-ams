@@ -1496,6 +1496,97 @@ def test_wifi_connect_closes_ap_after_success():
           "必须先回包给浏览器，再关热点；反了客户端会丢掉「连接成功」这句话")
 
 
+def test_wifi_connect_uses_official_provisioning_order():
+    """★ 官方配网顺序：先落盘凭据 → 回包 → 关热点 → 再连
+
+    三件事都必须是这个顺序，缺一件就会退回"配网总是失败"：
+
+      1. 凭据先落盘。旧代码是"连成功了才存"，运行时那一次连接失败，用户填的
+         账号密码就丢了，只能从头再填一遍。ESP-IDF 官方配网示例是
+         「提交表单 → 写 NVS → 用新凭据重连」。而且**开机路径才是本项目实测
+         唯一稳定的连接路径**（那时热点还没起来，射频干净），凭据先存才能保证
+         下次开机一定拿新凭据再试一次。
+      2. 关热点必须在 do_connect 之前 —— 这是根因：单射频被 SoftAP 占着时，
+         sta.connect() 永远停在 201（NO_AP_FOUND），跟密码、信道都无关。
+      3. 回包必须在关热点之前 —— 热点一关 TCP 就断，响应没发完用户永远看不到。
+    """
+    import inspect
+    import AMS_WEB as web_module
+
+    src = inspect.getsource(web_module.AMS_WEB.handle_wifi_cennect)
+    idx_save = src.find("_save_wifi_credentials")
+    idx_send = src.find("send_response")
+    idx_apoff = src.find("swcith_ap(0)")
+    idx_conn = src.find("do_connect(")
+
+    check(idx_save != -1, "配网要先调用 _save_wifi_credentials 落盘凭据")
+    check(idx_conn != -1, "配网要调用 do_connect 去连接")
+    check(idx_apoff != -1, "连接前必须关掉配置热点")
+    check(idx_send != -1, "关热点前必须先把响应发出去")
+
+    check(idx_save < idx_conn, "凭据必须先落盘再连接（连失败也不能丢）")
+    check(idx_apoff < idx_conn,
+          "必须先关掉配置热点再连接（单射频：热点占着射频 STA 就关联不上）")
+    check(idx_send < idx_apoff,
+          "必须先回包再关热点；反了客户端收不到任何结果")
+
+    # 失败分支必须**无条件**把热点开回来：那一刻设备已经离线，热点是唯一入口
+    idx_restore = src.find("_restore_ap_after_failed_connect")
+    check(idx_restore != -1, "连接失败后必须把配置热点恢复起来")
+    window = src[max(0, idx_restore - 80):idx_restore]
+    check("if not self.ap_is_on()" in window,
+          "恢复热点要无条件判断（只看现在关没关，不看之前开没开）")
+
+
+def test_wifi_last_result_survives_client_offline():
+    """★ 最近一次配网结果要能从 /status 读到
+
+    连接前必须先关掉配置热点 → 手机当场掉线 → 那一次 HTTP 回包大概率到不了
+    页面。失败原因不留下来，用户就只看到"又失败了"，永远不知道是密码错、
+    找不到 AP、还是路由器没开 2.4G。
+    """
+    import inspect
+    import AMS_WEB as web_module
+
+    app = web_module.AMS_WEB()
+    info = app._status_dict()
+    check("wifi_last" in info, "/status 必须带上最近一次配网结果")
+    check(isinstance(info["wifi_last"], dict),
+          "wifi_last 要是字典（还没配过就是空字典）")
+
+    src = inspect.getsource(web_module.AMS_WEB.handle_wifi_cennect)
+    check(src.count("self._wifi_last =") >= 2,
+          "成功和失败两条路都要把结果写进 _wifi_last")
+
+
+def test_wifi_connect_keeps_credentials_when_connect_fails():
+    """★ 连接失败时凭据已经在盘上了（官方顺序的直接推论）
+
+    这里用一个假的 write_profiles 走一遍 _save_wifi_credentials，确认它
+    真的会被调用、并且写进去的是用户填的那一组。
+    """
+    import AMS_WEB as web_module
+
+    app = web_module.AMS_WEB()
+    saved = {}
+
+    original_read = web_module.read_profiles
+    original_write = web_module.write_profiles
+    original_updata = app.updata_data
+    web_module.read_profiles = lambda: {"Old": "old-pwd"}
+    web_module.write_profiles = lambda profiles: saved.update(profiles)
+    app.updata_data = lambda d: dict(d)      # 别真的写 config.json
+    try:
+        app._save_wifi_credentials("NewNet", "new-pwd")
+    finally:
+        web_module.read_profiles = original_read
+        web_module.write_profiles = original_write
+        app.updata_data = original_updata
+
+    check(saved.get("NewNet") == "new-pwd", "新凭据要写进 wifi.dat")
+    check(saved.get("Old") == "old-pwd", "旧凭据不能被覆盖掉（auto_connection 会依次试）")
+
+
 def test_ap_can_be_toggled_from_web():
     """★ 网页上必须能把配置热点再打开
 

@@ -335,6 +335,11 @@ class AMS_WEB(AMS):
         #   排一堆动作（总线本身也会拒绝，但这里能给出更好的提示）。
         self._jog_channel = None
         self._jog_until = 0
+        # ★ 最近一次配网尝试的结果：{"ssid":..., "ok":True/False/None, "info":...}
+        #   为什么要有它：配网时**必须先关掉配置热点**，手机当场掉线，那次
+        #   HTTP 回包大概率到不了页面 —— 失败原因就此丢失，用户只看到"又
+        #   失败了"。把结果留在这里，手机重连上热点后一刷新就能读到。
+        self._wifi_last = {}
 
     # ======================================================================
     # 配置读写
@@ -543,6 +548,12 @@ class AMS_WEB(AMS):
                 False, "mqtt_configured"),
             # 只给前 12 个：SSID 一多，这段 JSON 就会明显变胖
             "ssids": _safe(lambda: list(self._scan_cache[:12]), [], "ssids"),
+            # 最近一次配网的结果。配网时热点会被关掉、手机当场掉线，
+            # 那次 HTTP 回包到不了页面，只能靠这里把原因带回来。
+            "wifi_last": _safe(lambda: self._wifi_last, {}, "wifi_last"),
+            # 热点上连着几个客户端。大于 0 时 /wifi_scan 会**跳过**全信道
+            # 扫描（否则会把正在配网的手机踢下线），页面据此解释原因。
+            "ap_clients": _safe(self._ap_client_count, -1, "ap_clients"),
             "color_list": _safe(lambda: self.color_list, [], "color_list"),
             "access_list": _safe(lambda: self.access_list, [], "access_list"),
             "current_access": _safe(lambda: self.filament_current, 0, "current_access"),
@@ -596,8 +607,33 @@ class AMS_WEB(AMS):
         self.send_response(client, ujson.dumps({"boot_count": 0}), is_json=True)
 
     async def handle_wifi_scan(self, client):
-        """强制扫描（用户点「重新扫描 WiFi」）。会阻塞约 2 秒，先把响应头发出去。"""
+        """「重新扫描 WiFi」按钮走的接口。
+
+        ★ 热点上有客户端连着时**不做全信道扫描**。
+          ESP-IDF 官方配网文档（api-reference/provisioning/wifi_provisioning）
+          写得很明确：「一次性扫描所有信道可能会导致 Wi-Fi 驱动没有足够时间
+          发送信标，进而导致与部分站点断连」。而配网页恰恰就是"手机连在热点
+          上"时打开的 —— 旧版一进 WiFi 页就自动扫一次，正好把手机踢下线，
+          于是"配网总是失败"；手机重连后又触发下一次扫描，形成死循环。
+
+          所以这种情况只回缓存，并把原因交给页面显示（页面上可以手动填 SSID）。
+        """
         await asyncio.sleep_ms(20)
+
+        clients = self._ap_client_count() if self.ap_is_on() else 0
+        if clients != 0:                      # -1 表示数不出来，按"有人在用"处理
+            ssids = list(self._scan_cache[:12])
+            info = ("热点上还有设备在用，全信道扫描会把它们踢下线，"
+                    "本次只列出已缓存的 %d 个网络；列表里没有就直接填 WiFi 名称"
+                    % len(ssids))
+            logout("跳过全信道扫描（热点客户端数=%d），只回缓存 %d 条"
+                   % (clients, len(ssids)))
+            self.send_response(client,
+                               ujson.dumps({"ssids": ssids, "info": info,
+                                            "scan_skipped": True}),
+                               is_json=True)
+            return
+
         ssids = self.scan_networks(force=True)
         self.send_response(client, ujson.dumps({"ssids": ssids}), is_json=True)
 
@@ -935,50 +971,62 @@ class AMS_WEB(AMS):
             self.send_response(client, ujson.dumps(dict_info), status_code=400, is_json=True)
             return False
 
-        # ★★★ 连接之前先判断：配置热点会不会把射频占住？★★★
+        # ★★★ 官方配网顺序第 1 步：**先把凭据落盘，再去连** ★★★
         #
-        # ESP32 只有**一个**射频，SoftAP 和 STA 是分时复用的 —— 热点开着的
-        # 时候，STA 只能关联到**和热点同信道**的路由器。
+        # ESP-IDF 官方配网（api-reference/provisioning/wifi_provisioning 的
+        # 示例流程）就是这个顺序：提交表单 → 凭据写进 NVS → 用新凭据重连，
+        # 参考实现里干脆 esp_restart() 重启重连。
         #
-        # 实测（这块板子，2026-09-17）：
-        #   配置热点走的是驱动默认的**信道 1**（项目从来没给它设过信道），
-        #   而要连的 xiaomi2 在**信道 13**。于是：
-        #       网页上点"连接"     → 永远失败（卡在连接状态，出不来 IP）
-        #       同样凭据，热点关着时开机连 → 5.12 秒拿到 192.168.2.100
-        #   这就是"配网总是连不上"的真凶，跟密码、加密方式都无关。
+        # 旧代码是反过来的（连成功了才存），后果很直接：运行时那一次连接一旦
+        # 失败，用户刚填的账号密码就丢了，只能从头再填一遍 —— 这就是
+        # "配网总是失败"最难受的地方：不是连不上，是**连不上还什么都留不下**。
         #
-        # 所以先扫一次核对信道：不同就先关掉热点，把射频让给 STA。
-        # 配网成功后热点本来也要关；万一连接失败，下面会把热点恢复起来。
-        ap_was_on = self.ap_is_on()
-        releasing_rf = ap_was_on and self._ap_blocks_sta(ssid)
-        if releasing_rf:
-            # 必须**先把响应发出去**：热点一关，这个客户端立刻失联，
-            # 之后再想回任何内容都回不去了。
-            dict_info["info"] = "正在让出射频并连接 %s …" % ssid
+        # 这块板子上"先存"还有一层更实在的收益：**开机路径才是实测唯一稳定
+        # 的连接路径**（第 0.5 步 auto_connection 跑的时候热点还没起来，射频
+        # 是干净的）。凭据先落盘，就算下面运行时这次连接失败、或者板子中途
+        # 复位了，下次开机一定会拿新凭据再连一次，绝不会"白配一场"。
+        self._save_wifi_credentials(ssid, password)
+        self._wifi_last = {"ssid": ssid, "ok": None, "info": "配置已保存，等待连接结果"}
+
+        # ★★★ 官方配网顺序第 2 步：连接之前，先把配置热点关掉 ★★★
+        #
+        # ESP32 只有**一个**射频，SoftAP 和 STA 是分时复用的。同一块板子上
+        # 逐秒采样实测（2026-09-17，串口直读 status()）：
+        #     热点开着 → sta.connect() 永远停在 201（WIFI_REASON_NO_AP_FOUND），
+        #                密码填对填错都一样，连等 30 秒也不会自己好；
+        #     热点关掉 → 同一组账号密码在**第 1 秒**就连上，IP 192.168.2.100。
+        # 曾经怀疑是"热点在信道 1 挡住了信道 13 的路由器"，已被这组实测推翻：
+        # 现象和信道无关（错密码也一样卡在 201），而且驱动本来就会带着热点
+        # 一起跳信道。
+        #
+        # 顺序必须是：**先把响应发回手机** → 关热点让出射频 → 再连路由器。
+        # 热点一关这条 TCP 连接就断了，响应没发完用户就永远看不到结果；
+        # 结果同时写进 self._wifi_last，手机重连回本页时能从 /status 读到。
+        if self.ap_is_on():
             dict_info["ap_on"] = False
+            dict_info["info"] = ("配置已保存，正在关闭配置热点并连接 %s …"
+                                 "手机会短暂掉线，稍后重连本页看结果" % ssid)
             self.send_response(client, ujson.dumps(dict_info), is_json=True)
             self._sleep_ms(700)          # 等这份响应真的落到客户端
             self.swcith_ap(0)            # 关热点 → 射频自由
             self._sleep_ms(300)
+        else:
+            # 热点本来就关着（从 STA 侧打开的页面，一般走不到这里）
+            dict_info["info"] = "配置已保存，正在连接 %s …" % ssid
+            self.send_response(client, ujson.dumps(dict_info), is_json=True)
 
         if self.do_connect(ssid, password):
             ip = self.sta_ip()
+            logout("配网成功: %s  IP=%s" % (ssid, ip or "(等待分配)"))
             dict_info["info"] = "%s 连接成功，IP = %s" % (ssid, ip or "(等待分配)")
             dict_info["ip"] = ip
             dict_info["wifi_ssid"] = ssid
             dict_info["ap_on"] = self.ap_is_on()
-            self.send_response(client, ujson.dumps(dict_info), is_json=True)
-
-            # 把成功的账号密码记下来，下次开机直接连
-            try:
-                profiles = read_profiles()
-            except OSError:
-                profiles = {}
-            profiles[ssid] = password
-            write_profiles(profiles)
-            # 顺手同步进 config.json，方便一眼看到当前用的 WiFi
-            self.updata_data({"wifi_username": ssid, "wifi_password": password})
-            logout("配网成功，已保存到 wifi.dat: %s" % ssid)
+            # 记进 _wifi_last：热点已经关了，下面这个回包大概率到不了手机，
+            # 页面重连上来读 /status 里的 wifi_last 才知道结果。
+            self._wifi_last = {"ssid": ssid, "ok": True, "ip": ip,
+                               "info": dict_info["info"]}
+            self._try_send(client, ujson.dumps(dict_info))
 
             # ★ 配网成功后关掉配置热点（如果上面还没关）。
             #   这是"WiFi 连上之后就不再显示配网页面"能成立的前提：
@@ -991,54 +1039,68 @@ class AMS_WEB(AMS):
                 dict_info["ap_on"] = False
             return True
 
-        # 失败：如果刚才把热点关了，此刻客户端是失联的（页面已经打不开）。
-        # 不恢复热点，用户就再也进不了配置页，只能靠重启板子 —— 所以必须恢复。
+        # 失败：此刻设备已经离线了（do_connect 会先断开旧连接），热点是唯一
+        # 还能联系上它的入口 —— 所以只要热点是关的就必须开回来，否则用户
+        # 只能靠重启板子才能重配。**无条件**，不看热点之前开没开。
         # 运行期重开热点会走 esp_wifi_start，碎堆上有复位风险；但**就算它真
         # 复位了，重启后启动流程也会把热点打开**，两条路都回到"热点可用"。
-        if ap_was_on and not self.ap_is_on():
+        if not self.ap_is_on():
             self._restore_ap_after_failed_connect()
 
-        dict_info["info"] = "连接失败（%s），请检查密码或确认路由器 2.4G 频段已开启" % self.status_text()
-        self.send_response(client, ujson.dumps(dict_info), status_code=400, is_json=True)
+        # ★ 凭据是**已经存下**的（官方顺序第 1 步），所以这里要说清楚：
+        #   不是白填一场，下次开机还会拿它再试一次。这句话让"配网失败"
+        #   从"又要重来"变成"知道发生了什么"。
+        dict_info["info"] = ("%s 连接失败（%s）。凭据已保存，下次开机会再试一次；"
+                             "请检查密码或确认路由器 2.4G 频段已开启"
+                             % (ssid, self.status_text()))
+        dict_info["ap_on"] = self.ap_is_on()
+        self._wifi_last = {"ssid": ssid, "ok": False, "info": dict_info["info"]}
+        self._try_send(client, ujson.dumps(dict_info), status_code=400)
         return False
 
     # ----------------------------------------------------------------------
-    # 单射频：热点与目标路由器抢射频的判断 / 恢复
+    # 凭据落盘 / 尽力回包 / 配网失败兜底 / 热点客户端计数
     # ----------------------------------------------------------------------
-    def _ap_blocks_sta(self, ssid):
-        """配置热点会不会挡住 STA 连这台路由器？
+    def _save_wifi_credentials(self, ssid, password):
+        """把 WiFi 账号密码**立刻**落盘（wifi.dat + config.json）。
 
-        返回 True = 需要先关掉热点（也是**判断不出来时的保守答案**）。
-
-        判据很简单：扫一次，拿目标 SSID 的信道，跟热点自己的信道比。
-        注意 scan() 在 APSTA 下是可用的（实测热点开着也能扫到周围 6 个网络）。
+        ★ 必须在"连接之前"调用，理由见 handle_wifi_cennect 里官方顺序的注释：
+          连不上的时候凭据更不能丢，开机路径还指望它。
+        ★ 两个写入都各自兜底：文件写不进去（只读/空间不足）不该让整条配网
+          流程中断 —— 大不了这次连上后重启会再配一次。
         """
-        target = None
         try:
-            for ap in self.wlan_sta.scan():
-                name = ap[0]
-                if isinstance(name, bytes):
-                    name = name.decode()
-                if name == ssid:
-                    target = ap[2]          # (ssid, bssid, channel, rssi, ...)
-                    break
+            profiles = read_profiles()
+        except OSError:
+            profiles = {}                 # 第一次配网，wifi.dat 还不存在
         except Exception as e:
-            logout("配网前扫描失败，按“需要关热点”处理: %r" % (e,))
-            return True
-
-        if target is None:
-            # 扫不到多半是它在 5G 频段（ESP32 收不到）或信号太弱 ——
-            # 这种连接本来也会失败，但先按保守处理，别让热点挡着。
-            logout("扫描没看到 %s（可能在 5G 或太远），按“需要关热点”处理" % ssid)
-            return True
-
+            logout("读取 wifi.dat 失败，将重建: %r" % (e,), is_error=True)
+            profiles = {}
+        profiles[ssid] = password
         try:
-            ap_ch = self.wlan_ap.config("channel")
-        except Exception:
-            ap_ch = 1
+            write_profiles(profiles)
+            logout("凭据已写入 wifi.dat: %s" % ssid)
+        except Exception as e:
+            logout("写入 wifi.dat 失败: %r" % (e,), is_error=True)
+        # 顺手同步进 config.json，方便一眼看到当前用的 WiFi
+        try:
+            self.updata_data({"wifi_username": ssid, "wifi_password": password})
+        except Exception as e:
+            logout("同步 config.json 失败: %r" % (e,), is_error=True)
 
-        logout("信道核对：配置热点=%s  %s=%s" % (ap_ch, ssid, target))
-        return ap_ch != target
+    def _try_send(self, client, payload, status_code=200):
+        """尽力回一次包，失败只记日志、不抛。
+
+        ★ 配网流程里客户端随时可能已经掉线了（配置热点刚被关掉），对端没了
+          sendall 会抛 OSError —— 这只说明"用户看不到这句话"，不是程序错误，
+          不该打断流程、也不该在上位机刷一屏 traceback。
+        """
+        try:
+            self.send_response(client, payload, status_code=status_code, is_json=True)
+            return True
+        except Exception as e:
+            logout("回包失败（客户端可能已掉线，结果已记入 wifi_last）: %r" % (e,))
+            return False
 
     def _restore_ap_after_failed_connect(self):
         """配网失败后把配置热点恢复起来，否则用户只能重启板子才能重配。"""
@@ -1047,6 +1109,21 @@ class AMS_WEB(AMS):
             self.swcith_ap(1)
         except Exception as e:
             logout("恢复热点失败: %r（重启后会自动重开）" % (e,))
+
+    def _ap_client_count(self):
+        """当前连在配置热点上的客户端数量。
+
+        返回 -1 表示"数不出来"（固件不支持 status('stations')）—— 调用方要把它
+        当成"有人在用"来处理：宁可跳过扫描，也不要把正在配网的手机踢下线。
+        热点关着时直接返回 0：这时 /wifi_scan 做全信道扫描是安全的。
+        """
+        if not self.ap_is_on():
+            return 0
+        try:
+            return len(self.wlan_ap.status("stations"))
+        except Exception as e:
+            logout("读热点客户端数量失败，按“有人在用”处理: %r" % (e,))
+            return -1
 
     @staticmethod
     def _sleep_ms(ms):
