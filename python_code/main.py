@@ -102,6 +102,11 @@ MicroPython 上电时会依次执行根目录下的 boot.py 和 main.py，
 # ---------------------------------------------------------------------------
 import gc
 import network
+import time     # 只用于第 0.5 步"连上网之后静默一下"，见 WIFI_SETTLE_MS
+
+# ★ 连上路由器之后、加载应用之前先静默多久（毫秒）。理由见第 0.5 步的注释：
+#   实测"刚关联上就去导应用 + 驱动引脚"这几秒最容易把射频搞掉。设 0 关掉。
+WIFI_SETTLE_MS = 600
 
 gc.collect()
 try:
@@ -147,6 +152,11 @@ try:
     _wifi = network_model.network_model()
     if _wifi.auto_connection():
         print("已联网，IP = %s" % _wifi.sta_ip())
+        # ★ 关联刚建立时别立刻去干重活：应用一导入要吃掉近 100KB 代码、
+        #   连着几秒的 flash 读 + 分配，紧接着又会去驱动 H 桥/离合的引脚。
+        #   实测（板子串口）这几秒里射频最脆弱：给协议握手/组密钥留半秒，
+        #   能明显减少"刚连上就掉线"。代价只有 0.6 秒，非常划算。
+        time.sleep_ms(WIFI_SETTLE_MS)
     else:
         _wifi.swcith_ap(1)           # 开配置热点：手机连 AMS_WIFI 后访问 192.168.4.1
 except Exception as _bringup_error:  # noqa: BLE001 - 失败也不要挡住后面

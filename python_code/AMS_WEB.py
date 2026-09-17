@@ -75,7 +75,10 @@ from machine import Pin, PWM
 from info_load import read_profiles, write_profiles, read_json_file, write_json_file
 from hardware_config import LED_PIN, CONFIG_FILE
 from motor_clutch import MotorBusError, ClutchConflictError
-from ota_update import OtaUpdate, OtaError
+# ★ ota_update 改成**按需导入**（在 handle_ota_upload 里现用现 import）。
+#   实测：它是 16KB 的模块，而 `import AMS_WEB` 这整条链正好卡在内存边缘
+#   —— 冷启动出现过 MemoryError: allocating 640 bytes，崩的正是原来这行。
+#   升级包是个低频操作，没必要为了它把启动峰值抬高。
 import reset_info
 
 # 重启：应用层 OTA 写完文件后要重启才生效。
@@ -146,6 +149,25 @@ OTA_TOTAL_TIMEOUT_MS = 180000   # 整个上传的总上限
 REBOOT_DELAY_MS = 900           # 回完包到真正重启之间留的缓冲时间
 MQTT_PING_INTERVAL_MS = 5000  # MQTT 存活探测节流（keepalive=60s，5 秒一次足够）
 LOG_TAIL = 24               # /log 一次给网页多少行（和 logout.LOG_MAX_LINES 对齐）
+
+# ---- WiFi 掉线自愈（见 run_wifi_watchdog）----
+# ★ 为什么需要它：实测板子连上路由器、拿到 IP 之后，跑着跑着 STA 会自己
+#   掉成 status=201（找不到 AP），而且**再也不会自己回来** —— 于是网页
+#   永远打不开，串口却一片平静，看起来像"服务挂了"。
+#   不跑应用时同一个连接 80 秒纹丝不动（rssi -55），所以掉线是应用起来
+#   之后才发生的事。不管根因是什么，兜住它最实在：定时看一眼，掉了就重连。
+WIFI_WATCHDOG_POLL_MS = 5000     # 多久看一次
+WIFI_WATCHDOG_RETRY_MS = 15000   # 一次重连失败后，歇多久再试（别把 CPU 耗在重试上）
+WIFI_RECONNECT_WAIT_MS = 10000   # 单次 connect() 之后最多等它多久（期间网页不卡）
+
+# ★ 软重连一直失败多久之后，复位整机（毫秒；设成 0 就关掉这个兜底）。
+#   为什么最后要落到"重启"（实测数据，板子串口）：
+#     · 射频一旦掉线，STA 会停在 status=201/202（找不到 AP / 认证失败），
+#       之后**几十秒都回不来**，光靠 connect() 重试救不回来；
+#     · 而复位之后每一次都能重新关联上、重新拿到 IP（上机实测 10+ 次）。
+#   没有这一步，用户就只能自己去拔电 —— 表现就是"网页打不开"。
+#   180 秒是个折中：够它自己缓过来，又不至于让用户干等太久。
+WIFI_RESET_AFTER_MS = 180000
 
 _REASON = {
     200: "OK",
@@ -784,6 +806,9 @@ class AMS_WEB(AMS):
     #   直接拖进来，OtaUpdate 会识别出来并明确告诉他改走 USB。
     # ======================================================================
     async def handle_ota_upload(self, client, head, extra):
+        # 现用现 import：ota_update 有 16KB，启动时不背这个包袱（见文件头）
+        from ota_update import OtaUpdate, OtaError
+
         info = {"info": None, "ok": False}
         total = _content_length(head)
         if total <= 0:
@@ -1204,6 +1229,98 @@ class AMS_WEB(AMS):
     # ======================================================================
     # Web 主循环
     # ======================================================================
+    async def run_wifi_watchdog(self):
+        """★ STA 掉线自愈：定时看一眼，断了就重连。
+
+        为什么要它（实测，板子串口）：
+            连上路由器、拿到 192.168.2.153 之后，跑着跑着
+            `sta.isconnected()` 变成 False、`status()` 变成 201（找不到 AP），
+            而且**再也不会自己回来**。表现就是网页永远打不开，串口一片平静，
+            极容易被误判成"Web 服务挂了"。
+            反过来，**不跑应用**时同一个连接能稳稳撑 80 秒（rssi -55），
+            所以这不是信号弱，是应用起来之后才发生的事。
+
+        ⚠️ 这里**只重连 STA，绝不碰热点**：碎堆上 ap.active(True) 会走
+           esp_wifi_start() 去要一大块连续内存，实测直接硬复位（见 main.py
+           文件头"第二层坑"）。掉线期间就老实重试 STA。
+
+        ⚠️ 等待连接必须用 `await asyncio.sleep_ms`，**不能**用阻塞的
+           time.sleep_ms：后者会把整个事件循环按在这里十几秒，网页转圈。
+        """
+        down_ms = 0
+        while True:
+            await asyncio.sleep_ms(WIFI_WATCHDOG_POLL_MS)
+
+            alive = False
+            try:
+                alive = bool(self.wlan_sta.isconnected() and self.sta_ip())
+            except Exception:
+                alive = False
+
+            if alive:
+                if down_ms:
+                    logout("WiFi 已恢复，IP = %s" % self.sta_ip())
+                down_ms = 0
+                continue
+
+            if not down_ms:
+                logout("WiFi 已断开（%s），开始重连…" % self.status_text())
+            down_ms += WIFI_WATCHDOG_POLL_MS
+
+            ok = False
+            try:
+                from info_load import read_profiles
+
+                profiles = read_profiles()
+            except Exception as e:
+                logout("读取 wifi.dat 失败，无法重连: %r" % (e,), is_error=True)
+                profiles = {}
+
+            if not profiles:
+                logout("wifi.dat 里没有可用的 WiFi，无法重连", is_error=True)
+
+            for ssid in list(profiles.keys()):
+                try:
+                    self.wlan_sta.active(True)
+                    self.wlan_sta.connect(ssid, profiles[ssid])
+                except Exception as e:
+                    logout("重连 %s 调用失败: %r" % (ssid, e), is_error=True)
+                    continue
+                waited = 0
+                while waited < WIFI_RECONNECT_WAIT_MS:
+                    await asyncio.sleep_ms(500)
+                    waited += 500
+                    try:
+                        if self.wlan_sta.isconnected() and self.sta_ip():
+                            ok = True
+                            break
+                    except Exception:
+                        break
+                if ok:
+                    break
+
+            if ok:
+                logout("WiFi 已恢复，IP = %s" % self.sta_ip())
+                down_ms = 0
+                continue
+
+            # ★ 软重连都救不回来时，最后手段是复位整机（理由见 WIFI_RESET_AFTER_MS）。
+            if WIFI_RESET_AFTER_MS and down_ms >= WIFI_RESET_AFTER_MS:
+                logout("WiFi 连续 %d 秒连不回来，重启设备以恢复网络"
+                       % (down_ms // 1000), is_error=True)
+                await asyncio.sleep_ms(200)   # 先把这句日志吐出去再重启
+                try:
+                    import machine
+
+                    machine.reset()
+                except Exception as e:
+                    logout("自动重启失败: %r" % (e,), is_error=True)
+                down_ms = 0
+
+            logout("WiFi 重连失败，%d 秒后再试"
+                   % (WIFI_WATCHDOG_RETRY_MS // 1000), is_error=True)
+            await asyncio.sleep_ms(WIFI_WATCHDOG_RETRY_MS)
+
     async def run_web_loop(self, port=WEB_PORT):
         """起监听，并拉起 WEB_WORKERS 个 worker 一起服务请求。
 
@@ -1242,7 +1359,11 @@ class AMS_WEB(AMS):
             logout("Web 监听 socket 是现场建的（启动阶段没预建成功）")
         logout("Web 服务已启动，监听 %s:%d（%d 个 worker）"
                % (addr[0], port, WEB_WORKERS))
-        logout("连上同一网络后用浏览器访问 http://%s 或 http://192.168.4.1" % addr[0])
+        # ★ 别再打印 "http://0.0.0.0" 了：连上路由器时真正能访问的是 STA 的
+        #   IP，0.0.0.0 在浏览器里根本打不开（排查"网页打不开"时被它带偏过）。
+        #   没连上（走热点）时才退回 192.168.4.1。
+        logout("连上同一网络后用浏览器访问 http://%s"
+               % (self.sta_ip() or self.ap_ip() or "192.168.4.1"))
 
         workers = [asyncio.create_task(self._web_worker(i))
                    for i in range(WEB_WORKERS)]
@@ -1391,6 +1512,9 @@ async def main_task():
     task.append(asyncio.create_task(AMS_WEB_MODEL.status_lED()))
     task.append(asyncio.create_task(AMS_WEB_MODEL.run_web_loop()))
     task.append(asyncio.create_task(AMS_WEB_MODEL.run_ams_loop()))
+    if wlan:
+        # ★ 只有"确实是连路由器"这种模式才需要自愈 —— 走热点时没有 STA 可重连。
+        task.append(asyncio.create_task(AMS_WEB_MODEL.run_wifi_watchdog()))
     await asyncio.gather(*task)
 
 

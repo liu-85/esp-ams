@@ -185,14 +185,28 @@ class network_model:
             code = self.wlan_sta.status()
         except Exception:
             return "未知"
-        return {
-            network.STAT_IDLE: "空闲",
-            network.STAT_CONNECTING: "连接中",
-            network.STAT_WRONG_PASSWORD: "密码错误",
-            network.STAT_NO_AP_FOUND: "找不到该 WiFi",
-            network.STAT_CONNECT_FAIL: "连接失败",
-            network.STAT_GOT_IP: "已获取 IP",
-        }.get(code, "状态码 %s" % code)
+        # ★ 别直接写 network.STAT_CONNECT_FAIL 这类属性名：
+        #   实测 v1.23.0 的 ESP32C3 构建里 **没有** STAT_CONNECT_FAIL，
+        #   模块级字典求值时直接抛 AttributeError。而这个字典是在
+        #   do_connect() 失败打日志那一行才被构造的 —— 于是真正的失败原因
+        #   （密码错 / 找不到 AP / 超时）永远看不到，只看到一条莫名其妙的
+        #   AttributeError。用 getattr 兜底，缺哪个就少哪条，不挡路。
+        def _code(name):
+            return getattr(network, name, None)
+
+        table = {}
+        for name, text in (("STAT_IDLE", "空闲"),
+                           ("STAT_CONNECTING", "连接中"),
+                           ("STAT_WRONG_PASSWORD", "密码错误"),
+                           ("STAT_NO_AP_FOUND", "找不到该 WiFi"),
+                           ("STAT_CONNECT_FAIL", "连接失败"),
+                           ("STAT_GOT_IP", "已获取 IP"),
+                           ("STAT_BEACON_TIMEOUT", "信号丢失（基站超时）"),
+                           ("STAT_HANDSHAKE_TIMEOUT", "握手超时")):
+            value = _code(name)
+            if value is not None:
+                table[value] = text
+        return table.get(code, "状态码 %s" % code)
 
     # ======================================================================
     # 扫描（只在用户主动要求时才真的扫）
