@@ -74,6 +74,60 @@ static int64_t s_scan_cache_us;
 
 #define WIFI_SCAN_CACHE_US  (60LL * 1000 * 1000)   /* 60 秒 */
 
+/** 等 SoftAP 真正起来（WIFI_EVENT_AP_START）的最长时间 */
+#define AP_START_WAIT_MS      5000
+
+static uint8_t desired_ap_channel(void);
+
+/* ==========================================================================
+ * 内部工具
+ * ========================================================================== */
+
+/** 停掉 STA 的后台重连，把射频让给 SoftAP（单射频芯片的关键步骤） */
+static void stop_sta_reconnect(void)
+{
+    esp_wifi_disconnect();
+    wifi_config_t sta = {0};
+    sta.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
+    sta.sta.pmf_cfg.capable = true;
+    sta.sta.pmf_cfg.required = false;
+    esp_wifi_set_config(WIFI_IF_STA, &sta);
+    vTaskDelay(pdMS_TO_TICKS(200));
+}
+
+/** 等 SoftAP 就绪；超时返回 false */
+static bool wait_ap_ready(uint32_t timeout_ms)
+{
+    EventBits_t bits = xEventGroupWaitBits(
+        s_events, WIFI_MGR_BIT_AP_READY, pdFALSE, pdFALSE,
+        pdMS_TO_TICKS(timeout_ms));
+    return (bits & WIFI_MGR_BIT_AP_READY) != 0;
+}
+
+/** 按 config 填好 SoftAP 参数（Windows / 手机兼容性优先） */
+static void fill_ap_config(wifi_config_t *ap)
+{
+    ams_config_t *cfg = config_get();
+    memset(ap, 0, sizeof(*ap));
+    snprintf((char *)ap->ap.ssid, sizeof(ap->ap.ssid), "%s", cfg->ap_ssid);
+    ap->ap.ssid_len = (uint8_t)strlen((char *)ap->ap.ssid);
+    ap->ap.channel = desired_ap_channel();
+    ap->ap.max_connection = 4;
+    ap->ap.ssid_hidden = 0;
+    ap->ap.beacon_interval = 100;
+    ap->ap.pmf_cfg.capable = true;
+    ap->ap.pmf_cfg.required = false;
+
+    if (cfg->ap_pass[0] != '\0') {
+        snprintf((char *)ap->ap.password, sizeof(ap->ap.password), "%s",
+                 cfg->ap_pass);
+        /* 混合 WPA/WPA2 比纯 WPA2 在 Windows 上更稳 */
+        ap->ap.authmode = WIFI_AUTH_WPA_WPA2_PSK;
+    } else {
+        ap->ap.authmode = WIFI_AUTH_OPEN;
+    }
+}
+
 /* ==========================================================================
  * 一、事件处理
  * ========================================================================== */
@@ -254,6 +308,16 @@ esp_err_t wifi_mgr_init(void)
     ESP_ERROR_CHECK(esp_wifi_start());
     s_wifi_started = true;
 
+    /* 2.4GHz 全信道（1~13），避免某些信道在默认国家码下不可用 */
+    wifi_country_t country = {
+        .cc = "CN",
+        .schan = 1,
+        .nchan = 13,
+        .policy = WIFI_COUNTRY_POLICY_AUTO,
+    };
+    esp_wifi_set_country(&country);
+    esp_wifi_set_max_tx_power(78);   /* 约 19.5 dBm，配网热点尽量满功率 */
+
     /* ★★ 关掉省电 ★★
      * 这一行是整个项目里"网页能不能发出去"的关键。ESP32 默认 pm=1，
      * 射频空闲时打盹，传大文件中途会掉关联。sdkconfig.defaults 里也配了
@@ -402,6 +466,7 @@ bool wifi_mgr_auto_connect(uint32_t timeout_ms)
 
     ams_config_t *cfg = config_get();
     if (cfg->profile_count == 0) {
+        stop_sta_reconnect();
         ams_log("没有已保存的 WiFi 记录，直接进入配网模式");
         return false;
     }
@@ -443,6 +508,8 @@ bool wifi_mgr_auto_connect(uint32_t timeout_ms)
         vTaskDelay(pdMS_TO_TICKS(300));
     }
 
+    /* 直连全失败 → 清掉 STA 重连，否则后面开热点时单射频会被 STA 占着 */
+    stop_sta_reconnect();
     ams_log_err("全部 WiFi 记录都连不上，转由上层打开配置热点");
     return false;
 }
@@ -512,6 +579,7 @@ static void provision_task(void *arg)
          * 注意是**无条件**：wifi_mgr_connect() 里会先 disconnect，所以这时候
          * 设备已经离线了。热点是唯一还能联系上它的入口 —— 哪怕之前热点是
          * （连上路由器之后）关着的，也必须开回来，否则用户彻底进不去配网页。 */
+        stop_sta_reconnect();
         if (!s_ap_on) {
             ams_log_warn("正在重新打开配置热点，请连回热点后重试");
             if (wifi_mgr_ap_start() != ESP_OK) {
@@ -622,39 +690,74 @@ esp_err_t wifi_mgr_ap_start(void)
         return ESP_OK;
     }
 
-    /* 切到 APSTA：配网时热点和"尝试连路由器"要能同时存在 */
-    esp_err_t err = esp_wifi_set_mode(WIFI_MODE_APSTA);
-    if (err != ESP_OK) {
-        ams_log_err("切换到 APSTA 模式失败: %s", esp_err_to_name(err));
-        return err;
+    if (!s_wifi_started) {
+        return ESP_ERR_INVALID_STATE;
     }
 
-    wifi_config_t ap = {0};
-    snprintf((char *)ap.ap.ssid, sizeof(ap.ap.ssid), "%s", cfg->ap_ssid);
-    ap.ap.ssid_len = (uint8_t)strlen((char *)ap.ap.ssid);
-    ap.ap.channel = desired_ap_channel();
-    ap.ap.max_connection = 4;
+    /*
+     * ★ 配网热点用哪种模式：
+     *   · STA **没连上** → 纯 AP（WIFI_MODE_AP）。射频 100% 给热点，电脑/手机
+     *     才能稳定关联；同时停掉 STA 后台重连（单射频下这是连不上的主因）。
+     *   · STA **已连上** → APSTA，热点信道跟着 STA 走（desired_ap_channel）。
+     */
+    bool sta_up = wifi_mgr_is_connected();
+    wifi_config_t ap;
+    fill_ap_config(&ap);
 
-    if (cfg->ap_pass[0] != '\0') {
-        snprintf((char *)ap.ap.password, sizeof(ap.ap.password), "%s",
-                 cfg->ap_pass);
-        ap.ap.authmode = WIFI_AUTH_WPA2_PSK;
+    xEventGroupClearBits(s_events, WIFI_MGR_BIT_AP_READY);
+    esp_err_t err;
+
+    if (sta_up) {
+        err = esp_wifi_set_mode(WIFI_MODE_APSTA);
+        if (err != ESP_OK) {
+            ams_log_err("切换到 APSTA 模式失败: %s", esp_err_to_name(err));
+            return err;
+        }
+        err = esp_wifi_set_config(WIFI_IF_AP, &ap);
+        if (err != ESP_OK) {
+            ams_log_err("配置热点参数下发失败: %s", esp_err_to_name(err));
+            return err;
+        }
     } else {
-        ap.ap.authmode = WIFI_AUTH_OPEN;
+        /* 纯配网：先停射频再起 AP-only，比热切换 APSTA 更可靠 */
+        stop_sta_reconnect();
+        err = esp_wifi_stop();
+        if (err != ESP_OK && err != ESP_ERR_WIFI_NOT_STARTED) {
+            ams_log_err("关闭 WiFi 失败: %s", esp_err_to_name(err));
+            return err;
+        }
+        vTaskDelay(pdMS_TO_TICKS(100));
+
+        err = esp_wifi_set_mode(WIFI_MODE_AP);
+        if (err != ESP_OK) {
+            ams_log_err("切换到 AP 模式失败: %s", esp_err_to_name(err));
+            return err;
+        }
+        err = esp_wifi_set_config(WIFI_IF_AP, &ap);
+        if (err != ESP_OK) {
+            ams_log_err("配置热点参数下发失败: %s", esp_err_to_name(err));
+            return err;
+        }
+        err = esp_wifi_start();
+        if (err != ESP_OK) {
+            ams_log_err("启动配置热点失败: %s", esp_err_to_name(err));
+            return err;
+        }
+        esp_wifi_set_ps(WIFI_PS_NONE);
     }
 
-    err = esp_wifi_set_config(WIFI_IF_AP, &ap);
-    if (err != ESP_OK) {
-        ams_log_err("配置热点参数下发失败: %s", esp_err_to_name(err));
-        return err;
+    if (!wait_ap_ready(AP_START_WAIT_MS)) {
+        ams_log_err("配置热点启动超时（%ums 内未收到 AP_START）",
+                    (unsigned)AP_START_WAIT_MS);
+        return ESP_FAIL;
     }
 
-    /* 注意：esp_wifi_start() 在 wifi_mgr_init() 里已经调过了，模式切换后
-     * 热点会自己起来，不需要再 start 一次。 */
-    ams_log("配置热点已打开: %s  密码: %s  信道: %d",
+    update_ap_ip();
+    ams_log("配置热点已打开: %s  密码: %s  信道: %d  模式: %s",
             cfg->ap_ssid,
             cfg->ap_pass[0] ? cfg->ap_pass : "(无密码)",
-            (int)ap.ap.channel);
+            (int)ap.ap.channel,
+            sta_up ? "APSTA" : "AP");
     ams_log("手机连上热点后，浏览器打开 http://%s 配网",
             s_ap_ip[0] ? s_ap_ip : "192.168.4.1");
     return ESP_OK;
@@ -665,12 +768,13 @@ esp_err_t wifi_mgr_ap_stop(void)
     if (!s_ap_on) {
         return ESP_OK;
     }
-    /* 只切回 STA 模式，热点就没了 —— 不需要专门的 stop API */
+
     esp_err_t err = esp_wifi_set_mode(WIFI_MODE_STA);
     if (err != ESP_OK) {
         ams_log_err("关闭配置热点失败: %s", esp_err_to_name(err));
         return err;
     }
+
     ams_log("配置热点已关闭");
     return ESP_OK;
 }

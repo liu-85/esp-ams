@@ -96,6 +96,14 @@ static volatile bool  s_report_pending;
 static int  s_exchange_attempts;
 static bool s_change_active;
 
+/* ★ 用户中止标记（网页「停止」按钮）。
+ * ams_post_stop() 立刻置位；正在执行的送/退料/探测循环每走一步
+ * （≤ AMS_FILAMENT_STEP_MS=500ms）查一次，发现置位就自己收停 ——
+ * 否则停止指令只能在队列里排队，要等当前动作自然结束（最长 8 秒）
+ * 才生效，"紧急停止"名存实亡。
+ * execute_cmd() 每开始执行一条新命令时清掉它。 */
+static volatile bool s_stop_requested;
+
 /* 状态灯 */
 static bool     s_led_on;
 static uint32_t s_led_tick;
@@ -287,7 +295,7 @@ static bool drive_channel(int material_index, int direction, uint32_t max_ms,
 
     if (use_sensor) {
         uint32_t elapsed = 0;
-        while (elapsed < max_ms) {
+        while (elapsed < max_ms && !s_stop_requested) {
             uint32_t run = AMS_FILAMENT_STEP_MS;
             if (elapsed + run > max_ms) {
                 run = max_ms - elapsed;
@@ -302,8 +310,24 @@ static bool drive_channel(int material_index, int direction, uint32_t max_ms,
         }
         motor_stop();
     } else {
-        motor_run((motor_dir_t)direction, max_ms);
+        /* ★ 无微动时同样按步推进：一次性 motor_run(max_ms)（最长 8 秒）
+         * 会让「停止」指令在整个期间完全无法生效。按 500ms 步进后，
+         * 用户中止最多晚 0.5 秒生效；motor_run 同向同速是幂等的，
+         * 步与步之间电机不会停，机械效果与一整段相同。 */
+        uint32_t elapsed = 0;
+        while (elapsed < max_ms && !s_stop_requested) {
+            uint32_t run = AMS_FILAMENT_STEP_MS;
+            if (elapsed + run > max_ms) {
+                run = max_ms - elapsed;
+            }
+            motor_run((motor_dir_t)direction, run);
+            elapsed += run;
+        }
         motor_stop();
+    }
+
+    if (s_stop_requested) {
+        ams_log("料盘位%d 动作被用户中止", material_index + 1);
     }
 
     if (out_triggered) {
@@ -346,7 +370,7 @@ static bool creep_feed(int material_index)
             (unsigned)cfg->creep_times, (unsigned)cfg->creep_pulse_ms,
             (unsigned)cfg->creep_speed_pct);
 
-    for (int i = 0; i < cfg->creep_times; i++) {
+    for (int i = 0; i < cfg->creep_times && !s_stop_requested; i++) {
         motor_run_speed(MOTOR_DIR_FEED, cfg->creep_pulse_ms,
                         cfg->creep_speed_pct);
         motor_stop();
@@ -573,7 +597,7 @@ static int probe_current_filament(int fallback)
 
         bool found = false;
         uint32_t steps = 0;
-        for (steps = 0; steps < max_steps; steps++) {
+        for (steps = 0; steps < max_steps && !s_stop_requested; steps++) {
             motor_run(MOTOR_DIR_RETRACT, step_ms);
             if (sensor_triggered(mat, SENSOR_STOP)) {
                 found = true;
@@ -581,6 +605,14 @@ static int probe_current_filament(int fallback)
             }
         }
         motor_stop();
+
+        if (s_stop_requested) {
+            /* 用户中止：不再继续探测其他通道，反向回位也不做 ——
+             * 停止指令要的就是"立刻全停"，剩下的由人工接手 */
+            clutch_release_all_settled();
+            ams_log("探测被用户中止，沿用记录值: %d", fallback);
+            return fallback;
+        }
 
         if (found) {
             /* 反向回位：把刚才拉紧的那一段料推回去 */
@@ -844,33 +876,53 @@ static void do_jog(int material_index, int direction, int ms)
 
 static void execute_cmd(const ams_cmd_t *cmd)
 {
+    /* 新命令起步前清掉上一次的中止标记。STOP 指令自身也走这里 ——
+     * 没关系，它进来只做安全复位（停电机、断离合），不依赖这个标记。 */
+    s_stop_requested = false;
+
     switch (cmd->id) {
     case AMS_CMD_JOG:
         do_jog(cmd->channel, cmd->arg, cmd->ms);
         break;
 
-    case AMS_CMD_LOAD:
-        if (do_load(cmd->channel, false)) {
+    case AMS_CMD_LOAD: {
+        bool ok = do_load(cmd->channel, false);
+        if (s_stop_requested) {
+            ams_log("送料被用户中止");
             set_state(AMS_STATE_IDLE, -1);
         } else {
-            set_state(AMS_STATE_ERROR, -1);
+            set_state(ok ? AMS_STATE_IDLE : AMS_STATE_ERROR, -1);
         }
         break;
+    }
 
-    case AMS_CMD_RETRACT:
-        if (do_retract(cmd->channel)) {
+    case AMS_CMD_RETRACT: {
+        bool ok = do_retract(cmd->channel);
+        if (s_stop_requested) {
+            ams_log("退料被用户中止");
             set_state(AMS_STATE_IDLE, -1);
         } else {
-            set_state(AMS_STATE_ERROR, -1);
+            set_state(ok ? AMS_STATE_IDLE : AMS_STATE_ERROR, -1);
         }
         break;
+    }
 
     case AMS_CMD_AUTOLOAD:
         do_autoload(cmd->channel);
         break;
 
     case AMS_CMD_EXCHANGE: {
-        if (do_exchange(cmd->channel)) {
+        bool ok = do_exchange(cmd->channel);
+        if (s_stop_requested) {
+            /* 用户中止的换料**不能**给打印机发 resume：
+             * 料路停在一个未知位置，让打印机继续打只会打坏模型。
+             * 标记换料流程"已结束但需人工确认"，等用户处理完再来。 */
+            ams_log("换料被用户中止 —— 不通知打印机继续，请人工确认料路");
+            set_state(AMS_STATE_IDLE, -1);
+            s_change_active = true;   /* 不再自动重试 */
+            break;
+        }
+        if (ok) {
             s_exchange_attempts = 0;
             s_change_active = false;
             /* 换料成功后通知打印机继续打印 */
@@ -894,6 +946,7 @@ static void execute_cmd(const ams_cmd_t *cmd)
 
     case AMS_CMD_STOP:
         ams_log("收到停止指令");
+        motor_stop();          /* ★ 原来漏了：只断离合不停电机，电机会空转到自然结束 */
         clutch_release_all();
         set_state(AMS_STATE_IDLE, -1);
         break;
@@ -926,6 +979,9 @@ bool ams_post_jog(int material_index, int direction, int ms)
 bool ams_post_stop(void)
 {
     ams_cmd_t cmd = { .id = AMS_CMD_STOP };
+    /* ★ 先立刻置中止标记：正在执行的送/退料/探测循环会在下一步
+     * （≤500ms）自己收停，不用等 STOP 指令排到队首。 */
+    s_stop_requested = true;
     /* 停止指令优先级最高：先把队列里排着的命令清掉，再塞进去 */
     if (s_cmd_queue) {
         xQueueReset(s_cmd_queue);

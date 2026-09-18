@@ -316,3 +316,20 @@ U+FEFF 而不是 `#`，跳过逻辑失效 → 首行注释被当成一条分区�
   → 改用：Write 写到 `.git/COMMIT_MSG_TMP.txt`（顺带剥 BOM）→ `git commit -F 该文件`
   → 删掉临时文件。
 
+
+## 2026-09-18 实证一批（S3 + CI 单文件固件）
+
+- **「烧新固件后反复重启」未复现，固件无罪**：CI 版 S3 单文件固件实测干净启动、
+  15+ 分钟稳定、`boot_stat.json count` 不疯涨（boot.py 每次启动都写它，
+  **判断重启循环就看这个计数**）。重启首选怀疑供电/欠压（本项目的祖传问题），
+  让用户复现后看复位原因：连续 PWRON 或 BROWN_OUT = 电源带不动负载。
+- **S3 跑 CI 固件后是 TinyUSB CDC**：`VID_303A&PID_4001` 序列号 `123456`，
+  REPL 要发 Enter/Ctrl-C 才开口，DTR 必须拉高；旧固件是 `PID_1001`（USB-Serial/JTAG，
+  序列号=MAC）。**看 PNPDeviceID 就知道板子跑的是哪份固件。**
+- **C3 时代「碎堆上重开热点 → esp_wifi_start 硬复位」在 S3 不成立**（实测 free=103KB
+  时关/开 AP 都正常）。MicroPython 版那些"运行期不许动热点"的忌讳**只对 C3 有效**。
+- **扫描缓存必须是类属性**：`network_model._scan_cache/_scan_ts`（读走 self 回落、
+  写显式写类名）。main.py 预热扫描和 AMS_WEB 是两个实例，放实例上配网页列表必为空。
+  tests/run_tests.py 里有回归测试守着。
+- **.NET SerialPort 在这台机器有怪病**：Open 成功但 Read 立即"端口被关闭"。
+  串口工具一律用原生 Win32（`.workbuddy/_tmp/raw_com.py` 模板），别用 SerialPort 类。

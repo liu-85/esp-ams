@@ -68,6 +68,22 @@ SCAN_CACHE_MS = 60000       # 60 秒
 
 
 class network_model:
+    # ★ 扫描缓存是**类属性**，全继承链共享一份。
+    #
+    # 为什么不能是实例属性：main.py 第 0.5 步会建一个 network_model() 实例
+    # 做开机预热扫描（趁热点还没客户端、射频空闲），而真正服务网页的是
+    # AMS_WEB() 实例（继承链 AMS_WEB → … → network_model）。如果缓存放在
+    # 实例上，预热写进的是「废实例」的缓存，网页那个实例的缓存永远是空的
+    # —— 配网页在「热点有客户端」时故意不做全信道扫描、只回缓存，列表就
+    # 永远是空的，用户只能手填 SSID。扫描结果描述的是环境、不是某个实例，
+    # 所以共享一份才符合语义。
+    #
+    # 注意：读取走 self._scan_cache（实例上没有就回落到类属性），
+    #       写入必须显式写类属性 network_model._scan_cache，否则会在实例上
+    #       造出一个遮蔽副本，又退回"各实例各一份"的老问题。
+    _scan_cache = []
+    _scan_ts = None
+
     def __init__(self):
         self.ap_ssid = AP_SSID
         self.ap_password = AP_PASSWORD
@@ -104,9 +120,8 @@ class network_model:
         # 一句话：WiFi 的"起"归 main.py 管，这里只读取状态，不许关。
         # （关热点的正经入口仍然保留：swcith_ap(0)，配网成功后会用它。）
 
-        # 扫描结果缓存
-        self._scan_cache = []
-        self._scan_ts = None
+        # 扫描结果缓存：已提升为类属性（见类定义处的说明），这里**不要**
+        # 再写 self._scan_cache = []，否则会在实例上造出遮蔽副本。
 
     # ======================================================================
     # 热点（AP）
@@ -255,8 +270,9 @@ class network_model:
             if name and name not in found:
                 found.append(name)
 
-        self._scan_cache = found
-        self._scan_ts = now
+        # ★ 写类属性，别写实例属性（原因见类定义处的说明）
+        network_model._scan_cache = found
+        network_model._scan_ts = now
         logout("扫描到 %d 个 WiFi" % len(found))
         return found
 

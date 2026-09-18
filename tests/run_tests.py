@@ -546,6 +546,32 @@ def test_network_scan_is_cached_and_sorted():
     check_eq(m.wlan_sta.scan_calls, 2, "force=True 必须真的重扫")
 
 
+def test_network_scan_cache_is_shared_across_instances():
+    """★ 预热扫描（main.py 的实例）写出的缓存，网页实例必须读得到。
+
+    回归契约：_scan_cache 是类属性。若有人把它改回实例属性，main.py 第 0.5
+    步的预热扫描就会写进一个「废实例」，配网页（热点有客户端时故意不重新
+    扫描、只回缓存）的 WiFi 列表将永远为空。
+    """
+    import network_model as nm
+
+    # 预热线：模拟 main.py 第 0.5 步那个独立实例
+    warmer = nm.network_model()
+    warmer.wlan_sta.scan_result = [(b"Prewarmed", b"", 1, -50, 3, False)]
+    warmer.scan_networks(force=True)
+
+    # 网页线：模拟 AMS_WEB 实例（另一个对象）直接读缓存，不触发真扫描
+    page = nm.network_model()
+    check_eq(page.scan_networks(), ["Prewarmed"],
+             "扫描缓存必须在所有实例间共享（预热实例写入，网页实例读出）")
+    check_eq(page.wlan_sta.scan_calls, 0,
+             "网页实例应命中共享缓存，不该再触发一次真扫描")
+
+    # 清理，避免污染后面的用例
+    nm.network_model._scan_cache = []
+    nm.network_model._scan_ts = None
+
+
 def test_network_ap_switch_works():
     """热点开关必须可用，且名字能读回来"""
     import network_model as nm

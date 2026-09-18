@@ -45,7 +45,10 @@
  * 常量
  * ========================================================================== */
 
-/** 拼装缓冲区大小。拓竹的 pushall 报文实测 1~3KB，8KB 留了足够余量。 */
+/** 拼装缓冲区大小。拓竹的 pushall 报文实测 1~3KB，8KB 留了足够余量。
+ *  ⚠️ 有效载荷上限是 MQTT_RX_BUF_SIZE - 1 —— 收全后还要在末尾写一个 '\0'
+ *     （见 mqtt_event_handler 的 s_rx_buf[s_rx_len] = '\0'）。
+ *     如果允许载荷 == MQTT_RX_BUF_SIZE，那个终止符就越界 1 字节。 */
 #define MQTT_RX_BUF_SIZE 8192
 
 /** 主题字符串长度上限：device/ + 序列号 + /report */
@@ -137,10 +140,11 @@ static void mqtt_event_handler(void *args, esp_event_base_t base,
 
         if (offset == 0) {
             rx_reset();
-            if (total > MQTT_RX_BUF_SIZE) {
+            /* >= 而不是 >：要给结尾的 '\0' 留 1 字节（见缓冲区定义处的说明） */
+            if (total >= MQTT_RX_BUF_SIZE) {
                 s_rx_overflow = true;
                 ams_log_err("打印机报文 %u 字节，超过拼装缓冲 %d 字节，本条丢弃",
-                            (unsigned)total, MQTT_RX_BUF_SIZE);
+                            (unsigned)total, MQTT_RX_BUF_SIZE - 1);
                 return;
             }
             s_rx_expected = total;
@@ -149,7 +153,7 @@ static void mqtt_event_handler(void *args, esp_event_base_t base,
         if (s_rx_overflow) {
             return;
         }
-        if (offset + (size_t)event->data_len > MQTT_RX_BUF_SIZE) {
+        if (offset + (size_t)event->data_len >= MQTT_RX_BUF_SIZE) {
             s_rx_overflow = true;
             ams_log_err("报文偏移越界（offset=%u len=%d），本条丢弃",
                         (unsigned)offset, (int)event->data_len);
